@@ -24,9 +24,11 @@ python -m PyInstaller `
   --onedir `
   --windowed `
   --name AutoBackup `
+  --icon "assets/app_icon.ico" `
   --add-data "gologin_zeroprofile.zip;." `
   --add-data "proxy_auth_ext;proxy_auth_ext" `
   --add-data "proxy_ext_0;proxy_ext_0" `
+  --add-data "assets;assets" `
   --hidden-import curl_cffi `
   --hidden-import msal `
   --hidden-import pandas `

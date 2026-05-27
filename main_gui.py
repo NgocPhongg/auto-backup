@@ -25,7 +25,7 @@ from gologin_config import load_gologin_settings, save_gologin_settings, mask_se
 from video_table_manager import VideoTableManager
 from add_profile_dialog import AddProfileDialog
 from add_multiple_dialog import AddMultipleDialog
-from app_paths import data_file, gologin_profiles_root, init_app_data, named_browser_profile_dir, require_orbita_browser_exe
+from app_paths import data_file, gologin_profiles_root, init_app_data, named_browser_profile_dir, require_orbita_browser_exe, resource_path
 from app_version import APP_VERSION
 from update_checker import check_for_update
 
@@ -278,6 +278,7 @@ class SSMAToolGUI(QMainWindow):
         super().__init__()
         init_app_data()
         self.setWindowTitle("DNPTool Reup tiktok")
+        self.setWindowIcon(QIcon(str(resource_path("assets/app_icon.ico"))))
         self.resize(1300, 850)
         
         # Khởi tạo các module backend
@@ -4541,6 +4542,7 @@ if __name__ == "__main__":
             pass
 
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(resource_path("assets/app_icon.ico"))))
     window = SSMAToolGUI()
     window.show()
     sys.exit(app.exec_())

@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('gologin_zeroprofile.zip', '.'), ('proxy_auth_ext', 'proxy_auth_ext'), ('proxy_ext_0', 'proxy_ext_0')]
+datas = [('gologin_zeroprofile.zip', '.'), ('proxy_auth_ext', 'proxy_auth_ext'), ('proxy_ext_0', 'proxy_ext_0'), ('assets', 'assets')]
 binaries = []
 hiddenimports = ['curl_cffi', 'msal', 'pandas', 'yt_dlp']
 tmp_ret = collect_all('playwright')
@@ -41,6 +41,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['assets\\app_icon.ico'],
 )
 coll = COLLECT(
     exe,

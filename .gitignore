@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+*.log
+*.bak
+
+# Local user data. Runtime data is migrated to %APPDATA%\AutoBackup.
+accounts_data.json
+email_accounts.json
+feed_settings.json
+gologin_settings.json
+projects.json
+browser_profiles/
+profiles/
+gologin_profiles/
+logs/
+backups/
+temp/
+
+# Browser/runtime artifacts.
+Default/
+debug_frames/
+profile_*/
+Testgologin*/
+gologin_zeroprofile/
+
+# Large local media/tool artifacts.
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+*.webm
+Creator Now Cut 14112025/00.videogoc/
+Creator Now Cut 14112025/bg/
+
+# Build/release artifacts.
+build/
+dist/
+release/
+*.exe
+*.msi

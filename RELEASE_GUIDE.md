@@ -2,6 +2,8 @@
 
 ## Build local
 
+Update `APP_VERSION` in `app_version.py` first.
+
 Run from the project root:
 
 ```powershell
@@ -29,3 +31,9 @@ release\AutoBackup_v1.0.0.zip
 3. Run `AutoBackup.exe`.
 
 Runtime data is stored in `%APPDATA%\AutoBackup`, so updating the app does not overwrite user data.
+
+## Update flow
+
+The app checks GitHub Releases on startup.
+
+If a newer release exists, it shows a popup with a download button. Users still download and extract the new ZIP manually.

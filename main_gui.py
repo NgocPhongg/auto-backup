@@ -5,6 +5,7 @@ import html
 import json
 import os
 import inspect
+import webbrowser
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QSplitter, QTableWidget, QTableWidgetItem, QPushButton, 
@@ -25,6 +26,8 @@ from video_table_manager import VideoTableManager
 from add_profile_dialog import AddProfileDialog
 from add_multiple_dialog import AddMultipleDialog
 from app_paths import data_file, gologin_profiles_root, init_app_data, named_browser_profile_dir, require_orbita_browser_exe
+from app_version import APP_VERSION
+from update_checker import check_for_update
 
 # Disable gologin import for now
 # from kyc_manager import auto_upload_kyc
@@ -285,6 +288,7 @@ class SSMAToolGUI(QMainWindow):
         self.automation_dashboard = None
         self.automation_dashboards = {}
         self.running_profiles = {}
+        self._last_update_info = None
         # Giữ ref worker để không bị garbage collected và tự dọn khi worker xong.
         self.active_workers = []
 
@@ -298,6 +302,7 @@ class SSMAToolGUI(QMainWindow):
         self.load_accounts_from_db()
         
         self.load_projects()
+        QTimer.singleShot(1500, lambda: self.check_app_update(silent=True))
 
     def init_ui(self):
         # 1. Menu Bar
@@ -313,7 +318,9 @@ class SSMAToolGUI(QMainWindow):
         menubar.addMenu('Cài đặt trình duyệt')
         menubar.addMenu('Hướng dẫn sử dụng')
         menubar.addMenu('Lỗi thường gặp')
-        menubar.addMenu('Tiện ích')
+        menu_tools = menubar.addMenu('Tiện ích')
+        action_check_update = menu_tools.addAction("Kiểm tra cập nhật")
+        action_check_update.triggered.connect(lambda: self.check_app_update(silent=False))
         menu_browser_cleanup = menubar.addMenu('Dọn trình duyệt')
         action_cleanup_browsers = menu_browser_cleanup.addAction("Đóng các phiên trình duyệt đang chạy")
         action_cleanup_browsers.triggered.connect(self.handle_cleanup_browser_sessions)
@@ -2101,6 +2108,55 @@ class SSMAToolGUI(QMainWindow):
 
     def clear_log_output(self):
         self.log_output.clear()
+
+    def check_app_update(self, silent=True):
+        worker = GenericWorker(check_for_update, extra_data={"silent": bool(silent)}, pass_progress=False)
+        worker.finished.connect(self.on_check_app_update_done)
+        self._track_worker(worker)
+        worker.start()
+        if not silent:
+            self.status_bar.showMessage("Đang kiểm tra cập nhật...", 4000)
+
+    def on_check_app_update_done(self, success, result, extra_data):
+        silent = bool((extra_data or {}).get("silent"))
+        if not success:
+            if not silent:
+                QMessageBox.warning(self, "Cập nhật", f"Không kiểm tra được cập nhật:\n{result}")
+            return
+
+        info = result if isinstance(result, dict) else {}
+        self._last_update_info = info
+        if info.get("has_update"):
+            self.show_update_dialog(info)
+            return
+
+        if not silent:
+            QMessageBox.information(
+                self,
+                "Cập nhật",
+                f"Bạn đang dùng bản mới nhất.\n\nPhiên bản hiện tại: v{APP_VERSION}",
+            )
+        else:
+            self.status_bar.showMessage(f"AutoBackup v{APP_VERSION}", 3000)
+
+    def show_update_dialog(self, info):
+        latest = info.get("latest_tag") or f"v{info.get('latest_version', '')}"
+        download_url = info.get("download_url") or info.get("release_url")
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Có bản cập nhật mới")
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setText(f"Đã có AutoBackup {latest}.")
+        dialog.setInformativeText(
+            f"Phiên bản hiện tại: v{APP_VERSION}\n\n"
+            "Bấm Tải bản mới để mở trang tải. Sau khi tải xong, giải nén ra thư mục mới và chạy AutoBackup.exe."
+        )
+        btn_download = dialog.addButton("Tải bản mới", QMessageBox.AcceptRole)
+        dialog.addButton("Để sau", QMessageBox.RejectRole)
+        dialog.exec_()
+
+        if dialog.clickedButton() == btn_download and download_url:
+            webbrowser.open(download_url)
 
     def open_gologin_settings(self):
         dialog = GoLoginSettingsDialog(self)

@@ -8,6 +8,16 @@ $ZipPath = Join-Path $ReleaseDir "AutoBackup_v$Version.zip"
 
 Set-Location $Root
 
+$VersionFile = Join-Path $Root "app_version.py"
+$VersionText = Get-Content -LiteralPath $VersionFile -Raw
+if ($VersionText -notmatch "APP_VERSION\s*=\s*`"([^`"]+)`"") {
+  throw "Cannot read APP_VERSION from app_version.py"
+}
+$AppVersion = $Matches[1]
+if ($AppVersion -ne $Version) {
+  throw "Build version mismatch. app_version.py has $AppVersion but build argument is $Version."
+}
+
 python -m PyInstaller `
   --noconfirm `
   --clean `

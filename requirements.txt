@@ -1,0 +1,15 @@
+PyQt5
+PyQtWebEngine
+requests
+psutil
+pywin32
+imap-tools
+playwright
+playwright-stealth
+gologin
+websockets
+curl-cffi
+msal
+pandas
+yt-dlp
+pyinstaller

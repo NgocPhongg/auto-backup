@@ -15,7 +15,15 @@ import threading
 from datetime import datetime, timedelta
 from PyQt5.QtCore import QThread, pyqtSignal
 from gologin_config import load_gologin_settings
+from gologin_profile_utils import first_real_gologin_profile_id
 from app_paths import gologin_base_dir, gologin_profile_dir, resource_path
+from proxy_utils import (
+    normalize_proxy_type,
+    parse_proxy_string,
+    proxy_custom_name,
+    proxy_display_text,
+    validate_proxy_connection,
+)
 
 GOLOGIN_BASE_DIR = str(gologin_base_dir())
 ZERO_PROFILE_ZIP = str(resource_path("gologin_zeroprofile.zip"))
@@ -107,63 +115,21 @@ def _parse_debug_port(debugger_address):
 
 
 def _normalize_proxy_mode(proxy_type):
-    proxy_type = (proxy_type or "http").strip().lower()
-    if proxy_type == "socks5h":
-        proxy_type = "socks5"
-    if proxy_type == "https":
-        proxy_type = "http"
-    if proxy_type not in ("http", "socks4", "socks5"):
-        proxy_type = "http"
-    return proxy_type
+    return normalize_proxy_type(proxy_type)
 
 
 def _parse_proxy_string(proxy_str, proxy_type="http"):
     """Parse host:port, host:port:user:pass, scheme://host:port:user:pass, or user:pass@host:port."""
-    proxy_str = (proxy_str or "").strip()
-    if not proxy_str:
-        return None
-
-    proxy_type = _normalize_proxy_mode(proxy_type)
-    if "://" in proxy_str:
-        scheme, proxy_str = proxy_str.split("://", 1)
-        proxy_type = _normalize_proxy_mode(scheme)
-
-    username = ""
-    password = ""
-    if "@" in proxy_str:
-        auth_part, proxy_str = proxy_str.rsplit("@", 1)
-        if ":" in auth_part:
-            username, password = auth_part.split(":", 1)
-        else:
-            username = auth_part
-
-    parts = proxy_str.split(":", 3)
-    if len(parts) < 2:
-        return None
-
-    host = parts[0].strip()
-    port_text = parts[1].strip()
-    if not host or not port_text.isdigit():
-        return None
-
-    if not username and len(parts) >= 3:
-        username = parts[2].strip()
-    if not password and len(parts) >= 4:
-        password = parts[3].strip()
-
-    return {
-        "mode": proxy_type,
-        "host": host,
-        "port": int(port_text),
-        "username": username.strip(),
-        "password": password.strip(),
-    }
+    return parse_proxy_string(proxy_str, proxy_type)
 
 
 def _proxy_display_text(payload):
     if not payload:
         return ""
-    return f"{payload.get('mode')}://{payload.get('host')}:{payload.get('port')}"
+    return proxy_display_text(
+        f"{payload.get('host')}:{payload.get('port')}",
+        payload.get("mode"),
+    )
 
 
 def _sync_gologin_profile_proxy(token, profile_id, task):
@@ -175,9 +141,12 @@ def _sync_gologin_profile_proxy(token, profile_id, task):
         return True, "Khong co proxy de dong bo"
 
     proxy_payload["changeIpUrl"] = ""
-    profile_name = (task.get("upload_to") or "").strip()
-    if profile_name:
-        proxy_payload["customName"] = profile_name[:80]
+    proxy_payload["customName"] = proxy_custom_name(
+        f"{proxy_payload.get('host')}:{proxy_payload.get('port')}",
+        proxy_payload.get("mode"),
+    )
+    proxy_payload["autoProxyRegion"] = ""
+    proxy_payload["torProxyRegion"] = ""
 
     body = {
         "proxies": [
@@ -207,6 +176,25 @@ def _sync_gologin_profile_proxy(token, profile_id, task):
 
     detail = (response.text or "").strip().replace("\n", " ")[:300]
     return False, f"GoLogin proxy API loi HTTP {response.status_code}: {detail}"
+
+
+def _validate_task_proxy(task, timeout=8):
+    proxy_string = (task.get("proxy") or "").strip()
+    if not proxy_string:
+        return {
+            "ok": True,
+            "scheme": _normalize_proxy_mode(task.get("proxy_type", "http")),
+            "proxy_ip": "",
+            "direct_ip": "",
+            "message": "Khong dung Proxy",
+        }
+
+    return validate_proxy_connection(
+        proxy_string,
+        proxy_type=task.get("proxy_type", "http"),
+        require_ip_change=True,
+        timeout=timeout,
+    )
 
 
 class UploadWorker(QThread):
@@ -329,15 +317,14 @@ class UploadWorker(QThread):
             return False, "Chưa gán tài khoản Upload To"
 
         # Check 5: GoLogin profile ID. Upload must use the real GoLogin/Orbita profile.
-        gologin_profile_id = (
-            task.get("gologin_profile_id")
-            or task.get("browser_id")
-            or ""
+        gologin_profile_id = first_real_gologin_profile_id(
+            task.get("gologin_profile_id"),
+            task.get("browser_id"),
         )
-        gologin_profile_id = str(gologin_profile_id).strip()
         if not gologin_profile_id:
-            return False, "Profile chua co GoLogin Profile ID"
+            return False, "Profile chua co GoLogin Profile ID that"
         task["gologin_profile_id"] = gologin_profile_id
+        task["browser_id"] = gologin_profile_id
 
         # Check 6: Schedule >= 30 phút
 
@@ -425,16 +412,28 @@ class UploadWorker(QThread):
         if not token:
             raise RuntimeError("Thieu GoLogin API Key. Vao menu API | Cookie de nhap token.")
 
-        gologin_profile_id = (
-            task.get("gologin_profile_id")
-            or task.get("browser_id")
-            or ""
+        gologin_profile_id = first_real_gologin_profile_id(
+            task.get("gologin_profile_id"),
+            task.get("browser_id"),
         )
-        gologin_profile_id = str(gologin_profile_id).strip()
         if not gologin_profile_id:
-            raise RuntimeError("Profile nay chua co GoLogin Profile ID.")
+            raise RuntimeError("Profile nay chua co GoLogin Profile ID that.")
+        task["browser_id"] = gologin_profile_id
 
         if (task.get("proxy") or "").strip():
+            proxy_check = _validate_task_proxy(task, timeout=8)
+            if not proxy_check.get("ok"):
+                raise RuntimeError(str(proxy_check.get("message") or "Proxy khong hop le"))
+
+            detected_mode = _normalize_proxy_mode(proxy_check.get("scheme"))
+            task["proxy_type"] = detected_mode
+            proxy_ip = str(proxy_check.get("proxy_ip") or "").strip()
+            direct_ip = str(proxy_check.get("direct_ip") or "").strip()
+            proxy_status = f"Proxy OK: {proxy_ip}" if proxy_ip else "Proxy OK"
+            if direct_ip and proxy_ip and direct_ip != proxy_ip:
+                proxy_status += f" (IP may: {direct_ip})"
+            self.status_updated.emit(idx, proxy_status, "green")
+
             ok, message = _sync_gologin_profile_proxy(token, gologin_profile_id, task)
             if not ok:
                 raise RuntimeError(message)

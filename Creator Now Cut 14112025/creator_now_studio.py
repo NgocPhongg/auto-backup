@@ -180,6 +180,36 @@ def folder_size_mb(folder: Path) -> float:
     return total / (1024 * 1024)
 
 
+def parse_time_value(value: str) -> float | None:
+    parts = value.strip().split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError:
+        return None
+    if len(numbers) == 2:
+        minutes, seconds = numbers
+        return minutes * 60 + seconds
+    hours, minutes, seconds = numbers
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def format_seconds(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def timecode_filename(stem: str, index: int, start: float, end: float) -> str:
+    start_text = format_seconds(start).replace(":", "m") + "s"
+    end_text = format_seconds(end).replace(":", "m") + "s"
+    return f"{stem}_scene{index:03d}_{start_text}_{end_text}.mp4"
+
+
 class DropBox(QFrame):
     def __init__(self, on_files_dropped):
         super().__init__()
@@ -339,6 +369,11 @@ class CreatorNowStudio(QMainWindow):
             btn.setMinimumWidth(118)
             btn.clicked.connect(lambda checked=False, f=folder: self.open_folder(f))
             action_row.addWidget(btn)
+        self.open_timecode_btn = QPushButton("Cat theo moc")
+        self.open_timecode_btn.setMinimumWidth(128)
+        self.open_timecode_btn.setObjectName("primaryButton")
+        self.open_timecode_btn.clicked.connect(self.open_timecode_cut_ui)
+        action_row.addWidget(self.open_timecode_btn)
         action_row.addStretch()
         layout.addLayout(action_row)
         return page
@@ -413,6 +448,11 @@ class CreatorNowStudio(QMainWindow):
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(3, 1)
 
+        self.cut_plan_mode_combo = QComboBox()
+        self.cut_plan_mode_combo.addItem("Tu dong theo do dai", "duration")
+        self.cut_plan_mode_combo.addItem("Dan moc thoi gian", "timecodes")
+        self.cut_plan_mode_combo.currentIndexChanged.connect(self.on_cut_plan_mode_changed)
+
         self.cut_random_check = QCheckBox("Random thoi luong moi doan")
         self.cut_random_check.setChecked(True)
         self.cut_random_check.stateChanged.connect(self.update_command_preview)
@@ -466,22 +506,65 @@ class CreatorNowStudio(QMainWindow):
         self.cut_mode_combo.addItem("Chinh xac - render lai", "encode")
         self.cut_mode_combo.currentIndexChanged.connect(self.update_command_preview)
 
-        layout.addWidget(self.cut_random_check, 0, 0, 1, 2)
-        layout.addWidget(QLabel("Do dai tu"), 1, 0)
-        layout.addWidget(self.cut_min_minutes, 1, 1)
-        layout.addWidget(QLabel("Den"), 1, 2)
-        layout.addWidget(self.cut_max_minutes, 1, 3)
-        layout.addWidget(QLabel("Cat bo dau"), 2, 0)
-        layout.addWidget(self.cut_head_seconds, 2, 1)
-        layout.addWidget(QLabel("Cat bo cuoi"), 2, 2)
-        layout.addWidget(self.cut_tail_seconds, 2, 3)
-        layout.addWidget(QLabel("So video toi da"), 3, 0)
-        layout.addWidget(self.cut_video_limit, 3, 1)
-        layout.addWidget(QLabel("So doan/video"), 3, 2)
-        layout.addWidget(self.cut_clip_limit, 3, 3)
-        layout.addWidget(QLabel("Che do cat"), 4, 0)
-        layout.addWidget(self.cut_mode_combo, 4, 1)
-        layout.addWidget(self.cut_keep_short_check, 4, 2, 1, 2)
+        self.timecode_panel = QFrame()
+        self.timecode_panel.setObjectName("timecodePanel")
+        timecode_layout = QVBoxLayout(self.timecode_panel)
+        timecode_layout.setContentsMargins(10, 10, 10, 10)
+        timecode_layout.setSpacing(8)
+
+        timecode_title = QLabel("Dan moc thoi gian de cat nhanh")
+        timecode_title.setObjectName("sectionTitle")
+        timecode_layout.addWidget(timecode_title)
+
+        timecode_source_row = QHBoxLayout()
+        self.timecode_video_combo = QComboBox()
+        self.timecode_video_combo.currentIndexChanged.connect(self.update_timecode_preview)
+        self.timecode_refresh_btn = QPushButton("Lam moi video")
+        self.timecode_refresh_btn.setMinimumWidth(110)
+        self.timecode_refresh_btn.clicked.connect(self.refresh_timecode_video_combo)
+        timecode_source_row.addWidget(QLabel("Video can cat"))
+        timecode_source_row.addWidget(self.timecode_video_combo, stretch=1)
+        timecode_source_row.addWidget(self.timecode_refresh_btn)
+        timecode_layout.addLayout(timecode_source_row)
+
+        self.timecode_text = QPlainTextEdit()
+        self.timecode_text.setPlaceholderText(
+            "Dan text moc thoi gian vao day, vi du:\n"
+            "Canh 1: 14:51 - 15:00 (File goc)\n"
+            "Canh 2: 15:12 - 15:18 (File goc)"
+        )
+        self.timecode_text.setMinimumHeight(110)
+        self.timecode_text.textChanged.connect(self.update_timecode_preview)
+        timecode_layout.addWidget(self.timecode_text)
+
+        self.timecode_table = QTableWidget(0, 5)
+        self.timecode_table.setHorizontalHeaderLabels(["Canh", "Bat dau", "Ket thuc", "Thoi luong", "Output"])
+        self.timecode_table.verticalHeader().setVisible(False)
+        self.timecode_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.timecode_table.horizontalHeader().setStretchLastSection(True)
+        self.timecode_table.setMinimumHeight(130)
+        timecode_layout.addWidget(self.timecode_table)
+
+        layout.addWidget(QLabel("Kieu cat"), 0, 0)
+        layout.addWidget(self.cut_plan_mode_combo, 0, 1)
+        layout.addWidget(self.cut_random_check, 1, 0, 1, 2)
+        layout.addWidget(QLabel("Do dai tu"), 2, 0)
+        layout.addWidget(self.cut_min_minutes, 2, 1)
+        layout.addWidget(QLabel("Den"), 2, 2)
+        layout.addWidget(self.cut_max_minutes, 2, 3)
+        layout.addWidget(QLabel("Cat bo dau"), 3, 0)
+        layout.addWidget(self.cut_head_seconds, 3, 1)
+        layout.addWidget(QLabel("Cat bo cuoi"), 3, 2)
+        layout.addWidget(self.cut_tail_seconds, 3, 3)
+        layout.addWidget(QLabel("So video toi da"), 4, 0)
+        layout.addWidget(self.cut_video_limit, 4, 1)
+        layout.addWidget(QLabel("So doan/video"), 4, 2)
+        layout.addWidget(self.cut_clip_limit, 4, 3)
+        layout.addWidget(QLabel("Che do cat"), 5, 0)
+        layout.addWidget(self.cut_mode_combo, 5, 1)
+        layout.addWidget(self.cut_keep_short_check, 5, 2, 1, 2)
+        layout.addWidget(self.timecode_panel, 6, 0, 1, 4)
+        self.on_cut_plan_mode_changed()
         return box
 
     def _build_log_tab(self) -> QWidget:
@@ -546,6 +629,11 @@ class CreatorNowStudio(QMainWindow):
             #panel {
                 background: #ffffff;
                 border: 1px solid #cbd5e1;
+                border-radius: 8px;
+            }
+            #timecodePanel {
+                background: #f8fafc;
+                border: 1px solid #94a3b8;
                 border-radius: 8px;
             }
             #dropBox {
@@ -697,12 +785,142 @@ class CreatorNowStudio(QMainWindow):
         self.step_input.setText(str(safe_path(step.input_folder)))
         self.step_output.setText(str(safe_path(step.output_folder)))
         self.cut_options.setVisible(self.is_cut_stock_step(step))
+        if self.is_cut_stock_step(step):
+            self.refresh_timecode_video_combo()
+        self.update_command_preview()
+
+    def on_cut_plan_mode_changed(self):
+        use_timecodes = self.cut_plan_mode_combo.currentData() == "timecodes"
+        self.timecode_panel.setVisible(use_timecodes)
+        for widget in (
+            self.cut_random_check,
+            self.cut_min_minutes,
+            self.cut_max_minutes,
+            self.cut_head_seconds,
+            self.cut_tail_seconds,
+            self.cut_video_limit,
+            self.cut_clip_limit,
+        ):
+            widget.setEnabled(not use_timecodes)
+        self.cut_mode_combo.setEnabled(not use_timecodes)
+        if use_timecodes:
+            encode_index = self.cut_mode_combo.findData("encode")
+            if encode_index >= 0:
+                self.cut_mode_combo.setCurrentIndex(encode_index)
+            self.refresh_timecode_video_combo()
+            self.update_timecode_preview()
         self.update_command_preview()
 
     def update_command_preview(self):
+        if not hasattr(self, "command_preview"):
+            return
         step = self.selected_step()
         if step:
             self.command_preview.setPlainText(self.build_command_text(step))
+
+    def open_timecode_cut_ui(self):
+        self.step_list.setCurrentRow(0)
+        self.tabs.setCurrentIndex(1)
+        index = self.cut_plan_mode_combo.findData("timecodes")
+        if index >= 0:
+            self.cut_plan_mode_combo.setCurrentIndex(index)
+        self.refresh_timecode_video_combo()
+        self.timecode_text.setFocus()
+
+    def refresh_timecode_video_combo(self):
+        if not hasattr(self, "timecode_video_combo"):
+            return
+        input_dir = safe_path("00.videogoc")
+        input_dir.mkdir(exist_ok=True)
+        current_name = self.timecode_video_combo.currentData()
+        videos = sorted(
+            [item for item in input_dir.iterdir() if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS],
+            key=lambda item: item.name.lower(),
+        )
+        self.timecode_video_combo.blockSignals(True)
+        self.timecode_video_combo.clear()
+        if videos:
+            for video in videos:
+                self.timecode_video_combo.addItem(video.name, video.name)
+            if current_name:
+                index = self.timecode_video_combo.findData(current_name)
+                if index >= 0:
+                    self.timecode_video_combo.setCurrentIndex(index)
+        else:
+            self.timecode_video_combo.addItem("Khong co video trong 00.videogoc", "")
+        self.timecode_video_combo.blockSignals(False)
+        self.update_timecode_preview()
+
+    def selected_timecode_video(self) -> Path | None:
+        name = self.timecode_video_combo.currentData() if hasattr(self, "timecode_video_combo") else ""
+        if not name:
+            return None
+        video_path = safe_path("00.videogoc") / str(name)
+        if video_path.exists() and video_path.is_file():
+            return video_path
+        return None
+
+    def parse_timecode_pairs(self, text: str) -> tuple[list[dict], list[str]]:
+        dash_pattern = r"(?:-|\u2010|\u2011|\u2012|\u2013|\u2014|\u2212)"
+        pair_pattern = re.compile(
+            rf"(?P<start>\d{{1,2}}:\d{{2}}(?::\d{{2}})?)\s*{dash_pattern}\s*"
+            rf"(?P<end>\d{{1,2}}:\d{{2}}(?::\d{{2}})?)"
+        )
+        scene_pattern = re.compile(r"(?:canh|c\u1ea3nh|scene)\s*(\d+)", re.IGNORECASE)
+        ranges = []
+        errors = []
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            for match in pair_pattern.finditer(line):
+                start = parse_time_value(match.group("start"))
+                end = parse_time_value(match.group("end"))
+                if start is None or end is None:
+                    errors.append(f"Dong {line_number}: khong doc duoc moc thoi gian.")
+                    continue
+                if end <= start:
+                    errors.append(
+                        f"Dong {line_number}: ket thuc {match.group('end')} phai lon hon bat dau {match.group('start')}."
+                    )
+                    continue
+                scene_match = scene_pattern.search(line[: match.start()])
+                scene = scene_match.group(1) if scene_match else str(len(ranges) + 1)
+                ranges.append(
+                    {
+                        "scene": scene,
+                        "start": start,
+                        "end": end,
+                        "source": line.strip(),
+                    }
+                )
+        if text.strip() and not ranges and not errors:
+            errors.append("Khong tim thay cap moc thoi gian nao. Hay dung dang 14:51 - 15:00.")
+        return ranges, errors
+
+    def update_timecode_preview(self):
+        if not hasattr(self, "timecode_table"):
+            return
+        video = self.selected_timecode_video()
+        stem = video.stem if video else "video"
+        ranges, errors = self.parse_timecode_pairs(self.timecode_text.toPlainText())
+        self.timecode_table.setRowCount(len(ranges))
+        for row, item in enumerate(ranges):
+            duration = item["end"] - item["start"]
+            values = [
+                str(item["scene"]),
+                format_seconds(item["start"]),
+                format_seconds(item["end"]),
+                format_seconds(duration),
+                timecode_filename(stem, row + 1, item["start"], item["end"]),
+            ]
+            for col, value in enumerate(values):
+                table_item = QTableWidgetItem(value)
+                if col in (1, 2, 3):
+                    table_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.timecode_table.setItem(row, col, table_item)
+        if errors:
+            self.statusBar().showMessage(errors[0])
+        elif ranges:
+            self.statusBar().showMessage(f"Da doc {len(ranges)} moc thoi gian.")
+        self.update_command_preview()
 
     def cut_settings(self) -> dict:
         min_seconds = int(round(self.cut_min_minutes.value() * 60))
@@ -710,6 +928,7 @@ class CreatorNowStudio(QMainWindow):
         if max_seconds < min_seconds:
             max_seconds = min_seconds
         return {
+            "plan_mode": self.cut_plan_mode_combo.currentData(),
             "random_duration": self.cut_random_check.isChecked(),
             "min_seconds": min_seconds,
             "max_seconds": max_seconds,
@@ -724,6 +943,29 @@ class CreatorNowStudio(QMainWindow):
     def build_command_text(self, step: WorkflowStep) -> str:
         if self.is_cut_stock_step(step):
             settings = self.cut_settings()
+            mode = "copy stream" if settings["mode"] == "copy" else "render lai"
+            if settings["plan_mode"] == "timecodes":
+                video = self.selected_timecode_video()
+                ranges, errors = self.parse_timecode_pairs(self.timecode_text.toPlainText())
+                video_text = str(video) if video else "Chua chon video"
+                preview_lines = [
+                    f"{index}. {format_seconds(item['start'])} - {format_seconds(item['end'])} "
+                    f"({format_seconds(item['end'] - item['start'])})"
+                    for index, item in enumerate(ranges[:12], start=1)
+                ]
+                if len(ranges) > 12:
+                    preview_lines.append(f"... va {len(ranges) - 12} moc nua")
+                if errors:
+                    preview_lines.append(f"Loi: {errors[0]}")
+                return (
+                    "Cat stock bang app - dan moc thoi gian\n"
+                    f"Video: {video_text}\n"
+                    f"Output: {safe_path(step.output_folder)}\n"
+                    f"So moc doc duoc: {len(ranges)}\n"
+                    f"Doan vuot video: {'cat phan con lai' if settings['keep_short'] else 'bo qua'}\n"
+                    f"Che do: {mode}\n"
+                    + ("\n".join(preview_lines) if preview_lines else "Chua co moc thoi gian.")
+                )
             duration_text = (
                 f"random {settings['min_seconds']}s - {settings['max_seconds']}s"
                 if settings["random_duration"]
@@ -731,7 +973,6 @@ class CreatorNowStudio(QMainWindow):
             )
             video_limit = "tat ca" if settings["video_limit"] == 0 else str(settings["video_limit"])
             clip_limit = "tat ca" if settings["clip_limit"] == 0 else str(settings["clip_limit"])
-            mode = "copy stream" if settings["mode"] == "copy" else "render lai"
             return (
                 "Cat stock bang app\n"
                 f"Input: {safe_path(step.input_folder)}\n"
@@ -769,6 +1010,8 @@ class CreatorNowStudio(QMainWindow):
                 self.stats_table.setItem(row, col, item)
         ffmpeg_ok = safe_path("ffmpeg.exe").exists()
         self.statusBar().showMessage("ffmpeg.exe san sang" if ffmpeg_ok else "Khong thay ffmpeg.exe trong thu muc app")
+        if hasattr(self, "cut_plan_mode_combo") and self.cut_plan_mode_combo.currentData() == "timecodes":
+            self.refresh_timecode_video_combo()
 
     def copy_input_files(self, files: list[Path]):
         target_dir = safe_path("00.videogoc")
@@ -904,8 +1147,67 @@ class CreatorNowStudio(QMainWindow):
         hours, minutes, seconds = match.groups()
         return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
+    def build_timecode_cut_tasks(self, step: WorkflowStep, settings: dict) -> list[dict]:
+        output_dir = safe_path(step.output_folder)
+        output_dir.mkdir(exist_ok=True)
+        video_path = self.selected_timecode_video()
+        if not video_path:
+            self.append_log("Chua chon video trong 00.videogoc de cat theo moc thoi gian.")
+            return []
+
+        ranges, errors = self.parse_timecode_pairs(self.timecode_text.toPlainText())
+        for error in errors:
+            self.append_log(error)
+        if not ranges:
+            self.append_log("Khong co moc thoi gian hop le de cat.")
+            return []
+
+        duration = self.video_duration_seconds(video_path)
+        if duration is None:
+            return []
+
+        tasks = []
+        self.append_log(f"Cat theo {len(ranges)} moc thoi gian tren video: {video_path.name} ({duration:.1f}s).")
+        for index, item in enumerate(ranges, start=1):
+            start_time = item["start"]
+            end_time = item["end"]
+            if start_time >= duration:
+                self.append_log(
+                    f"Bo qua canh {item['scene']}: bat dau {format_seconds(start_time)} vuot thoi luong video."
+                )
+                continue
+            if end_time > duration:
+                if not settings["keep_short"]:
+                    self.append_log(
+                        f"Bo qua canh {item['scene']}: ket thuc {format_seconds(end_time)} vuot thoi luong video."
+                    )
+                    continue
+                self.append_log(
+                    f"Canh {item['scene']}: cat den cuoi video thay vi {format_seconds(end_time)}."
+                )
+                end_time = duration
+
+            clip_duration = end_time - start_time
+            if clip_duration <= 0:
+                continue
+            output_path = output_dir / timecode_filename(video_path.stem, index, start_time, end_time)
+            tasks.append(
+                {
+                    "input": video_path,
+                    "output": output_path,
+                    "start": start_time,
+                    "duration": clip_duration,
+                    "part": index,
+                    "label": f"canh {item['scene']}",
+                }
+            )
+        return tasks
+
     def build_cut_tasks(self, step: WorkflowStep) -> list[dict]:
         settings = self.cut_settings()
+        if settings["plan_mode"] == "timecodes":
+            return self.build_timecode_cut_tasks(step, settings)
+
         input_dir = safe_path(step.input_folder)
         output_dir = safe_path(step.output_folder)
         output_dir.mkdir(exist_ok=True)
@@ -1030,7 +1332,41 @@ class CreatorNowStudio(QMainWindow):
         task = self.cut_tasks.pop(0)
         settings = self.cut_settings()
         ffmpeg = self.ffmpeg_program()
-        if settings["mode"] == "copy":
+        if settings["plan_mode"] == "timecodes":
+            preseek_seconds = min(3.0, max(0.0, float(task["start"])))
+            fast_seek_start = max(0.0, float(task["start"]) - preseek_seconds)
+            args = ["-y"]
+            if fast_seek_start > 0:
+                args.extend(["-ss", f"{fast_seek_start:.3f}"])
+            args.extend(["-i", str(task["input"])])
+            if preseek_seconds > 0:
+                args.extend(["-ss", f"{preseek_seconds:.3f}"])
+            args.extend(
+                [
+                    "-t",
+                    f"{task['duration']:.3f}",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0?",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    "-movflags",
+                    "+faststart",
+                    str(task["output"]),
+                ]
+            )
+        elif settings["mode"] == "copy":
             args = [
                 "-y",
                 "-ss",
@@ -1063,9 +1399,10 @@ class CreatorNowStudio(QMainWindow):
                 str(task["output"]),
             ]
 
+        task_label = task.get("label", f"part {task['part']}")
         self.append_log(
             f"Cat clip {self.cut_done + 1}/{self.cut_total}: "
-            f"{task['input'].name} part {task['part']} | start {task['start']:.1f}s | dai {task['duration']:.1f}s"
+            f"{task['input'].name} {task_label} | start {task['start']:.1f}s | dai {task['duration']:.1f}s"
         )
 
         self.process = QProcess(self)

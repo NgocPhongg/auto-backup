@@ -12,6 +12,7 @@ import socket
 import json as _json
 import re
 import threading
+import unicodedata
 import uuid
 from urllib.parse import quote
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -19,7 +20,15 @@ import win32gui
 import win32con
 import win32process
 from gologin_config import load_gologin_settings
+from gologin_profile_utils import first_real_gologin_profile_id
 from app_paths import gologin_base_dir, gologin_profile_dir, resource_path
+from proxy_utils import (
+    normalize_proxy_type,
+    parse_proxy_string,
+    proxy_custom_name,
+    proxy_display_text,
+    validate_proxy_connection,
+)
 
 GOLOGIN_BASE_DIR = str(gologin_base_dir())
 ZERO_PROFILE_ZIP = str(resource_path("gologin_zeroprofile.zip"))
@@ -52,7 +61,7 @@ class CDPWorker(QThread):
 
     def __init__(self, profile_index, profile_data, selected_features, feed_settings,
                  container_width=0, container_height=0, widget_id=0, parent=None,
-                 manual_only=False):
+                 manual_only=False, planned_profile_count=1):
         super().__init__(parent)
         self.profile_index = profile_index
         self.profile_data = profile_data
@@ -71,6 +80,7 @@ class CDPWorker(QThread):
         self._gologin = None
         self._using_gologin_api = False
         self.manual_only = bool(manual_only)
+        self._planned_profile_count = max(1, int(planned_profile_count or 1))
         self._browser_pids = set()
         self._process_pid = 0
         self._launch_started_at = 0.0
@@ -84,6 +94,26 @@ class CDPWorker(QThread):
         self._last_error = ""
         self._last_login_error = ""
         self._feed_scroll_delta_sign = 1
+        self._selected_feature_tokens = {
+            self._feature_token(feature) for feature in (self.selected_features or [])
+        }
+        self._batch_login_fail_fast_message = ""
+
+        username = self.profile_data.get("username", "").strip()
+        password = self.profile_data.get("password", "").strip()
+        cookie = self.profile_data.get("cookie", "").strip()
+        cookie_backup = self.profile_data.get("cookie_backup", "").strip()
+        if ("dang nhap" in self._selected_feature_tokens) and self._planned_profile_count > 1 and not self.manual_only:
+            if not (cookie or cookie_backup) and (not username or not password):
+                missing = ["cookie"]
+                if not username:
+                    missing.append("username/email")
+                if not password:
+                    missing.append("password")
+                profile_name = self.profile_data.get("ten_ho_so", "")
+                self._batch_login_fail_fast_message = (
+                    f"[{profile_name}] Thieu {', '.join(missing)} cho batch login"
+                )
 
         # Comment bank: lưu comment từ các video trước để clone chéo
         self._comment_bank = []       # list comment đã thu thập từ video cũ
@@ -108,11 +138,29 @@ class CDPWorker(QThread):
         browser_id = self.profile_data.get('browser_id', '')
         if not browser_id:
             # Tự tạo browser_id nếu chưa có (dựa trên row index)
-            browser_id = f"auto_{uuid.uuid4().hex[:8]}"
+            browser_id = ""
             self.profile_data['browser_id'] = browser_id
         self._browser_id = browser_id
         self._profile_dir = str(gologin_profile_dir(browser_id))
         self._gologin_profile_id = (self.profile_data.get("gologin_profile_id") or "").strip()
+        resolved_gologin_profile_id = first_real_gologin_profile_id(
+            self._gologin_profile_id,
+            self._browser_id,
+        )
+        if resolved_gologin_profile_id:
+            self.profile_data["browser_id"] = resolved_gologin_profile_id
+            self.profile_data["gologin_profile_id"] = resolved_gologin_profile_id
+            self._browser_id = resolved_gologin_profile_id
+            self._profile_dir = str(gologin_profile_dir(resolved_gologin_profile_id))
+            self._gologin_profile_id = resolved_gologin_profile_id
+        else:
+            if str(self.profile_data.get("browser_id") or "").startswith(("auto_", "gologin_")):
+                self.profile_data["browser_id"] = ""
+            if not first_real_gologin_profile_id(self.profile_data.get("gologin_profile_id", "")):
+                self.profile_data["gologin_profile_id"] = ""
+            self._browser_id = ""
+            self._profile_dir = ""
+            self._gologin_profile_id = ""
         strict_override = self.profile_data.get("gologin_passthrough_strict")
         if strict_override is None and isinstance(self.feed_settings, dict):
             strict_override = self.feed_settings.get("gologin_passthrough_strict")
@@ -130,6 +178,33 @@ class CDPWorker(QThread):
         if text in {"0", "false", "no", "n", "off"}:
             return False
         return bool(default)
+
+    @staticmethod
+    def _feature_token(value) -> str:
+        text = str(value or "").replace("Đ", "D").replace("đ", "d")
+        text = unicodedata.normalize("NFKD", text)
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+        return " ".join(text.lower().split())
+
+    def _is_batch_run(self) -> bool:
+        return (not self.manual_only) and self._planned_profile_count > 1
+
+    def _batch_login_fail_fast_reason(self) -> str:
+        if "dang nhap" not in getattr(self, "_selected_feature_tokens", set()) or not self._is_batch_run():
+            return ""
+        username = self.profile_data.get("username", "").strip()
+        password = self.profile_data.get("password", "").strip()
+        cookie = self.profile_data.get("cookie", "").strip()
+        cookie_backup = self.profile_data.get("cookie_backup", "").strip()
+        if cookie or cookie_backup:
+            return ""
+        missing = ["cookie"]
+        if not username:
+            missing.append("username/email")
+        if not password:
+            missing.append("password")
+        profile_name = self.profile_data.get("ten_ho_so", "")
+        return f"[{profile_name}] Thieu {', '.join(missing)} cho batch login"
 
     @staticmethod
     def _has_valid_tiktok_auth_cookie(cookies) -> bool:
@@ -318,57 +393,11 @@ class CDPWorker(QThread):
             return False
 
     def _normalize_proxy_mode(self, proxy_type):
-        proxy_type = (proxy_type or "http").strip().lower()
-        if proxy_type == "socks5h":
-            proxy_type = "socks5"
-        # GoLogin uses "http" mode for common HTTP/HTTPS CONNECT proxies.
-        if proxy_type == "https":
-            proxy_type = "http"
-        if proxy_type not in ("http", "socks4", "socks5"):
-            proxy_type = "http"
-        return proxy_type
+        return normalize_proxy_type(proxy_type)
 
     def _parse_proxy_string(self, proxy_str, proxy_type="http"):
         """Parse proxy formats: host:port, host:port:user:pass, scheme://host:port:user:pass, or user:pass@host:port."""
-        proxy_str = (proxy_str or "").strip()
-        if not proxy_str:
-            return None
-
-        proxy_type = self._normalize_proxy_mode(proxy_type)
-        if "://" in proxy_str:
-            scheme, proxy_str = proxy_str.split("://", 1)
-            proxy_type = self._normalize_proxy_mode(scheme)
-
-        username = ""
-        password = ""
-        if "@" in proxy_str:
-            auth_part, proxy_str = proxy_str.rsplit("@", 1)
-            if ":" in auth_part:
-                username, password = auth_part.split(":", 1)
-            else:
-                username = auth_part
-
-        parts = proxy_str.split(":", 3)
-        if len(parts) < 2:
-            return None
-
-        host = parts[0].strip()
-        port_text = parts[1].strip()
-        if not host or not port_text.isdigit():
-            return None
-
-        if not username and len(parts) >= 3:
-            username = parts[2].strip()
-        if not password and len(parts) >= 4:
-            password = parts[3].strip()
-
-        return {
-            "mode": proxy_type,
-            "host": host,
-            "port": int(port_text),
-            "username": username.strip(),
-            "password": password.strip(),
-        }
+        return parse_proxy_string(proxy_str, proxy_type)
 
     def _get_proxy_payload(self, for_gologin_api=False):
         payload = self._parse_proxy_string(
@@ -379,18 +408,67 @@ class CDPWorker(QThread):
             return None
         payload["changeIpUrl"] = ""
         if for_gologin_api:
-            profile_name = (self.profile_data.get("ten_ho_so") or "").strip()
-            if profile_name:
-                payload["customName"] = profile_name[:80]
-        else:
-            payload["autoProxyRegion"] = ""
-            payload["torProxyRegion"] = ""
+            custom_name = proxy_custom_name(
+                f"{payload.get('host')}:{payload.get('port')}",
+                payload.get("mode"),
+            )
+            payload["customName"] = custom_name
+        payload["autoProxyRegion"] = ""
+        payload["torProxyRegion"] = ""
         return payload
 
     def _proxy_display_text(self, payload):
         if not payload:
             return ""
-        return f"{payload.get('mode')}://{payload.get('host')}:{payload.get('port')}"
+        return proxy_display_text(
+            f"{payload.get('host')}:{payload.get('port')}",
+            payload.get("mode"),
+        )
+
+    def _validate_runtime_proxy(self):
+        proxy_string = (self.profile_data.get("proxy") or "").strip()
+        if not proxy_string:
+            return True
+        requested_mode = self._normalize_proxy_mode(
+            self.profile_data.get("proxy_type", self._proxy_type)
+        )
+
+        result = validate_proxy_connection(
+            proxy_string,
+            proxy_type=requested_mode,
+            require_ip_change=True,
+            timeout=8,
+        )
+        if not result.get("ok"):
+            self.status_update.emit(str(result.get("message") or "Proxy khong hop le"), "red")
+            return False
+
+        detected_mode = self._normalize_proxy_mode(result.get("scheme"))
+        self.profile_data["proxy_type"] = detected_mode
+        self._proxy_type = detected_mode
+
+        parsed_proxy = self._parse_proxy_string(proxy_string, detected_mode)
+        if parsed_proxy:
+            self._proxy_host = parsed_proxy["host"]
+            self._proxy_port = str(parsed_proxy["port"])
+            self._proxy_user = parsed_proxy.get("username", "")
+            self._proxy_pass = parsed_proxy.get("password", "")
+
+        update_payload = {"proxy_type": detected_mode}
+        try:
+            self.profile_update_signal.emit(update_payload)
+        except Exception:
+            pass
+
+        proxy_ip = str(result.get("proxy_ip") or "").strip()
+        direct_ip = str(result.get("direct_ip") or "").strip()
+        status_text = f"Proxy OK: {proxy_ip}" if proxy_ip else "Proxy OK"
+        if direct_ip and proxy_ip and direct_ip != proxy_ip:
+            status_text += f" (IP may: {direct_ip})"
+        if detected_mode != requested_mode:
+            status_text += f" - da chuyen sang {detected_mode.upper()}"
+        self.status_update.emit(status_text, "green")
+        return True
 
     def _sync_gologin_profile_proxy(self):
         """Persist the current proxy to the GoLogin cloud profile before starting it."""
@@ -427,7 +505,7 @@ class CDPWorker(QThread):
         except Exception as e:
             return False, f"Lỗi kết nối API GoLogin khi đồng bộ proxy: {e}"
 
-        if response.status_code in (200, 204):
+        if response.status_code in (200, 201, 204):
             display = self._proxy_display_text(proxy_payload)
             try:
                 self.profile_update_signal.emit({"gologin_proxy_synced": display})
@@ -593,6 +671,16 @@ class CDPWorker(QThread):
         )
 
     def _launch_browser_via_gologin_sdk(self):
+        fail_fast_reason = str(getattr(self, "_batch_login_fail_fast_message", "") or "").strip()
+        if fail_fast_reason:
+            self._emit_login_error(fail_fast_reason)
+            self.status_update.emit(
+                f"FAIL FAST: {fail_fast_reason}. Khong mo browser.",
+                "red",
+            )
+            self.finished_signal.emit(f"error: {fail_fast_reason}")
+            return False
+
         strict_mode = bool(self._strict_gologin_passthrough)
         token, _, _ = self._get_gologin_api_settings()
         if not token:
@@ -604,7 +692,7 @@ class CDPWorker(QThread):
             return False
         if not self._gologin_profile_id:
             self.status_update.emit(
-                "Profile nay chua co gologin_profile_id nen khong the mo bang GoLogin.",
+                "Profile nay chua co GoLogin Profile ID that nen khong the mo bang GoLogin.",
                 "red"
             )
             self.finished_signal.emit("error")
@@ -618,6 +706,9 @@ class CDPWorker(QThread):
             return False
 
         if self.profile_data.get("proxy", "").strip():
+            if not self._validate_runtime_proxy():
+                self.finished_signal.emit("error")
+                return False
             ok, message = self._sync_gologin_profile_proxy()
             if not ok:
                 self.status_update.emit(message, "red")
@@ -778,17 +869,45 @@ class CDPWorker(QThread):
         return False
 
     def run(self):
+        if "dang nhap" in self._selected_feature_tokens and self._is_batch_run():
+            username = self.profile_data.get("username", "").strip()
+            password = self.profile_data.get("password", "").strip()
+            cookie = self.profile_data.get("cookie", "").strip()
+            cookie_backup = self.profile_data.get("cookie_backup", "").strip()
+            if not (cookie or cookie_backup) and (not username or not password):
+                missing = ["cookie"]
+                if not username:
+                    missing.append("username/email")
+                if not password:
+                    missing.append("password")
+                profile_name = self.profile_data.get("ten_ho_so", "")
+                detail = f"[{profile_name}] Thieu {', '.join(missing)} cho batch login"
+                self._emit_login_error(detail)
+                self.status_update.emit(f"FAIL FAST: {detail}. Khong mo browser.", "red")
+                self.finished_signal.emit(f"error: {detail}")
+                try:
+                    self._release_browser_session()
+                finally:
+                    self._emit_browser_closed_once("closed")
+                return
         try:
             # Kiểm tra thông tin đăng nhập
-            if "Đăng nhập" in self.selected_features:
+            if "dang nhap" in self._selected_feature_tokens:
                 username = self.profile_data.get('username', '').strip()
                 password = self.profile_data.get('password', '').strip()
                 cookie = self.profile_data.get('cookie', '').strip()
-                if not cookie and (not username or not password):
+                cookie_backup = self.profile_data.get('cookie_backup', '').strip()
+                if self._is_batch_run() and not (cookie or cookie_backup) and (not username or not password):
                     missing = []
-                    if not username: missing.append("Username/Email")
-                    if not password: missing.append("Password")
+                    missing.append("cookie")
+                    if not username: missing.append("username/email")
+                    if not password: missing.append("password")
                     profile_name = self.profile_data.get('ten_ho_so', '')
+                    detail = f"[{profile_name}] Thieu {', '.join(missing)} cho batch login"
+                    self._emit_login_error(detail)
+                    self.status_update.emit(f"FAIL FAST: {detail}. Khong mo browser.", "red")
+                    self.finished_signal.emit(f"error: {detail}")
+                    return
                     self.status_update.emit(
                         f"❌ [{profile_name}] Thiếu {', '.join(missing)} - Bỏ qua!", "red"
                     )
@@ -4009,6 +4128,12 @@ class CDPWorker(QThread):
         reason = str(reason or self._last_login_error or "Dang nhap that bai").strip()
         if reason:
             self._emit_login_error(reason)
+        if self._is_batch_run():
+            self.status_update.emit(
+                f"Auto-login loi: {reason}. Batch mode bo qua cho dang nhap tay.",
+                "orange",
+            )
+            return False
 
         self.status_update.emit(
             f"Auto-login loi: {reason}. Giu browser mo de dang nhap tay.",
@@ -4042,6 +4167,12 @@ class CDPWorker(QThread):
         """Keep Orbita open when an action stops before its target is completed."""
         reason = str(reason or "Chức năng chưa hoàn tất").strip()
         self._last_error = reason
+        if self._is_batch_run():
+            self.status_update.emit(
+                f"Action loi: {reason}. Batch mode dong profile de chay tiep.",
+                "orange",
+            )
+            return
         self.status_update.emit(
             f"⚠️ {reason}. Giữ browser mở để kiểm tra, bấm Dừng khi muốn đóng.",
             "orange",
@@ -4502,6 +4633,8 @@ class CDPWorker(QThread):
         has_credentials = bool(username and password)
 
         if not has_credentials:
+            if self._is_batch_run():
+                self._emit_login_error("Khong co email/password de dang nhap lai trong batch")
             # Không có credentials → chuyển thẳng sang chờ thủ công
             self.status_update.emit("👤 Không có Email/Password — chờ đăng nhập thủ công...", "orange")
             return await self._wait_manual_login(cdp)
@@ -5045,9 +5178,19 @@ class CDPWorker(QThread):
                     pass
 
         # ── TH2: Auto login thất bại → chờ người dùng tự nhập ──
+        if self._is_batch_run() and not self._last_login_error:
+            self._emit_login_error("Auto login khong hoan tat")
         return await self._wait_manual_login(cdp)
 
     async def _wait_manual_login(self, cdp):
+        if self._is_batch_run():
+            reason = self._last_login_error or "Can dang nhap thu cong"
+            self._emit_login_error(reason)
+            self.status_update.emit(
+                f"Batch mode bo qua cho dang nhap thu cong: {reason}",
+                "orange",
+            )
+            return False
         """TH2: Chờ người dùng tự đăng nhập thủ công (5 phút).
         Polling mỗi 3 giây kiểm tra _check_logged_in().
         """

@@ -50,6 +50,28 @@ def resource_path(name: str) -> Path:
             return candidate
     return app_root_dir() / name
 
+def tool_dir_path(name: str) -> Path:
+    """Find external tool directories from source, release root, or bundled runtime data."""
+    root_candidate = app_root_dir() / name
+    candidates = [root_candidate]
+
+    try:
+        bundled_candidate = resource_path(name)
+    except Exception:
+        bundled_candidate = root_candidate
+
+    if bundled_candidate not in candidates:
+        candidates.append(bundled_candidate)
+
+    internal_candidate = app_root_dir() / "_internal" / name
+    if internal_candidate not in candidates:
+        candidates.append(internal_candidate)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return root_candidate
+
 
 def _is_gologin_orbita_chrome(path: Path) -> bool:
     text = str(path).lower().replace("/", "\\")

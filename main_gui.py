@@ -6,6 +6,7 @@ import json
 import os
 import inspect
 import webbrowser
+import re
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QSplitter, QTableWidget, QTableWidgetItem, QPushButton, 
@@ -25,8 +26,17 @@ from gologin_config import load_gologin_settings, save_gologin_settings, mask_se
 from video_table_manager import VideoTableManager
 from add_profile_dialog import AddProfileDialog
 from add_multiple_dialog import AddMultipleDialog
-from app_paths import data_file, gologin_profiles_root, init_app_data, named_browser_profile_dir, require_orbita_browser_exe, resource_path
+from app_paths import (
+    data_file,
+    gologin_profiles_root,
+    init_app_data,
+    named_browser_profile_dir,
+    require_orbita_browser_exe,
+    resource_path,
+    tool_dir_path,
+)
 from app_version import APP_VERSION
+from proxy_utils import normalize_proxy_type, validate_proxy_connection
 from update_checker import check_for_update
 
 # Disable gologin import for now
@@ -162,52 +172,16 @@ class GoLoginSettingsDialog(QDialog):
 def check_proxy_live(proxy_string, proxy_type="http"):
     """
     Kiểm tra xem proxy có hoạt động hay không.
-    Trả về: (True, "IP thật") nếu sống, (False, "Lỗi") nếu chết.
-    Tự động thử cả HTTP và SOCKS5 nếu có lỗi.
+    Trả về: (True, "IP public") nếu sống, (False, "Lỗi") nếu chết.
+    Chỉ coi là sống khi proxy thực sự đổi route IP, không đi ra IP máy thật.
     """
-    import requests
-    if not proxy_string.strip():
-        return True, "Không dùng Proxy"
-
-    parts = proxy_string.strip().split(":", 3)
-    if len(parts) < 2:
-        return False, "Sai định dạng Proxy. Cần ít nhất IP:Port"
-    
-    ip, port = parts[0], parts[1]
-    user = pwd = ""
-    if len(parts) >= 4:
-        user, pwd = parts[2], parts[3]
-
-    def test_protocol(ptype):
-        if user and pwd:
-            p_url = f"{ptype}://{user}:{pwd}@{ip}:{port}"
-        else:
-            p_url = f"{ptype}://{ip}:{port}"
-            
-        proxies = {
-            "http": p_url,
-            "https": p_url
-        }
-        try:
-            res = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=5)
-            if res.status_code == 200:
-                return True, res.json().get('ip', 'Unknown IP')
-        except:
-            pass
-        return False, ""
-
-    # Thử protocol do user chọn trước
-    is_live, msg = test_protocol(proxy_type)
-    if is_live:
-        return True, msg
-        
-    # Nếu thất bại, thử protocol còn lại
-    other_type = "socks5" if proxy_type == "http" else "http"
-    is_live, msg = test_protocol(other_type)
-    if is_live:
-        return True, f"{msg} (Auto-detected as {other_type.upper()})"
-        
-    return False, "Proxy không phản hồi, đã chết hoặc sai thông tin Auth!"
+    result = validate_proxy_connection(
+        proxy_string,
+        proxy_type=proxy_type,
+        require_ip_change=True,
+        timeout=6,
+    )
+    return bool(result.get("ok")), str(result.get("message") or "")
 
 
 def detect_proxy_type_from_check_message(default_type, message):
@@ -215,9 +189,11 @@ def detect_proxy_type_from_check_message(default_type, message):
     text = (message or "").lower()
     if "auto-detected as http" in text:
         return "http"
+    if "auto-detected as socks4" in text:
+        return "socks4"
     if "auto-detected as socks5" in text:
         return "socks5"
-    return (default_type or "http").lower()
+    return normalize_proxy_type(default_type)
 
 
 def sync_profile_data_from_table_columns(profile_data, columns):
@@ -225,6 +201,7 @@ def sync_profile_data_from_table_columns(profile_data, columns):
     profile_data = dict(profile_data or {})
     columns = columns or {}
     old_proxy = (profile_data.get("proxy") or "").strip()
+    old_browser_id = (profile_data.get("browser_id") or "").strip()
 
     table_to_profile = {
         "1": "ten_ho_so",
@@ -243,10 +220,18 @@ def sync_profile_data_from_table_columns(profile_data, columns):
     new_proxy = (profile_data.get("proxy") or "").strip()
     if "3" in columns and new_proxy and new_proxy != old_proxy:
         if "://" in new_proxy:
-            profile_data["proxy_type"] = new_proxy.split("://", 1)[0].strip().lower()
+            profile_data["proxy_type"] = normalize_proxy_type(new_proxy.split("://", 1)[0].strip().lower())
         else:
-            # Direct table edits have no proxy-type radio, so default to the app's HTTP proxy path.
-            profile_data["proxy_type"] = "http"
+            profile_data["proxy_type"] = normalize_proxy_type(profile_data.get("proxy_type") or "http")
+
+    if "4" in columns:
+        browser_id = (profile_data.get("browser_id") or "").strip()
+        if not browser_id:
+            profile_data["gologin_profile_id"] = ""
+        elif re.fullmatch(r"[0-9a-fA-F]{24}", browser_id):
+            profile_data["gologin_profile_id"] = browser_id
+        elif old_browser_id != browser_id and re.fullmatch(r"[0-9a-fA-F]{24}", old_browser_id):
+            profile_data["gologin_profile_id"] = ""
 
     return profile_data
 
@@ -1496,27 +1481,56 @@ class SSMAToolGUI(QMainWindow):
             self.log(f"Lỗi khi đọc dữ liệu: {e}", "red")
 
     def open_edit1_folder(self):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        edit_dir = os.path.join(base_dir, "EDIT_1")
-        if not os.path.isdir(edit_dir):
+        edit_dir = tool_dir_path("EDIT_1")
+        if not edit_dir.is_dir():
             QMessageBox.warning(self, "EDIT_1", f"Khong tim thay thu muc EDIT_1:\n{edit_dir}")
             return
-        os.startfile(edit_dir)
+        os.startfile(str(edit_dir))
         self.status_bar.showMessage("Da mo thu muc EDIT_1.", 5000)
         self.log(f"Da mo thu muc EDIT_1: {edit_dir}", "#00aa00")
 
-    def open_edit_video_tool(self):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        edit_dir = os.path.join(base_dir, "EDIT_1")
+    def _resolve_external_python(self, tool_title: str, prefer_windowed: bool = False):
+        program = sys.executable
+        args_prefix = []
 
-        if not os.path.isdir(edit_dir):
+        if getattr(sys, "frozen", False):
+            import shutil
+            candidates = []
+            if prefer_windowed:
+                candidates.extend([
+                    shutil.which("pythonw"),
+                    shutil.which("pythonw.exe"),
+                ])
+            candidates.extend([
+                shutil.which("python"),
+                shutil.which("python.exe"),
+                shutil.which("python3"),
+                shutil.which("py"),
+            ])
+            program = next((item for item in candidates if item), "")
+            if not program:
+                QMessageBox.warning(self, tool_title, f"Không tìm thấy Python để chạy {tool_title}.")
+                return "", []
+            if os.path.basename(program).lower() in ("py.exe", "py"):
+                args_prefix = ["-3"]
+        elif prefer_windowed:
+            pythonw = os.path.join(os.path.dirname(program), "pythonw.exe")
+            if os.path.isfile(pythonw):
+                program = pythonw
+
+        return program, args_prefix
+
+    def open_edit_video_tool(self):
+        edit_dir = tool_dir_path("EDIT_1")
+
+        if not edit_dir.is_dir():
             QMessageBox.warning(self, "EDIT video", f"Không tìm thấy thư mục EDIT_1:\n{edit_dir}")
             return
 
         entry_script = None
         for file_name in ("main.py", "ui_main.py"):
-            candidate = os.path.join(edit_dir, file_name)
-            if os.path.isfile(candidate):
+            candidate = edit_dir / file_name
+            if candidate.is_file():
                 entry_script = candidate
                 break
 
@@ -1524,19 +1538,12 @@ class SSMAToolGUI(QMainWindow):
             QMessageBox.warning(self, "EDIT video", "Không tìm thấy file main.py hoặc ui_main.py trong thư mục EDIT_1.")
             return
 
-        program = sys.executable
-        args = [entry_script]
+        program, args_prefix = self._resolve_external_python("EDIT video")
+        if not program:
+            return
+        args = [*args_prefix, str(entry_script)]
 
-        if getattr(sys, "frozen", False):
-            import shutil
-            program = shutil.which("python") or shutil.which("python3") or shutil.which("py")
-            if not program:
-                QMessageBox.warning(self, "EDIT video", "Không tìm thấy Python để chạy EDIT_1/main.py.")
-                return
-            if os.path.basename(program).lower() in ("py.exe", "py"):
-                args = ["-3", entry_script]
-
-        started = QProcess.startDetached(program, args, edit_dir)
+        started = QProcess.startDetached(program, args, str(edit_dir))
         if isinstance(started, tuple):
             started = started[0]
 
@@ -1547,14 +1554,13 @@ class SSMAToolGUI(QMainWindow):
             QMessageBox.critical(self, "EDIT video", f"Không chạy được:\n{entry_script}")
 
     def open_creator_now_tool(self):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        tool_dir = os.path.join(base_dir, "Creator Now Cut 14112025")
-        script = os.path.join(tool_dir, "creator_now_studio.py")
+        tool_dir = tool_dir_path("Creator Now Cut 14112025")
+        script = tool_dir / "creator_now_studio.py"
 
-        if not os.path.isdir(tool_dir):
+        if not tool_dir.is_dir():
             QMessageBox.warning(self, "Creator Now", f"Khong tim thay thu muc Creator Now:\n{tool_dir}")
             return
-        if not os.path.isfile(script):
+        if not script.is_file():
             QMessageBox.warning(
                 self,
                 "Creator Now",
@@ -1562,16 +1568,11 @@ class SSMAToolGUI(QMainWindow):
             )
             return
 
-        program = sys.executable
-        pythonw = os.path.join(os.path.dirname(program), "pythonw.exe")
-        if os.path.isfile(pythonw):
-            program = pythonw
-        elif os.path.basename(program).lower() == "python.exe":
-            candidate = os.path.join(os.path.dirname(program), "pythonw.exe")
-            if os.path.isfile(candidate):
-                program = candidate
+        program, args_prefix = self._resolve_external_python("Creator Now", prefer_windowed=True)
+        if not program:
+            return
 
-        started = QProcess.startDetached(program, [script], tool_dir)
+        started = QProcess.startDetached(program, [*args_prefix, str(script)], str(tool_dir))
 
         if isinstance(started, tuple):
             started = started[0]
@@ -2438,21 +2439,17 @@ class SSMAToolGUI(QMainWindow):
                     data["gologin_profile_id"] = profile_id
                     self.log(f"✅ Đã tạo GoLogin cloud profile: {profile_id}", "#00ff00")
                 else:
-                    settings = load_gologin_settings()
-                    use_cloud = bool(settings.get("use_gologin_cloud"))
-                    
-                    if use_cloud and cloud_result not in ("GoLogin cloud đang tắt trong cấu hình.", "Thiếu GoLogin API key."):
-                        self.log(f"❌ Không tạo được GoLogin cloud cho {profile_name}: {cloud_result}", "red")
-                        self.log("Dừng quá trình nhập do lỗi API GoLogin.", "red")
-                        QMessageBox.critical(self, "Lỗi API GoLogin", f"Lỗi API khi tạo profile {profile_name}. Quá trình thêm nhiều đã bị dừng giữa chừng.")
-                        break # DỪNG LUÔN
-                    else:
-                        import time
-                        local_id = f"gologin_{int(time.time())}_{success_count}"
-                        data["browser_id"] = local_id
-                        data["gologin_profile_id"] = ""
-                        self.log(f"✅ Tạo hồ sơ offline: {local_id}", "#00ff00")
-                
+                    self.log(f"❌ Không tạo được GoLogin profile thật cho {profile_name}: {cloud_result}", "red")
+                    self.log("Dừng quá trình nhập vì tool chỉ cho phép profile GoLogin thật.", "red")
+                    QMessageBox.critical(
+                        self,
+                        "Lỗi GoLogin",
+                        f"Không tạo được GoLogin profile thật cho {profile_name}.\n\n"
+                        f"Chi tiết:\n{cloud_result}\n\n"
+                        "Tool hiện không còn tạo profile local/offline.",
+                    )
+                    break
+
                 self.add_profile_to_table(data)
                 success_count += 1
                 
@@ -2506,32 +2503,18 @@ class SSMAToolGUI(QMainWindow):
                 self.log(f"✅ Đã tạo GoLogin cloud profile: {profile_id}", "#00ff00")
                 QMessageBox.information(self, "Thành công", f"Đã tạo GoLogin profile!\nID: {profile_id}")
             else:
-                settings = load_gologin_settings()
-                use_cloud = bool(settings.get("use_gologin_cloud"))
-                
-                if use_cloud and cloud_result not in ("GoLogin cloud đang tắt trong cấu hình.", "Thiếu GoLogin API key."):
-                    # Lỗi API thực sự, hủy tạo profile
-                    self.log(f"❌ Không tạo được GoLogin cloud: {cloud_result}", "red")
-                    short_reason = self._explain_gologin_error(cloud_result)
-                    QMessageBox.critical(
-                        self,
-                        "Lỗi tạo profile",
-                        f"Không tạo được profile trên GoLogin cloud.\n"
-                        f"Lý do: {short_reason}\n\n"
-                        f"Chi tiết kỹ thuật:\n{cloud_result}\n\n"
-                        "Quá trình thêm hồ sơ đã bị hủy."
-                    )
-                    return # Dừng, không tạo profile
-                else:
-                    # Người dùng chủ động tắt cloud hoặc chưa có key -> Tạo offline
-                    import time
-                    local_id = f"gologin_{int(time.time())}"
-                    data["browser_id"] = local_id
-                    if not data.get("gologin_profile_id"):
-                        data["gologin_profile_id"] = ""
+                self.log(f"❌ Không tạo được GoLogin profile thật: {cloud_result}", "red")
+                short_reason = self._explain_gologin_error(cloud_result)
+                QMessageBox.critical(
+                    self,
+                    "Lỗi tạo profile",
+                    f"Không tạo được GoLogin profile thật.\n"
+                    f"Lý do: {short_reason}\n\n"
+                    f"Chi tiết kỹ thuật:\n{cloud_result}\n\n"
+                    "Tool hiện không còn tạo profile local/offline."
+                )
+                return
 
-                    self.log(f"✅ Tạo hồ sơ offline: {local_id}", "#00ff00")
-            
             self.add_profile_to_table(data)
 
     def handle_edit_profile(self, index):

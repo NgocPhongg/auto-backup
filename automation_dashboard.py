@@ -3,8 +3,8 @@ import os
 import asyncio
 import random
 import json
-import uuid
 import time
+import re
 
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QCheckBox,
@@ -17,6 +17,7 @@ from PyQt5.QtCore import Qt, QEvent, QThread, pyqtSignal, QUrl, QTimer, QPoint
 from PyQt5.QtGui import QColor, QCursor
 from PyQt5.QtNetwork import QNetworkCookie
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
+from gologin_profile_utils import first_real_gologin_profile_id
 from app_paths import data_file, named_browser_profile_dir
 
 
@@ -896,7 +897,7 @@ class AutomationDashboard(QDialog):
             # Đảm bảo browser_id luôn có giá trị duy nhất
             browser_id = profile_data.get("browser_id", "")
             if not browser_id:
-                browser_id = f"auto_{uuid.uuid4().hex[:8]}"
+                browser_id = ""
                 profile_data["browser_id"] = browser_id
                 # Lưu lại vào accounts_data để lần sau không tạo lại
                 acc_info.setdefault("profile_data", {})["browser_id"] = browser_id
@@ -970,7 +971,7 @@ class AutomationDashboard(QDialog):
             # Đảm bảo browser_id luôn có giá trị duy nhất
             browser_id = profile_data.get("browser_id", "")
             if not browser_id:
-                browser_id = f"auto_{uuid.uuid4().hex[:8]}"
+                browser_id = ""
                 profile_data["browser_id"] = browser_id
                 acc_info.setdefault("profile_data", {})["browser_id"] = browser_id
 
@@ -1081,7 +1082,7 @@ class AutomationDashboard(QDialog):
             # Đảm bảo browser_id luôn có giá trị duy nhất
             browser_id = profile_data.get("browser_id", "")
             if not browser_id:
-                browser_id = f"auto_{uuid.uuid4().hex[:8]}"
+                browser_id = ""
                 profile_data["browser_id"] = browser_id
                 # Lưu lại vào accounts_data để lần sau không tạo lại
                 acc_info.setdefault("profile_data", {})["browser_id"] = browser_id
@@ -1154,7 +1155,7 @@ class AutomationDashboard(QDialog):
             # Đảm bảo browser_id luôn có giá trị duy nhất
             browser_id = profile_data.get("browser_id", "")
             if not browser_id:
-                browser_id = f"auto_{uuid.uuid4().hex[:8]}"
+                browser_id = ""
                 profile_data["browser_id"] = browser_id
                 acc_info.setdefault("profile_data", {})["browser_id"] = browser_id
 
@@ -1203,15 +1204,13 @@ class AutomationDashboard(QDialog):
         columns = acc_info.setdefault("columns", {})
         profile_data = acc_info.setdefault("profile_data", {})
 
-        browser_id = (
-            profile_data.get("browser_id")
-            or columns.get("4")
-            or profile_data.get("gologin_profile_id")
-            or ""
-        ).strip()
-        if not browser_id:
-            browser_id = f"auto_{uuid.uuid4().hex[:8]}"
+        browser_id = first_real_gologin_profile_id(
+            profile_data.get("gologin_profile_id"),
+            profile_data.get("browser_id"),
+            columns.get("4"),
+        )
         profile_data["browser_id"] = browser_id
+        profile_data["gologin_profile_id"] = browser_id
         columns["4"] = browser_id
 
         source_row = acc_info.get("source_row")
@@ -1229,7 +1228,11 @@ class AutomationDashboard(QDialog):
 
     def _profile_key_for_account(self, row):
         acc_info, profile_data, columns, browser_id = self._ensure_profile_identity(row)
-        gologin_id = (profile_data.get("gologin_profile_id") or "").strip()
+        gologin_id = first_real_gologin_profile_id(
+            profile_data.get("gologin_profile_id"),
+            browser_id,
+            columns.get("4"),
+        )
         profile_name = profile_data.get("ten_ho_so", "") or columns.get("1", f"Profile_{row}")
         if gologin_id:
             return f"gologin:{gologin_id}", profile_name
@@ -1400,7 +1403,12 @@ class AutomationDashboard(QDialog):
             acc_info = self.accounts_data[row]
             profile_data = acc_info.get("profile_data", {})
             columns = acc_info.get("columns", {})
-            if not (profile_data.get("gologin_profile_id") or "").strip():
+            resolved_id = first_real_gologin_profile_id(
+                profile_data.get("gologin_profile_id"),
+                profile_data.get("browser_id"),
+                columns.get("4"),
+            )
+            if not resolved_id:
                 name = (
                     profile_data.get("ten_ho_so")
                     or columns.get("1")
@@ -1414,7 +1422,7 @@ class AutomationDashboard(QDialog):
             QMessageBox.warning(
                 self,
                 "GoLogin Local SDK",
-                "Cac profile nay chua co gologin_profile_id nen khong the chay bang GoLogin:\n\n"
+                "Cac profile nay chua co GoLogin Profile ID that nen khong the chay bang GoLogin:\n\n"
                 f"{sample}{more}",
             )
             return False
@@ -1730,6 +1738,7 @@ class AutomationDashboard(QDialog):
             embed_browser=embed_browser,
             preview_width=self._current_preview_width,
             browser_height=self._current_browser_height,
+            planned_profile_count=max(1, int(self._planned_profile_count or 1)),
             start_collapsed=start_collapsed,
         )
         run_generation = self._run_generation
@@ -1971,6 +1980,8 @@ class AutomationDashboard(QDialog):
             refresh_token = new_data.get("refresh_token", "")
             if refresh_token:
                 acc.setdefault("profile_data", {})["refresh_token"] = refresh_token
+            if "proxy_type" in new_data and new_data.get("proxy_type"):
+                acc.setdefault("profile_data", {})["proxy_type"] = new_data.get("proxy_type")
             gologin_proxy_synced = new_data.get("gologin_proxy_synced", "")
             if gologin_proxy_synced:
                 acc.setdefault("profile_data", {})["gologin_proxy_synced"] = gologin_proxy_synced
@@ -2037,6 +2048,8 @@ class AutomationDashboard(QDialog):
                     refresh_token = new_data.get("refresh_token", "")
                     if refresh_token:
                         pdata["refresh_token"] = refresh_token
+                    if "proxy_type" in new_data and new_data.get("proxy_type"):
+                        pdata["proxy_type"] = new_data.get("proxy_type")
                     gologin_proxy_synced = new_data.get("gologin_proxy_synced", "")
                     if gologin_proxy_synced:
                         pdata["gologin_proxy_synced"] = gologin_proxy_synced
@@ -2111,6 +2124,7 @@ class BrowserPreviewWidget(QFrame):
         embed_browser=True,
         preview_width=960,
         browser_height=680,
+        planned_profile_count=1,
         start_collapsed=False,
         parent=None,
     ):
@@ -2123,6 +2137,7 @@ class BrowserPreviewWidget(QFrame):
         self.profile_index = profile_index
         self.account_row = account_row
         self.embed_browser = embed_browser
+        self.planned_profile_count = max(1, int(planned_profile_count or 1))
         self.worker = None
         self._last_browser_focus_ts = 0.0
         self._last_status_payload = None
@@ -2862,6 +2877,7 @@ class BrowserPreviewWidget(QFrame):
             container_width=container_w,
             container_height=container_h,
             widget_id=widget_id,
+            planned_profile_count=self.planned_profile_count,
         )
         self._connect_worker_signals()
         self.worker.start()
@@ -2956,6 +2972,7 @@ class BrowserPreviewWidget(QFrame):
             container_height=container_h,
             widget_id=widget_id,
             manual_only=True,
+            planned_profile_count=self.planned_profile_count,
         )
         self._connect_worker_signals()
         self.worker.start()

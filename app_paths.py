@@ -27,6 +27,16 @@ DATA_DIRS = (
     "backups",
     "temp",
     "gologin_profiles",
+    "local_chrome_profiles",
+    "stealth_firefox_profiles",
+)
+
+LOCAL_CHROME_DISPOSABLE_TEST_PREFIXES = (
+    "fresh_",
+    "smoke",
+    "test_launch_",
+    "test_portable_check",
+    "codexcheck_",
 )
 
 
@@ -108,6 +118,80 @@ def require_orbita_browser_exe(preferred_path: str | None = None) -> str:
         "hoac dat orbita-browser.exe trong thu muc browser cua app."
     )
 
+def find_chrome_exe(preferred_path: str | None = None) -> str | None:
+    """Find the shared Chrome binary for Local Chrome backend."""
+    candidates: list[Path] = []
+    if preferred_path:
+        candidates.append(Path(preferred_path))
+    candidates.extend([
+        # Uu tien chrome-win64 portable dat canh app
+        app_root_dir() / "chrome-win64" / "chrome.exe",
+        app_root_dir() / "browser" / "chrome.exe",
+        tool_dir_path("chrome-win64") / "chrome.exe",
+        # Fallback Chrome he thong
+        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+        Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+    ])
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists() and candidate.is_file() and candidate.name.lower() == "chrome.exe":
+            return str(candidate)
+    return None
+
+
+def require_chrome_exe(preferred_path: str | None = None) -> str:
+    exe_path = find_chrome_exe(preferred_path)
+    if exe_path:
+        return exe_path
+    raise FileNotFoundError(
+        "Khong tim thay Chrome cho Local Chrome backend. Hay dat chrome.exe tai "
+        "chrome-win64\\chrome.exe trong thu muc app, hoac cai Google Chrome tren may."
+    )
+
+def find_stealth_firefox_exe(preferred_path: str | None = None) -> str | None:
+    candidates: list[Path] = []
+    if preferred_path:
+        candidates.append(Path(preferred_path))
+    candidates.extend([
+        app_root_dir() / "stealth_firefox" / "firefox.exe",
+        app_root_dir() / "stealth_firefox" / "firefox" / "firefox.exe",
+        tool_dir_path("stealth_firefox") / "firefox.exe",
+        tool_dir_path("stealth_firefox") / "firefox" / "firefox.exe",
+    ])
+    try:
+        from invisible_playwright import ensure_binary
+
+        cached_path = ensure_binary()
+        if cached_path:
+            candidates.append(Path(cached_path))
+    except Exception:
+        pass
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists() and candidate.is_file() and candidate.name.lower() == "firefox.exe":
+            return str(candidate)
+    return None
+
+def require_stealth_firefox_exe(preferred_path: str | None = None) -> str:
+    exe_path = find_stealth_firefox_exe(preferred_path)
+    if exe_path:
+        return exe_path
+    raise FileNotFoundError(
+        "Khong tim thay Firefox patched cho Stealth Firefox backend. "
+        "Hay dat firefox.exe tai stealth_firefox\\firefox.exe trong thu muc app, "
+        "hoac cai invisible_playwright va chay: python -m invisible_playwright fetch"
+    )
+
 
 def ensure_dir(name: str | None = None) -> Path:
     path = app_data_dir() if name is None else app_data_dir() / name
@@ -135,6 +219,52 @@ def browser_profiles_dir() -> Path:
 def named_browser_profile_dir(profile_name: str) -> Path:
     safe_name = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in str(profile_name or ""))
     return browser_profiles_dir() / safe_name
+
+def local_chrome_profiles_root() -> Path:
+    return app_root_dir() / "local_chrome_profiles"
+
+def local_chrome_check_profiles_root() -> Path:
+    path = app_root_dir() / ".codex_tmp" / "local_chrome_checks"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def local_chrome_check_profile_dir(check_name: str) -> Path:
+    safe_name = "".join(
+        c if c.isalnum() or c in ("_", "-") else "_"
+        for c in str(check_name or "")
+    ).strip("_") or "check"
+    path = local_chrome_check_profiles_root() / safe_name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def is_local_chrome_disposable_test_dir_name(name: str) -> bool:
+    text = str(name or "").strip().lower()
+    if not text:
+        return False
+    if text in {"smoke", "smoke2", "fresh_profile_never_used", "test_portable_check"}:
+        return True
+    return any(text.startswith(prefix) for prefix in LOCAL_CHROME_DISPOSABLE_TEST_PREFIXES)
+
+
+
+def local_chrome_profile_dir(browser_id: str) -> Path:
+    from browser_backend_utils import local_chrome_storage_key
+
+    key = local_chrome_storage_key(browser_id)
+    path = local_chrome_profiles_root() / key
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def stealth_firefox_profiles_root() -> Path:
+    return app_root_dir() / "stealth_firefox_profiles"
+
+def stealth_firefox_profile_dir(browser_id: str) -> Path:
+    from browser_backend_utils import stealth_firefox_storage_key
+
+    key = stealth_firefox_storage_key(browser_id)
+    path = stealth_firefox_profiles_root() / key
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def gologin_profiles_root() -> Path:

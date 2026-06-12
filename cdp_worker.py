@@ -1,7 +1,7 @@
-"""
-Worker CDP — Thay thế GoLoginWorker.
-Dùng CDP trực tiếp (websockets) thay Playwright.
-Hỗ trợ screencast live preview.
+﻿"""
+Worker CDP â€” Thay tháº¿ GoLoginWorker.
+DÃ¹ng CDP trá»±c tiáº¿p (websockets) thay Playwright.
+Há»— trá»£ screencast live preview.
 """
 import os
 import time
@@ -21,7 +21,9 @@ import win32con
 import win32process
 from gologin_config import load_gologin_settings
 from gologin_profile_utils import first_real_gologin_profile_id
-from app_paths import gologin_base_dir, gologin_profile_dir, resource_path
+from gologin_proxy_check import validate_profile_proxy
+from app_paths import resource_path, local_chrome_profile_dir
+from browser_backend_utils import LOCAL_CHROME_BACKEND, normalize_browser_backend
 from proxy_utils import (
     normalize_proxy_type,
     parse_proxy_string,
@@ -30,14 +32,13 @@ from proxy_utils import (
     validate_proxy_connection,
 )
 
-GOLOGIN_BASE_DIR = str(gologin_base_dir())
 ZERO_PROFILE_ZIP = str(resource_path("gologin_zeroprofile.zip"))
 
 BROWSER_WIDTH = 960
 BROWSER_HEIGHT = 680
-APP_TITLEBAR_HEIGHT = 0  # 0 = hiện thanh trình duyệt
+APP_TITLEBAR_HEIGHT = 0  # 0 = hiá»‡n thanh trÃ¬nh duyá»‡t
 
-# Viewport ảo — lừa TikTok render layout desktop 3 cột chuẩn
+# Viewport áº£o â€” lá»«a TikTok render layout desktop 3 cá»™t chuáº©n
 VIRTUAL_VIEWPORT_W = 1280
 VIRTUAL_VIEWPORT_H = 720
 _GOLOGIN_START_LOCK = threading.RLock()
@@ -50,9 +51,16 @@ def _is_port_open(port: int, timeout: float = 0.3) -> bool:
     except OSError:
         return False
 
+def _safe_randint(a: int, b: int) -> int:
+    a = int(a)
+    b = int(b)
+    if a > b:
+        a, b = b, a
+    return random.randint(a, b)
+
 
 class CDPWorker(QThread):
-    """Worker dùng CDP + Native Window Embedding (SetParent) — 60 FPS mượt mà."""
+    """Worker dÃ¹ng CDP + Native Window Embedding (SetParent) â€” 60 FPS mÆ°á»£t mÃ ."""
     status_update = pyqtSignal(str, str)       # (message, color)
     finished_signal = pyqtSignal(str)           # "success" / "error"
     profile_update_signal = pyqtSignal(dict)    # {"tiktok_id": ..., "cookie": ...}
@@ -65,11 +73,11 @@ class CDPWorker(QThread):
         super().__init__(parent)
         self.profile_index = profile_index
         self.profile_data = profile_data
-        self.selected_features = selected_features
+        self.selected_features = list(selected_features or [])
         self.feed_settings = feed_settings
         self.container_width = container_width or BROWSER_WIDTH
         self.container_height = container_height or BROWSER_HEIGHT
-        self.widget_id = widget_id  # HWND của QWidget container
+        self.widget_id = widget_id  # HWND cá»§a QWidget container
         self._stop_flag = False
         self._process = None
         self._debug_port = 0
@@ -94,30 +102,29 @@ class CDPWorker(QThread):
         self._last_error = ""
         self._last_login_error = ""
         self._feed_scroll_delta_sign = 1
-        self._selected_feature_tokens = {
-            self._feature_token(feature) for feature in (self.selected_features or [])
+        supported_feature_tokens = {
+            self._feature_token("Dang nhap"),
+            self._feature_token("Doi avatar"),
+            self._feature_token("Tuong tac o Feed"),
+            self._feature_token("Tuong tac theo tu khoa"),
         }
-        self._batch_login_fail_fast_message = ""
+        self._unsupported_selected_features = []
+        filtered_features = []
+        for feature in self.selected_features:
+            token = self._feature_token(feature)
+            if token in supported_feature_tokens:
+                filtered_features.append(feature)
+            elif str(feature or "").strip():
+                self._unsupported_selected_features.append(str(feature))
+        self.selected_features = filtered_features
+        self._selected_feature_tokens = {
+            self._feature_token(feature) for feature in self.selected_features
+        }
 
-        username = self.profile_data.get("username", "").strip()
-        password = self.profile_data.get("password", "").strip()
-        cookie = self.profile_data.get("cookie", "").strip()
-        cookie_backup = self.profile_data.get("cookie_backup", "").strip()
-        if ("dang nhap" in self._selected_feature_tokens) and self._planned_profile_count > 1 and not self.manual_only:
-            if not (cookie or cookie_backup) and (not username or not password):
-                missing = ["cookie"]
-                if not username:
-                    missing.append("username/email")
-                if not password:
-                    missing.append("password")
-                profile_name = self.profile_data.get("ten_ho_so", "")
-                self._batch_login_fail_fast_message = (
-                    f"[{profile_name}] Thieu {', '.join(missing)} cho batch login"
-                )
 
-        # Comment bank: lưu comment từ các video trước để clone chéo
-        self._comment_bank = []       # list comment đã thu thập từ video cũ
-        self._comment_history = set() # chống trùng lặp trong phiên
+        # Comment bank: lÆ°u comment tá»« cÃ¡c video trÆ°á»›c Ä‘á»ƒ clone chÃ©o
+        self._comment_bank = []       # list comment Ä‘Ã£ thu tháº­p tá»« video cÅ©
+        self._comment_history = set() # chá»‘ng trÃ¹ng láº·p trong phiÃªn
         self._comment_cooldown = False  # rate limit flag
 
         # Parse proxy
@@ -126,6 +133,7 @@ class CDPWorker(QThread):
         self._proxy_user = ""
         self._proxy_pass = ""
         self._proxy_type = (self.profile_data.get('proxy_type', 'http') or 'http').strip().lower()
+        self._gologin_profile_has_proxy = False
         parsed_proxy = self._parse_proxy_string(self.profile_data.get('proxy', ''), self._proxy_type)
         if parsed_proxy:
             self._proxy_type = parsed_proxy["mode"]
@@ -133,34 +141,46 @@ class CDPWorker(QThread):
             self._proxy_port = str(parsed_proxy["port"])
             self._proxy_user = parsed_proxy.get("username", "")
             self._proxy_pass = parsed_proxy.get("password", "")
+            self._gologin_profile_has_proxy = True
 
-        # Thư mục profile — luôn dựa trên browser_id duy nhất
-        browser_id = self.profile_data.get('browser_id', '')
+        # ThÆ° má»¥c profile â€” luÃ´n dá»±a trÃªn browser_id duy nháº¥t
+        browser_id = str(self.profile_data.get('browser_id', '') or '').strip()
         if not browser_id:
-            # Tự tạo browser_id nếu chưa có (dựa trên row index)
+            # Tá»± táº¡o browser_id náº¿u chÆ°a cÃ³ (dá»±a trÃªn row index)
             browser_id = ""
-            self.profile_data['browser_id'] = browser_id
-        self._browser_id = browser_id
-        self._profile_dir = str(gologin_profile_dir(browser_id))
+        self._browser_id = ""
+        self._profile_dir = ""
         self._gologin_profile_id = (self.profile_data.get("gologin_profile_id") or "").strip()
-        resolved_gologin_profile_id = first_real_gologin_profile_id(
-            self._gologin_profile_id,
-            self._browser_id,
-        )
-        if resolved_gologin_profile_id:
-            self.profile_data["browser_id"] = resolved_gologin_profile_id
-            self.profile_data["gologin_profile_id"] = resolved_gologin_profile_id
-            self._browser_id = resolved_gologin_profile_id
-            self._profile_dir = str(gologin_profile_dir(resolved_gologin_profile_id))
-            self._gologin_profile_id = resolved_gologin_profile_id
-        else:
-            if str(self.profile_data.get("browser_id") or "").startswith(("auto_", "gologin_")):
-                self.profile_data["browser_id"] = ""
-            if not first_real_gologin_profile_id(self.profile_data.get("gologin_profile_id", "")):
-                self.profile_data["gologin_profile_id"] = ""
-            self._browser_id = ""
-            self._profile_dir = ""
+        self._browser_backend = normalize_browser_backend(self.profile_data.get("browser_backend"))
+        if self._browser_backend == "local_chrome":
+            if not browser_id or not browser_id.startswith("local_chrome:"):
+                browser_id = str(self.profile_data.get("browser_id") or "").strip()
+            if not browser_id or not browser_id.startswith("local_chrome:"):
+                from browser_backend_utils import make_local_chrome_browser_id
+                browser_id = make_local_chrome_browser_id(self.profile_data.get("ten_ho_so") or f"profile_{self.profile_index}")
+            self._browser_id = browser_id
+            self.profile_data["browser_id"] = browser_id
+            self.profile_data["gologin_profile_id"] = ""
             self._gologin_profile_id = ""
+            self._profile_dir = str(local_chrome_profile_dir(browser_id))
+        else:
+            resolved_gologin_profile_id = first_real_gologin_profile_id(
+                self._gologin_profile_id,
+                browser_id,
+            )
+            if resolved_gologin_profile_id:
+                self.profile_data["browser_id"] = resolved_gologin_profile_id
+                self.profile_data["gologin_profile_id"] = resolved_gologin_profile_id
+                self._browser_id = resolved_gologin_profile_id
+                self._gologin_profile_id = resolved_gologin_profile_id
+            else:
+                if str(self.profile_data.get("browser_id") or "").startswith(("auto_", "gologin_")):
+                    self.profile_data["browser_id"] = ""
+                if not first_real_gologin_profile_id(self.profile_data.get("gologin_profile_id", "")):
+                    self.profile_data["gologin_profile_id"] = ""
+                self._browser_id = ""
+                self._profile_dir = ""
+                self._gologin_profile_id = ""
         strict_override = self.profile_data.get("gologin_passthrough_strict")
         if strict_override is None and isinstance(self.feed_settings, dict):
             strict_override = self.feed_settings.get("gologin_passthrough_strict")
@@ -181,7 +201,13 @@ class CDPWorker(QThread):
 
     @staticmethod
     def _feature_token(value) -> str:
-        text = str(value or "").replace("Đ", "D").replace("đ", "d")
+        text = (
+            str(value or "")
+            .replace("Đ", "D")
+            .replace("đ", "d")
+            .replace("Ä", "D")
+            .replace("Ä‘", "d")
+        )
         text = unicodedata.normalize("NFKD", text)
         text = "".join(ch for ch in text if not unicodedata.combining(ch))
         return " ".join(text.lower().split())
@@ -189,14 +215,58 @@ class CDPWorker(QThread):
     def _is_batch_run(self) -> bool:
         return (not self.manual_only) and self._planned_profile_count > 1
 
-    def _batch_login_fail_fast_reason(self) -> str:
-        if "dang nhap" not in getattr(self, "_selected_feature_tokens", set()) or not self._is_batch_run():
-            return ""
+    def _has_selected_feature(self, label: str) -> bool:
+        return self._feature_token(label) in getattr(self, "_selected_feature_tokens", set())
+
+    def _has_selected_feature_fragment(self, fragment: str) -> bool:
+        token = self._feature_token(fragment)
+        return any(token in value for value in getattr(self, "_selected_feature_tokens", set()))
+
+    def _has_saved_login_inputs(self) -> bool:
         username = self.profile_data.get("username", "").strip()
         password = self.profile_data.get("password", "").strip()
         cookie = self.profile_data.get("cookie", "").strip()
         cookie_backup = self.profile_data.get("cookie_backup", "").strip()
-        if cookie or cookie_backup:
+        return bool(cookie or cookie_backup or (username and password))
+
+    def _profile_has_persistent_browser_state_hint(self) -> bool:
+        if self._browser_backend == LOCAL_CHROME_BACKEND:
+            profile_dir = str(getattr(self, "_profile_dir", "") or "").strip()
+            if not profile_dir or not os.path.isdir(profile_dir):
+                return False
+            state_markers = (
+                "Local State",
+                "First Run",
+                "Default",
+                "Sessions",
+                "Network",
+                "Preferences",
+            )
+            try:
+                for marker in state_markers:
+                    if os.path.exists(os.path.join(profile_dir, marker)):
+                        return True
+                with os.scandir(profile_dir) as entries:
+                    return any(entry.name not in {".", ".."} for entry in entries)
+            except Exception:
+                return False
+
+        # GoLogin session that nam trong cloud/profile that.
+        return bool(self._gologin_profile_id)
+
+    def _should_defer_batch_login_validation(self) -> bool:
+        if "dang nhap" not in getattr(self, "_selected_feature_tokens", set()) or not self._is_batch_run():
+            return False
+        return self._profile_has_persistent_browser_state_hint()
+
+    def _batch_login_fail_fast_reason(self) -> str:
+        if "dang nhap" not in getattr(self, "_selected_feature_tokens", set()) or not self._is_batch_run():
+            return ""
+        if self._should_defer_batch_login_validation():
+            return ""
+        username = self.profile_data.get("username", "").strip()
+        password = self.profile_data.get("password", "").strip()
+        if self._has_saved_login_inputs():
             return ""
         missing = ["cookie"]
         if not username:
@@ -440,7 +510,9 @@ class CDPWorker(QThread):
             timeout=8,
         )
         if not result.get("ok"):
-            self.status_update.emit(str(result.get("message") or "Proxy khong hop le"), "red")
+            message = str(result.get("message") or "Proxy khong hop le")
+            self._last_proxy_error = message
+            self.status_update.emit(message, "red")
             return False
 
         detected_mode = self._normalize_proxy_mode(result.get("scheme"))
@@ -474,36 +546,27 @@ class CDPWorker(QThread):
         """Persist the current proxy to the GoLogin cloud profile before starting it."""
         proxy_payload = self._get_proxy_payload(for_gologin_api=True)
         if not proxy_payload:
-            return True, "Không có proxy để đồng bộ"
+            return True, "KhÃ´ng cÃ³ proxy Ä‘á»ƒ Ä‘á»“ng bá»™"
 
         token, _, _ = self._get_gologin_api_settings()
         if not token:
-            return False, "Thiếu GoLogin API key nên không thể đồng bộ proxy."
+            return False, "Thiáº¿u GoLogin API key nÃªn khÃ´ng thá»ƒ Ä‘á»“ng bá»™ proxy."
         if not self._gologin_profile_id:
-            return False, "Thiếu GoLogin Profile ID nên không thể đồng bộ proxy."
-
-        body = {
-            "proxies": [
-                {
-                    "profileId": self._gologin_profile_id,
-                    "proxy": proxy_payload,
-                }
-            ]
-        }
+            return False, "Thiáº¿u GoLogin Profile ID nÃªn khÃ´ng thá»ƒ Ä‘á»“ng bá»™ proxy."
 
         try:
             import requests
             response = requests.patch(
-                "https://api.gologin.com/browser/proxy/many/v2",
+                f"https://api.gologin.com/browser/{self._gologin_profile_id}/proxy",
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
                 },
-                json=body,
+                json=proxy_payload,
                 timeout=25,
             )
         except Exception as e:
-            return False, f"Lỗi kết nối API GoLogin khi đồng bộ proxy: {e}"
+            return False, f"Lá»—i káº¿t ná»‘i API GoLogin khi Ä‘á»“ng bá»™ proxy: {e}"
 
         if response.status_code in (200, 201, 204):
             display = self._proxy_display_text(proxy_payload)
@@ -514,7 +577,7 @@ class CDPWorker(QThread):
             return True, display
 
         detail = (response.text or "").strip().replace("\n", " ")[:300]
-        return False, f"GoLogin proxy API lỗi HTTP {response.status_code}: {detail}"
+        return False, f"GoLogin proxy API lá»—i HTTP {response.status_code}: {detail}"
 
     def _get_gologin_api_settings(self):
         settings = load_gologin_settings()
@@ -637,14 +700,14 @@ class CDPWorker(QThread):
             self._debug_port = dynamic_port
             self._process_pid = self._process.pid
             self._using_gologin_api = False
-            self.status_update.emit(f"Trình duyệt đang mở qua BrowserManager (port {dynamic_port})...", "blue")
+            self.status_update.emit(f"TrÃ¬nh duyá»‡t Ä‘ang má»Ÿ qua BrowserManager (port {dynamic_port})...", "blue")
             time.sleep(0.25)
             return True
         except Exception as e:
             msg = str(e)
-            if "đang được sử dụng" in msg:
-                msg = "Lỗi: Không thể chạy, Profile đang bận up video/nuôi nick"
-            self.status_update.emit(f"❌ {msg}", "red")
+            if "Ä‘ang Ä‘Æ°á»£c sá»­ dá»¥ng" in msg:
+                msg = "Lá»—i: KhÃ´ng thá»ƒ cháº¡y, Profile Ä‘ang báº­n up video/nuÃ´i nick"
+            self.status_update.emit(f"âŒ {msg}", "red")
             self.finished_signal.emit("error")
             return False
 
@@ -670,8 +733,68 @@ class CDPWorker(QThread):
             "python -m pip install gologin"
         )
 
+    def _validate_gologin_profile_proxy(self, gl, timeout=8):
+        try:
+            profile = gl.getProfile()
+        except Exception as exc:
+            return False, f"Khong doc duoc proxy GoLogin profile: {exc}"
+
+        result = validate_profile_proxy(profile, timeout=timeout)
+        message = str(result.get("message") or "").strip()
+        proxy_info = result.get("proxy_info") or {}
+        has_proxy = bool(proxy_info.get("has_proxy"))
+        self._gologin_profile_has_proxy = has_proxy
+        proxy_string = str(proxy_info.get("proxy_string") or "").strip() if has_proxy else ""
+        proxy_type = str(proxy_info.get("proxy_type") or "").strip() if has_proxy else ""
+        proxy_display = str(proxy_info.get("display") or "").strip() if has_proxy else ""
+        cached_proxy = (self.profile_data.get("proxy") or "").strip()
+        self.profile_data["proxy"] = proxy_string
+        self.profile_data["proxy_type"] = proxy_type
+        try:
+            self.profile_update_signal.emit({
+                "proxy": proxy_string,
+                "proxy_type": proxy_type,
+                "gologin_proxy_synced": proxy_display,
+            })
+        except Exception:
+            pass
+
+        if result.get("skipped"):
+            if cached_proxy:
+                self.status_update.emit(
+                    "GoLogin profile hien khong dung proxy; da xoa proxy cu trong tool.",
+                    "blue",
+                )
+            if message:
+                self.status_update.emit(message, "blue")
+            return True, message
+        if result.get("ok"):
+            if message:
+                self.status_update.emit(message, "green")
+            return True, message
+        return False, message or "GoLogin proxy loi"
+
+    def _force_direct_browser_when_no_gologin_proxy(self, gl, extra_params):
+        if self._gologin_profile_has_proxy:
+            return
+        params = getattr(gl, "extra_params", extra_params)
+        if params is None:
+            params = []
+            try:
+                gl.extra_params = params
+            except Exception:
+                pass
+        if not any(str(param).startswith("--proxy-server") or str(param) == "--no-proxy-server" for param in params):
+            params.append("--no-proxy-server")
+        if extra_params is not params and not any(str(param) == "--no-proxy-server" for param in extra_params):
+            extra_params.append("--no-proxy-server")
+        self.status_update.emit(
+            "GoLogin profile khong co proxy; ep browser chay direct de tranh proxy cu trong Preferences.",
+            "blue",
+        )
+
     def _launch_browser_via_gologin_sdk(self):
-        fail_fast_reason = str(getattr(self, "_batch_login_fail_fast_message", "") or "").strip()
+        fail_fast_reason = self._batch_login_fail_fast_reason()
         if fail_fast_reason:
             self._emit_login_error(fail_fast_reason)
             self.status_update.emit(
@@ -704,23 +827,6 @@ class CDPWorker(QThread):
             self.status_update.emit(self._gologin_install_help(), "red")
             self.finished_signal.emit("error")
             return False
-
-        if self.profile_data.get("proxy", "").strip():
-            if not self._validate_runtime_proxy():
-                self.finished_signal.emit("error")
-                return False
-            ok, message = self._sync_gologin_profile_proxy()
-            if not ok:
-                self.status_update.emit(message, "red")
-                self.finished_signal.emit("error")
-                return False
-            if message:
-                self.status_update.emit(f"GoLogin proxy synced: {message}", "blue")
-            if strict_mode:
-                self.status_update.emit(
-                    "GoLogin pass-through strict: da sync proxy, van giu nguyen fingerprint/header/cookie.",
-                    "blue"
-                )
 
         extra_params = []
         if strict_mode:
@@ -765,6 +871,12 @@ class CDPWorker(QThread):
                     "extra_params": extra_params,
                 })
             gl = GoLogin(gl_config)
+            ok, proxy_message = self._validate_gologin_profile_proxy(gl, timeout=8)
+            if not ok:
+                self.status_update.emit(proxy_message, "red")
+                self.finished_signal.emit(f"error: {proxy_message}")
+                return False
+            self._force_direct_browser_when_no_gologin_proxy(gl, extra_params)
             if strict_mode:
                 self.status_update.emit(
                     "GoLogin pass-through strict: chi mo profile, khong inject/cookie sync/header patch.",
@@ -830,6 +942,74 @@ class CDPWorker(QThread):
             self.finished_signal.emit("error")
             return False
 
+    def _launch_browser_via_local_chrome(self):
+        fail_fast_reason = self._batch_login_fail_fast_reason()
+        if fail_fast_reason:
+            self._emit_login_error(fail_fast_reason)
+            self.status_update.emit(
+                f"FAIL FAST: {fail_fast_reason}. Khong mo browser.",
+                "red",
+            )
+            self.finished_signal.emit(f"error: {fail_fast_reason}")
+            return False
+
+        try:
+            from browser_manager import BrowserManager
+        except Exception as exc:
+            self.status_update.emit(f"Khong import duoc BrowserManager: {exc}", "red")
+            self.finished_signal.emit("error")
+            return False
+
+        proxy_server = ""
+        if self._proxy_host and self._proxy_port:
+            local_port = self._start_local_proxy_bridge()
+            proxy_server = f"127.0.0.1:{local_port}" if local_port else self.profile_data.get("proxy", "")
+        elif self.profile_data.get("proxy"):
+            proxy_server = self.profile_data.get("proxy", "")
+
+        extra_params = [
+            f"--window-size={int(self.container_width)},{int(self.container_height)}",
+            "--window-position=0,0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--disable-infobars",
+            f"--ssmatool-embed-token={self._embed_token}",
+        ]
+
+        try:
+            self._cleanup_stale_profile_processes_before_start()
+            self.status_update.emit(
+                f"Mo Local Chrome profile {self._browser_id}...",
+                "blue"
+            )
+            manager = BrowserManager()
+            self._process, dynamic_port = manager.launch_browser(
+                profile_id=self._browser_id,
+                profile_dir=self._profile_dir,
+                width=self.container_width,
+                height=self.container_height,
+                proxy_server=proxy_server,
+                extra_args=extra_params,
+                chrome_path=None,
+                browser_backend=LOCAL_CHROME_BACKEND,
+            )
+            self._browser_manager_acquired = True
+            self._debug_port = dynamic_port
+            self._process_pid = self._process.pid
+            self._using_gologin_api = False
+            if self._process_pid:
+                self._browser_pids.add(self._process_pid)
+            self._browser_pids.update(self._find_pids_by_debug_port(dynamic_port))
+            self.status_update.emit(f"Local Chrome da mo profile (CDP port {dynamic_port}).", "green")
+            return True
+        except Exception as e:
+            msg = str(e)
+            self.status_update.emit(f"Local Chrome loi: {msg[:220]}", "red")
+            self.finished_signal.emit("error")
+            return False
+
     def _release_browser_session(self):
         self._release_managed_browser()
         self._stop_gologin_profile()
@@ -869,79 +1049,61 @@ class CDPWorker(QThread):
         return False
 
     def run(self):
-        if "dang nhap" in self._selected_feature_tokens and self._is_batch_run():
-            username = self.profile_data.get("username", "").strip()
-            password = self.profile_data.get("password", "").strip()
-            cookie = self.profile_data.get("cookie", "").strip()
-            cookie_backup = self.profile_data.get("cookie_backup", "").strip()
-            if not (cookie or cookie_backup) and (not username or not password):
-                missing = ["cookie"]
-                if not username:
-                    missing.append("username/email")
-                if not password:
-                    missing.append("password")
-                profile_name = self.profile_data.get("ten_ho_so", "")
-                detail = f"[{profile_name}] Thieu {', '.join(missing)} cho batch login"
-                self._emit_login_error(detail)
-                self.status_update.emit(f"FAIL FAST: {detail}. Khong mo browser.", "red")
-                self.finished_signal.emit(f"error: {detail}")
-                try:
-                    self._release_browser_session()
-                finally:
-                    self._emit_browser_closed_once("closed")
-                return
+        fail_fast_reason = self._batch_login_fail_fast_reason()
+        if fail_fast_reason:
+            self._emit_login_error(fail_fast_reason)
+            self.status_update.emit(f"FAIL FAST: {fail_fast_reason}. Khong mo browser.", "red")
+            self.finished_signal.emit(f"error: {fail_fast_reason}")
+            try:
+                self._release_browser_session()
+            finally:
+                self._emit_browser_closed_once("closed")
+            return
         try:
-            # Kiểm tra thông tin đăng nhập
+            # Kiá»ƒm tra thÃ´ng tin Ä‘Äƒng nháº­p
             if "dang nhap" in self._selected_feature_tokens:
-                username = self.profile_data.get('username', '').strip()
-                password = self.profile_data.get('password', '').strip()
-                cookie = self.profile_data.get('cookie', '').strip()
-                cookie_backup = self.profile_data.get('cookie_backup', '').strip()
-                if self._is_batch_run() and not (cookie or cookie_backup) and (not username or not password):
-                    missing = []
-                    missing.append("cookie")
-                    if not username: missing.append("username/email")
-                    if not password: missing.append("password")
-                    profile_name = self.profile_data.get('ten_ho_so', '')
-                    detail = f"[{profile_name}] Thieu {', '.join(missing)} cho batch login"
-                    self._emit_login_error(detail)
-                    self.status_update.emit(f"FAIL FAST: {detail}. Khong mo browser.", "red")
-                    self.finished_signal.emit(f"error: {detail}")
+                fail_fast_reason = self._batch_login_fail_fast_reason()
+                if fail_fast_reason:
+                    self._emit_login_error(fail_fast_reason)
+                    self.status_update.emit(f"FAIL FAST: {fail_fast_reason}. Khong mo browser.", "red")
+                    self.finished_signal.emit(f"error: {fail_fast_reason}")
                     return
-                    self.status_update.emit(
-                        f"❌ [{profile_name}] Thiếu {', '.join(missing)} - Bỏ qua!", "red"
-                    )
 
             browser_id = self._browser_id
+            backend_label = "Local Chrome" if self._browser_backend == LOCAL_CHROME_BACKEND else "GoLogin Local SDK"
             self.status_update.emit(
-                f"[{browser_id}] Mo profile bang GoLogin Local SDK",
+                f"[{browser_id}] Mo profile bang {backend_label}",
                 "blue"
             )
 
-            # BƯỚC 2: Mở browser
+            # BÆ¯á»šC 2: Má»Ÿ browser
             embedded = False
             with _GOLOGIN_START_LOCK:
                 if self._stop_flag:
                     return
                 self._launch_started_at = time.time()
-                if not self._launch_browser_via_gologin_sdk():
-                    return
+                if self._browser_backend == "local_chrome":
+                    if not self._launch_browser_via_local_chrome():
+                        return
+                else:
+                    if not self._launch_browser_via_gologin_sdk():
+                        return
                 if self._stop_flag:
                     return
 
                 # Keep the next GoLogin launch waiting until this window is embedded.
                 if self.widget_id:
-                    self.status_update.emit("📺 Đang bắt cửa sổ browser vào dashboard...", "blue")
+                    self.status_update.emit("Dang bat cua so browser vao dashboard...", "blue")
                     embedded = self._request_browser_embed_from_ui(timeout=30.0)
                 else:
-                    self.status_update.emit("Đã tắt nhúng browser, browser sẽ mở ngoài dashboard.", "orange")
+                    self.status_update.emit("Da tat nhung browser, browser se mo ngoai dashboard.", "orange")
 
             if self.manual_only:
                 if embedded:
-                    self.status_update.emit("Browser đã nhúng - bạn tự thao tác", "green")
+                    self.status_update.emit("Browser da nhung - ban tu thao tac", "green")
                 else:
                     self.status_update.emit(
-                        "⚠️ Không nhúng được browser. Browser có thể đang mở ngoài dashboard.",
+                        "Khong nhung duoc browser. Browser co the dang mo ngoai dashboard.",
                         "orange"
                     )
                 while not self._stop_flag:
@@ -952,14 +1114,14 @@ class CDPWorker(QThread):
                     self.finished_signal.emit("success")
                 return
 
-            # BƯỚC 4: Chạy automation bằng CDP
+            # BÆ¯á»šC 4: Cháº¡y automation báº±ng CDP
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(self._run_cdp_automation())
             loop.close()
 
         except Exception as e:
-            self.status_update.emit(f"Lỗi: {e}", "red")
+            self.status_update.emit(f"Loi: {e}", "red")
             self.finished_signal.emit(f"error: {e}")
         finally:
             if not self._async_close_started:
@@ -967,10 +1129,10 @@ class CDPWorker(QThread):
                 self._emit_browser_closed_once("closed")
 
     def _prepare_profile_dir(self):
-        """Tạo profile từ zero template."""
+        """Táº¡o profile tá»« zero template."""
         self._process = None
         if not os.path.exists(self._profile_dir):
-            self.status_update.emit(f"Tạo profile: {os.path.basename(self._profile_dir)}", "blue")
+            self.status_update.emit(f"Táº¡o profile: {os.path.basename(self._profile_dir)}", "blue")
             if os.path.exists(ZERO_PROFILE_ZIP):
                 import zipfile
                 parent_dir = os.path.dirname(self._profile_dir)
@@ -982,20 +1144,20 @@ class CDPWorker(QThread):
                     shutil.move(extracted, self._profile_dir)
                 else:
                     os.makedirs(self._profile_dir, exist_ok=True)
-                self.status_update.emit("Profile từ template OK", "green")
+                self.status_update.emit("Profile tá»« template OK", "green")
             else:
                 os.makedirs(self._profile_dir, exist_ok=True)
 
-        # ★ FIX CRITICAL: Chrome xóa session cookies khi thấy exit_type="Crashed"
-        # Patch Preferences để Chrome nghĩ lần trước đóng bình thường
+        # â˜… FIX CRITICAL: Chrome xÃ³a session cookies khi tháº¥y exit_type="Crashed"
+        # Patch Preferences Ä‘á»ƒ Chrome nghÄ© láº§n trÆ°á»›c Ä‘Ã³ng bÃ¬nh thÆ°á»ng
         self._fix_chrome_exit_type()
 
     def _fix_chrome_exit_type(self):
-        """Fix Preferences để Chrome giữ session cookies.
+        """Fix Preferences Ä‘á»ƒ Chrome giá»¯ session cookies.
         
-        TikTok dùng SESSION cookies (không có expiry) → Chrome xóa khi đóng.
-        Fix: bật 'Continue where you left off' (restore_on_startup=1)
-        → Chrome GIỮ session cookies qua các lần khởi động.
+        TikTok dÃ¹ng SESSION cookies (khÃ´ng cÃ³ expiry) â†’ Chrome xÃ³a khi Ä‘Ã³ng.
+        Fix: báº­t 'Continue where you left off' (restore_on_startup=1)
+        â†’ Chrome GIá»® session cookies qua cÃ¡c láº§n khá»Ÿi Ä‘á»™ng.
         """
         prefs_path = os.path.join(self._profile_dir, "Default", "Preferences")
         if not os.path.exists(prefs_path):
@@ -1007,7 +1169,7 @@ class CDPWorker(QThread):
 
             changed = False
 
-            # Fix 1: exit_type = Normal (tránh crash recovery)
+            # Fix 1: exit_type = Normal (trÃ¡nh crash recovery)
             profile = prefs.get("profile", {})
             if profile.get("exit_type", "") != "Normal":
                 profile["exit_type"] = "Normal"
@@ -1015,8 +1177,8 @@ class CDPWorker(QThread):
                 prefs["profile"] = profile
                 changed = True
 
-            # ★ Fix 2: restore_on_startup = 1 ("Continue where you left off")
-            # Đây là fix THẬT SỰ: Chrome sẽ GIỮ session cookies khi có setting này
+            # â˜… Fix 2: restore_on_startup = 1 ("Continue where you left off")
+            # ÄÃ¢y lÃ  fix THáº¬T Sá»°: Chrome sáº½ GIá»® session cookies khi cÃ³ setting nÃ y
             session = prefs.get("session", {})
             if session.get("restore_on_startup") != 5:
                 session["restore_on_startup"] = 5  # 5 = Open New Tab page
@@ -1026,7 +1188,7 @@ class CDPWorker(QThread):
             if changed:
                 with open(prefs_path, "w", encoding="utf-8") as f:
                     json.dump(prefs, f, ensure_ascii=False)
-                self.status_update.emit("🔧 Đã bật giữ session cookies", "blue")
+                self.status_update.emit("ðŸ”§ ÄÃ£ báº­t giá»¯ session cookies", "blue")
         except Exception:
             pass
 
@@ -1170,19 +1332,12 @@ class CDPWorker(QThread):
         pids.update(self._find_pids_by_profile_path(profile_dir if profile_dir is not None else self._profile_dir))
         try:
             import psutil
-            browser_names = {"chrome.exe", "orbita-browser.exe", "chromium.exe"}
             expanded = set(pids)
             for pid in list(pids):
                 try:
                     proc = psutil.Process(pid)
                     for child in proc.children(recursive=True):
                         expanded.add(child.pid)
-                    for parent in proc.parents():
-                        try:
-                            if (parent.name() or "").lower() in browser_names:
-                                expanded.add(parent.pid)
-                        except Exception:
-                            continue
                 except Exception:
                     continue
             pids = expanded
@@ -1549,7 +1704,7 @@ class CDPWorker(QThread):
                 self._embedded_hwnd = target_hwnd
                 self._browser_pids.add(int(target_pid))
                 self.status_update.emit(
-                    f"Browser nhúng OK! pid={target_pid}, hwnd={target_hwnd}, port={self._debug_port}",
+                    f"Browser nhÃºng OK! pid={target_pid}, hwnd={target_hwnd}, port={self._debug_port}",
                     "green",
                 )
 
@@ -1582,14 +1737,14 @@ class CDPWorker(QThread):
 
 
     def _lock_browser_position(self, hwnd, width, height):
-        """Liên tục ép browser về vị trí (0,-tb) — ẩn title bar + chống kéo."""
+        """LiÃªn tá»¥c Ã©p browser vá» vá»‹ trÃ­ (0,-tb) â€” áº©n title bar + chá»‘ng kÃ©o."""
         tb = APP_TITLEBAR_HEIGHT
         last_width = 0
         last_height = 0
         last_sync = 0.0
         while not self._stop_flag:
             try:
-                # Dừng nếu browser hoặc container đã bị đóng
+                # Dá»«ng náº¿u browser hoáº·c container Ä‘Ã£ bá»‹ Ä‘Ã³ng
                 if not win32gui.IsWindow(hwnd):
                     break
                 if self.widget_id and not win32gui.IsWindow(self.widget_id):
@@ -1616,27 +1771,27 @@ class CDPWorker(QThread):
             time.sleep(1.0)
 
     async def _run_cdp_automation(self):
-        """Main automation loop dùng CDP trực tiếp."""
+        """Main automation loop dÃ¹ng CDP trá»±c tiáº¿p."""
         from cdp_client import CDPClient
 
-        self.status_update.emit(f"Kết nối CDP (port {self._debug_port})...", "blue")
+        self.status_update.emit(f"Káº¿t ná»‘i CDP (port {self._debug_port})...", "blue")
 
         try:
             self._cdp = CDPClient(port=self._debug_port)
             await self._cdp.connect(timeout=15)
-            self.status_update.emit("✅ CDP kết nối thành công!", "green")
+            self.status_update.emit("âœ… CDP káº¿t ná»‘i thÃ nh cÃ´ng!", "green")
         except Exception as e:
-            self.status_update.emit(f"❌ CDP lỗi: {str(e)[:60]}", "red")
+            self.status_update.emit(f"âŒ CDP lá»—i: {str(e)[:60]}", "red")
             self._release_browser_session()
             self.finished_signal.emit("error")
             return
 
         cdp = self._cdp
 
-        # ═══════════════════════════════════════════════════════
-        #  STEALTH INJECTION — Chạy TRƯỚC MỌI navigation
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  STEALTH INJECTION â€” Cháº¡y TRÆ¯á»šC Má»ŒI navigation
         #  Patch navigator.webdriver, window.chrome, v.v.
-        # ═══════════════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         try:
             if self._should_preserve_gologin_fingerprint():
                 webdriver_value = "unknown"
@@ -1651,13 +1806,13 @@ class CDPWorker(QThread):
             else:
                 await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
                 "source": r"""
-                // ★ Patch navigator.webdriver = false (quan trọng nhất)
+                // â˜… Patch navigator.webdriver = false (quan trá»ng nháº¥t)
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => false,
                     configurable: true
                 });
 
-                // ★ Fake window.chrome (Chrome tự có nhưng automation mode thiếu)
+                // â˜… Fake window.chrome (Chrome tá»± cÃ³ nhÆ°ng automation mode thiáº¿u)
                 if (!window.chrome) {
                     window.chrome = {
                         runtime: {
@@ -1670,14 +1825,14 @@ class CDPWorker(QThread):
                     };
                 }
 
-                // ★ Xóa cdc_ markers (chromedriver fingerprint)
+                // â˜… XÃ³a cdc_ markers (chromedriver fingerprint)
                 for (const prop of Object.keys(window)) {
                     if (prop.match(/^cdc_/) || prop.match(/^\$cdc_/)) {
                         delete window[prop];
                     }
                 }
 
-                // ★ Fake permissions query (notification, push)
+                // â˜… Fake permissions query (notification, push)
                 const originalQuery = window.navigator.permissions.query;
                 window.navigator.permissions.query = (parameters) => (
                     parameters.name === 'notifications'
@@ -1685,7 +1840,7 @@ class CDPWorker(QThread):
                         : originalQuery(parameters)
                 );
 
-                // ★ Fake plugins (trình duyệt thật có plugins)
+                // â˜… Fake plugins (trÃ¬nh duyá»‡t tháº­t cÃ³ plugins)
                 Object.defineProperty(navigator, 'plugins', {
                     get: () => [
                         { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
@@ -1695,39 +1850,39 @@ class CDPWorker(QThread):
                     configurable: true
                 });
 
-                // ★ Fake languages
+                // â˜… Fake languages
                 Object.defineProperty(navigator, 'languages', {
                     get: () => ['en-US', 'en'],
                     configurable: true
                 });
 
-                // ★ Patch iframe contentWindow.navigator.webdriver
+                // â˜… Patch iframe contentWindow.navigator.webdriver
                 const originalAttachShadow = Element.prototype.attachShadow;
                 Element.prototype.attachShadow = function() {
                     return originalAttachShadow.apply(this, arguments);
                 };
 
-                // ★ Hide sourceURL traces of injected scripts
+                // â˜… Hide sourceURL traces of injected scripts
                 // Cloudflare/TikTok checks Error stack traces for puppeteer/CDP markers
                 const _Error = Error;
                 const nativeErrorToString = Error.prototype.toString;
                 """
             })
-                self.status_update.emit("🛡️ Stealth injection OK (navigator.webdriver patched)", "green")
+                self.status_update.emit("ðŸ›¡ï¸ Stealth injection OK (navigator.webdriver patched)", "green")
         except Exception as e:
-            self.status_update.emit(f"⚠️ Stealth injection lỗi: {str(e)[:50]}", "orange")
+            self.status_update.emit(f"âš ï¸ Stealth injection lá»—i: {str(e)[:50]}", "orange")
 
-        # ═══════════════════════════════════════════════════════
-        #  PROXY AUTH HANDLER — Tự điền credentials khi có proxy
-        #  (Không cần xử lý khi không có proxy — --no-proxy-server đã fix)
-        # ═══════════════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  PROXY AUTH HANDLER â€” Tá»± Ä‘iá»n credentials khi cÃ³ proxy
+        #  (KhÃ´ng cáº§n xá»­ lÃ½ khi khÃ´ng cÃ³ proxy â€” --no-proxy-server Ä‘Ã£ fix)
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         try:
             proxy_payload = self._get_proxy_payload()
             if proxy_payload:
                 proxy_user = proxy_payload.get("username", "")
                 proxy_pass = proxy_payload.get("password", "")
                 if proxy_user and proxy_pass:
-                    # ★ Có proxy có auth → bật Fetch để tự điền credentials
+                    # â˜… CÃ³ proxy cÃ³ auth â†’ báº­t Fetch Ä‘á»ƒ tá»± Ä‘iá»n credentials
                     await cdp.send("Fetch.enable", {
                         "handleAuthRequests": True,
                         "patterns": [{"urlPattern": "*"}]
@@ -1750,7 +1905,7 @@ class CDPWorker(QThread):
                                 pass
 
                     async def _continue_request(params):
-                        """Continue intercepted requests (bắt buộc khi Fetch.enable)."""
+                        """Continue intercepted requests (báº¯t buá»™c khi Fetch.enable)."""
                         request_id = params.get("requestId", "")
                         if request_id:
                             try:
@@ -1760,9 +1915,9 @@ class CDPWorker(QThread):
 
                     cdp.on("Fetch.authRequired", _provide_auth)
                     cdp.on("Fetch.requestPaused", _continue_request)
-                    self.status_update.emit("🔑 Proxy auth handler: tự điền credentials", "blue")
+                    self.status_update.emit("ðŸ”‘ Proxy auth handler: tá»± Ä‘iá»n credentials", "blue")
         except Exception as e:
-            self.status_update.emit(f"⚠️ Proxy auth setup: {str(e)[:50]}", "orange")
+            self.status_update.emit(f"âš ï¸ Proxy auth setup: {str(e)[:50]}", "orange")
 
         try:
             cookie_str = self.profile_data.get("cookie", "")
@@ -1787,53 +1942,53 @@ class CDPWorker(QThread):
 
             await self._emit_runtime_fingerprint_snapshot(cdp)
 
-            # ★ BƯỚC 1: Ở lại New Tab — chờ 3s như người thật
-            self.status_update.emit("🌐 Browser đã mở — đang ở New Tab...", "blue")
+            # â˜… BÆ¯á»šC 1: á»ž láº¡i New Tab â€” chá» 3s nhÆ° ngÆ°á»i tháº­t
+            self.status_update.emit("Browser da mo - dang o New Tab...", "blue")
             if not await self._verify_proxy_in_browser(cdp):
                 self.finished_signal.emit("error")
                 return
 
             await asyncio.sleep(3)
 
-            # ★ BƯỚC 2: Mở TikTok bằng đúng session đang nằm trong profile GoLogin.
-            # Cookie trong tool chỉ là bản dự phòng, không bơm sớm để tránh ghi đè phiên thật.
+            # â˜… BÆ¯á»šC 2: Má»Ÿ TikTok báº±ng Ä‘Ãºng session Ä‘ang náº±m trong profile GoLogin.
+            # Cookie trong tool chá»‰ lÃ  báº£n dá»± phÃ²ng, khÃ´ng bÆ¡m sá»›m Ä‘á»ƒ trÃ¡nh ghi Ä‘Ã¨ phiÃªn tháº­t.
             if has_saved_cookie:
                 self.status_update.emit(
-                    "🍪 Có cookie dự phòng trong tool, chưa nạp sớm để giữ nguyên phiên GoLogin.",
+                    "Co cookie du phong trong tool, chua nap som de giu nguyen phien GoLogin.",
                     "blue",
                 )
 
-            # ★ BƯỚC 3: Mở Google ngắn, sau đó vào thẳng TikTok.
-            # Không tìm/click TikTok trên Google để tránh Google unusual-traffic/CAPTCHA.
+            # â˜… BÆ¯á»šC 3: Má»Ÿ Google ngáº¯n, sau Ä‘Ã³ vÃ o tháº³ng TikTok.
+            # KhÃ´ng tÃ¬m/click TikTok trÃªn Google Ä‘á»ƒ trÃ¡nh Google unusual-traffic/CAPTCHA.
             if not await self._warmup_google_then_tiktok_direct(cdp):
-                self.status_update.emit("⚠️ Warm-up lỗi — vào TikTok trực tiếp", "orange")
+                self.status_update.emit("Warm-up loi - vao TikTok truc tiep", "orange")
                 await self._type_url_in_addressbar("tiktok.com", wait=6, cdp=cdp)
             if not await self._wait_for_tiktok_ready(cdp):
-                reason = "TikTok kẹt ở Please wait"
-                self.status_update.emit(f"❌ {reason}", "red")
+                reason = "TikTok káº¹t á»Ÿ Please wait"
+                self.status_update.emit(f"Loi: {reason}", "red")
                 await self._hold_browser_for_action_issue(cdp, reason)
                 if not self._stop_flag:
                     self.finished_signal.emit(f"error: {reason}")
                 return
 
-            # ★ BƯỚC 4: Kiểm tra session thật của profile GoLogin trước.
+            # â˜… BÆ¯á»šC 4: Kiá»ƒm tra session tháº­t cá»§a profile GoLogin trÆ°á»›c.
             profile_logged_in = await self._check_logged_in(cdp)
             if profile_logged_in:
-                self.status_update.emit("✅ Profile GoLogin đang có phiên TikTok hợp lệ.", "green")
+                self.status_update.emit("Profile GoLogin dang co phien TikTok hop le.", "green")
                 await self._persist_tiktok_cookies(cdp)
             else:
-                if has_saved_cookie and "Đăng nhập" in self.selected_features:
+                if has_saved_cookie and self._has_selected_feature("Dang nhap"):
                     self.status_update.emit(
-                        "⚠️ Profile GoLogin chưa đăng nhập; cookie dự phòng chỉ dùng trong bước Đăng nhập.",
+                        "Profile GoLogin chua dang nhap; cookie du phong chi dung trong buoc Dang nhap.",
                         "orange",
                     )
                 else:
                     self.status_update.emit(
-                        "⚠️ Profile GoLogin chưa đăng nhập; không nạp cookie dự phòng ở bước khởi động.",
+                        "Profile GoLogin chua dang nhap; khong nap cookie du phong o buoc khoi dong.",
                         "orange",
                     )
 
-            # Ẩn viền focus/outline khi bot click
+            # áº¨n viá»n focus/outline khi bot click
             if not self._should_preserve_gologin_fingerprint():
                 await cdp.evaluate("""
             (() => {
@@ -1849,17 +2004,23 @@ class CDPWorker(QThread):
             })()
             """)
 
-            # Bỏ qua popup chọn chủ đề
+            # Bá» qua popup chá»n chá»§ Ä‘á»
             await self._skip_tiktok_popup(cdp)
             await asyncio.sleep(1)
 
-            # Chạy các chức năng
-            self.status_update.emit(f"📋 Chức năng đã chọn: {self.selected_features}", "blue")
+            # Cháº¡y cÃ¡c chá»©c nÄƒng
+            self.status_update.emit(f"Chuc nang da chon: {self.selected_features}", "blue")
+            if self._unsupported_selected_features:
+                skipped = ", ".join(self._unsupported_selected_features)
+                self.status_update.emit(
+                    f"Bo qua chuc nang khong con ho tro: {skipped}",
+                    "orange",
+                )
             login_ok = bool(profile_logged_in)
             any_feature_ran = False
             feature_failures = []
 
-            if "Đăng nhập" in self.selected_features:
+            if self._has_selected_feature("Dang nhap"):
                 any_feature_ran = True
                 self._last_login_error = ""
                 login_ok = await self._do_login(cdp)
@@ -1874,33 +2035,29 @@ class CDPWorker(QThread):
                         return
                     self.finished_signal.emit(f"error: {detail}")
                     return
-                    self.status_update.emit("❌ Đăng nhập thất bại, dừng profile", "red")
-                    self.finished_signal.emit("error")
-                    return
-
-            if "Cập nhật thống kê" in self.selected_features:
+            if self._has_selected_feature("Cap nhat thong ke"):
                 any_feature_ran = True
-                login_ok = await self._ensure_logged_in_for_feature(cdp, "Cập nhật thống kê", login_ok)
+                login_ok = await self._ensure_logged_in_for_feature(cdp, "Cáº­p nháº­t thá»‘ng kÃª", login_ok)
                 if login_ok:
-                    self.status_update.emit("📊 Bắt đầu cập nhật thống kê tài khoản...", "blue")
+                    self.status_update.emit("Bat dau cap nhat thong ke tai khoan...", "blue")
                     stats_ok = await self._update_tiktok_stats(cdp)
                     if not stats_ok and not self._stop_flag:
-                        feature_failures.append("Cập nhật thống kê chưa hoàn tất")
+                        feature_failures.append("Cáº­p nháº­t thá»‘ng kÃª chÆ°a hoÃ n táº¥t")
                 elif not self._stop_flag:
-                    feature_failures.append("Cập nhật thống kê chưa chạy vì profile chưa đăng nhập")
+                    feature_failures.append("Cáº­p nháº­t thá»‘ng kÃª chÆ°a cháº¡y vÃ¬ profile chÆ°a Ä‘Äƒng nháº­p")
 
-            if "Cập nhật thông tin" in self.selected_features:
+            if self._has_selected_feature("Cap nhat thong tin"):
                 any_feature_ran = True
-                login_ok = await self._ensure_logged_in_for_feature(cdp, "Cập nhật thông tin", login_ok)
+                login_ok = await self._ensure_logged_in_for_feature(cdp, "Cáº­p nháº­t thÃ´ng tin", login_ok)
                 if login_ok:
-                    self.status_update.emit("💰 Bắt đầu cập nhật thông tin tài khoản...", "blue")
+                    self.status_update.emit("Bat dau cap nhat thong tin tai khoan...", "blue")
                     info_ok = await self._update_account_financial_info(cdp)
                     if not info_ok and not self._stop_flag:
-                        feature_failures.append("Cập nhật thông tin chưa hoàn tất")
+                        feature_failures.append("Cáº­p nháº­t thÃ´ng tin chÆ°a hoÃ n táº¥t")
                 elif not self._stop_flag:
-                    feature_failures.append("Cập nhật thông tin chưa chạy vì profile chưa đăng nhập")
+                    feature_failures.append("Cáº­p nháº­t thÃ´ng tin chÆ°a cháº¡y vÃ¬ profile chÆ°a Ä‘Äƒng nháº­p")
 
-            if "Đổi avatar" in self.selected_features:
+            if self._has_selected_feature("Doi avatar"):
                 any_feature_ran = True
                 login_ok = await self._ensure_logged_in_for_feature(cdp, "Doi avatar", login_ok)
                 if login_ok:
@@ -1909,53 +2066,46 @@ class CDPWorker(QThread):
                         if not ok:
                             self.status_update.emit("Doi avatar that bai - xem log chi tiet.", "red")
                             if not self._stop_flag:
-                                feature_failures.append("Đổi avatar thất bại")
+                                feature_failures.append("Äá»•i avatar tháº¥t báº¡i")
                     elif not self._stop_flag:
-                        feature_failures.append("Đổi avatar bị dừng vì CAPTCHA/challenge")
+                        feature_failures.append("Äá»•i avatar bá»‹ dá»«ng vÃ¬ CAPTCHA/challenge")
                 elif not self._stop_flag:
-                    feature_failures.append("Đổi avatar chưa chạy vì profile chưa đăng nhập")
+                    feature_failures.append("Äá»•i avatar chÆ°a cháº¡y vÃ¬ profile chÆ°a Ä‘Äƒng nháº­p")
 
-            if "Tương tác ở Feed" in self.selected_features:
+            if self._has_selected_feature("Tuong tac o Feed"):
                 any_feature_ran = True
                 login_ok = await self._ensure_logged_in_for_feature(cdp, "Feed", login_ok)
                 if login_ok:
                     if await self._wait_captcha_clear_for_action(cdp, "Feed"):
                         feed_ok = await self._do_feed_interaction(cdp)
                         if not feed_ok and not self._stop_flag:
-                            feature_failures.append("Tương tác Feed chưa hoàn tất")
+                            feature_failures.append("TÆ°Æ¡ng tÃ¡c Feed chÆ°a hoÃ n táº¥t")
                     elif not self._stop_flag:
-                        feature_failures.append("Tương tác Feed bị dừng vì CAPTCHA/challenge")
+                        feature_failures.append("TÆ°Æ¡ng tÃ¡c Feed bá»‹ dá»«ng vÃ¬ CAPTCHA/challenge")
                 elif not self._stop_flag:
-                    feature_failures.append("Tương tác Feed chưa chạy vì profile chưa đăng nhập")
+                    feature_failures.append("TÆ°Æ¡ng tÃ¡c Feed chÆ°a cháº¡y vÃ¬ profile chÆ°a Ä‘Äƒng nháº­p")
 
-            # ★ Flexible matching cho keyword feature — khớp cả (key), (kw), hay bất kỳ biến thể nào
-            has_keyword_feature = any("từ khóa" in f for f in self.selected_features)
+            # â˜… Flexible matching cho keyword feature â€” khá»›p cáº£ (key), (kw), hay báº¥t ká»³ biáº¿n thá»ƒ nÃ o
+            has_keyword_feature = self._has_selected_feature_fragment("tu khoa")
             if has_keyword_feature:
                 any_feature_ran = True
                 login_ok = await self._ensure_logged_in_for_feature(cdp, "Keyword", login_ok)
                 if login_ok:
                     if await self._wait_captcha_clear_for_action(cdp, "Keyword"):
-                        self.status_update.emit("🔍 Bắt đầu tương tác theo từ khóa...", "blue")
+                        self.status_update.emit("Bat dau tuong tac theo tu khoa...", "blue")
                         keyword_ok = await self._do_keyword_interaction(cdp)
                         if not keyword_ok and not self._stop_flag:
-                            feature_failures.append("Tương tác từ khóa chưa hoàn tất")
+                            feature_failures.append("TÆ°Æ¡ng tÃ¡c tá»« khÃ³a chÆ°a hoÃ n táº¥t")
                     elif not self._stop_flag:
-                        feature_failures.append("Tương tác từ khóa bị dừng vì CAPTCHA/challenge")
+                        feature_failures.append("TÆ°Æ¡ng tÃ¡c tá»« khÃ³a bá»‹ dá»«ng vÃ¬ CAPTCHA/challenge")
                 elif not self._stop_flag:
-                    feature_failures.append("Tương tác từ khóa chưa chạy vì profile chưa đăng nhập")
+                    feature_failures.append("TÆ°Æ¡ng tÃ¡c tá»« khÃ³a chÆ°a cháº¡y vÃ¬ profile chÆ°a Ä‘Äƒng nháº­p")
 
-            for feat in ["KYC(gologin)(pro)", "Set riêng tư(pro)", "Đổi password(firefox)(pro)",
-                         "Login mail(pro)", "Xóa tài khoản(pro)"]:
-                if feat in self.selected_features:
-                    any_feature_ran = True
-                    self.status_update.emit(f"{feat} - Đang phát triển...", "orange")
-                    feature_failures.append(f"{feat} chưa triển khai")
-
-            # Nếu KHÔNG có chức năng nào chạy → giữ browser mở
+            # Náº¿u KHÃ”NG cÃ³ chá»©c nÄƒng nÃ o cháº¡y â†’ giá»¯ browser má»Ÿ
             if not self.selected_features or not any_feature_ran:
                 if self.selected_features and not any_feature_ran:
-                    self.status_update.emit(f"⚠️ Không có chức năng nào khớp! Features: {self.selected_features}", "orange")
-                self.status_update.emit("🌍 Browser đang mở — bạn tự do sử dụng", "green")
+                    self.status_update.emit(f"Khong co chuc nang nao khop! Features: {self.selected_features}", "orange")
+                self.status_update.emit("Browser dang mo - ban tu do su dung", "green")
                 while not self._stop_flag:
                     await asyncio.sleep(2)
 
@@ -1965,52 +2115,52 @@ class CDPWorker(QThread):
                 if not self._stop_flag:
                     self.finished_signal.emit(f"error: {reason}")
                 return
-            # ══════════════════════════════════════════════════════
-            #  KẾT THÚC: Lưu cookie → Browser.close (graceful) → Kill
-            # ══════════════════════════════════════════════════════
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  Káº¾T THÃšC: LÆ°u cookie â†’ Browser.close (graceful) â†’ Kill
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-            # ★ FIX 2 + FIX 4: LƯU COOKIE + STORAGE TRƯỚC KHI ĐÓNG
-            self.status_update.emit("🍪 Lưu dữ liệu phiên trước khi đóng...", "blue")
+            # â˜… FIX 2 + FIX 4: LÆ¯U COOKIE + STORAGE TRÆ¯á»šC KHI ÄÃ“NG
+            self.status_update.emit("Luu du lieu phien truoc khi dong...", "blue")
             try:
-                # Chốt TikTok ID trước khi đóng browser. Bước này click vào hồ sơ,
-                # đọc @username từ URL/localStorage và emit về UI để lưu DB.
+                # Chá»‘t TikTok ID trÆ°á»›c khi Ä‘Ã³ng browser. BÆ°á»›c nÃ y click vÃ o há»“ sÆ¡,
+                # Ä‘á»c @username tá»« URL/localStorage vÃ  emit vá» UI Ä‘á»ƒ lÆ°u DB.
                 final_logged_in = bool(login_ok)
                 if not final_logged_in:
                     final_logged_in = await self._check_logged_in(cdp)
                 if final_logged_in:
-                    self.status_update.emit("👤 Lấy User ID trước khi đóng browser...", "blue")
+                    self.status_update.emit("ðŸ‘¤ Láº¥y User ID trÆ°á»›c khi Ä‘Ã³ng browser...", "blue")
                     await self._extract_profile_info(cdp, need_reload=False)
 
-                    # Persist session cookies → 30 ngày TRƯỚC (quan trọng nhất)
+                    # Persist session cookies â†’ 30 ngÃ y TRÆ¯á»šC (quan trá»ng nháº¥t)
                     await self._persist_tiktok_cookies(cdp)
-                    # Re-save cookie text vào DB
+                    # Re-save cookie text vÃ o DB
                     await self._resave_cookies_to_db(cdp)
                     # Backup localStorage/sessionStorage
                     await self._save_tiktok_storage(cdp)
-                    self.status_update.emit("✅ Đã lưu tất cả dữ liệu phiên", "green")
+                    self.status_update.emit("âœ… ÄÃ£ lÆ°u táº¥t cáº£ dá»¯ liá»‡u phiÃªn", "green")
                 else:
                     self.status_update.emit(
-                        "⚠️ Browser đang chưa đăng nhập, bỏ qua lưu cookie/storage để không ghi đè phiên cũ.",
+                        "âš ï¸ Browser Ä‘ang chÆ°a Ä‘Äƒng nháº­p, bá» qua lÆ°u cookie/storage Ä‘á»ƒ khÃ´ng ghi Ä‘Ã¨ phiÃªn cÅ©.",
                         "orange",
                     )
             except Exception as e:
-                self.status_update.emit(f"⚠️ Lưu phiên lỗi: {str(e)[:40]}", "orange")
+                self.status_update.emit(f"âš ï¸ LÆ°u phiÃªn lá»—i: {str(e)[:40]}", "orange")
 
-            # BƯỚC 1: Browser.close (graceful — cho Chrome ghi cookie ra đĩa)
-            self.status_update.emit("🔒 Đóng browser (graceful — chờ Chrome flush cookies)...", "blue")
+            # BÆ¯á»šC 1: Browser.close (graceful â€” cho Chrome ghi cookie ra Ä‘Ä©a)
+            self.status_update.emit("ðŸ”’ ÄÃ³ng browser (graceful â€” chá» Chrome flush cookies)...", "blue")
             try:
                 await cdp.send("Browser.close")
-                await asyncio.sleep(5)  # ★ Chờ 5s cho Chrome ghi cookie + SQLite ra đĩa
+                await asyncio.sleep(5)  # â˜… Chá» 5s cho Chrome ghi cookie + SQLite ra Ä‘Ä©a
             except Exception:
                 pass
 
-            # BƯỚC 2: Kill process nếu vẫn còn sống
+            # BÆ¯á»šC 2: Kill process náº¿u váº«n cÃ²n sá»‘ng
             self._stop_flag = True
             self._release_browser_session()
             self._process = None
 
-            # BƯỚC 3: Emit finished
-            self.status_update.emit("✅ Hoàn thành!", "green")
+            # BÆ¯á»šC 3: Emit finished
+            self.status_update.emit("âœ… HoÃ n thÃ nh!", "green")
             self.finished_signal.emit("success")
 
         except Exception as e:
@@ -2020,23 +2170,23 @@ class CDPWorker(QThread):
                        "errno", "closed", "disconnect",
                        "no close frame received or sent")
             if any(s in err_msg.lower() for s in _closed):
-                self.status_update.emit("🔒 Browser đã đóng.", "blue")
+                self.status_update.emit("ðŸ”’ Browser Ä‘Ã£ Ä‘Ã³ng.", "blue")
                 self.finished_signal.emit("success")
             else:
-                self.status_update.emit(f"Lỗi: {err_msg[:80]}", "red")
+                self.status_update.emit(f"Lá»—i: {err_msg[:80]}", "red")
                 self.finished_signal.emit(f"error: {e}")
         finally:
             try: await cdp.disconnect()
             except Exception: pass
 
-    # ─── TikTok Automation ──────────────────────────────
+    # â”€â”€â”€ TikTok Automation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
     async def _update_account_financial_info(self, cdp):
-        """Cập nhật follow, quốc gia và thông tin tiền/balance của tài khoản TikTok."""
+        """Cáº­p nháº­t follow, quá»‘c gia vÃ  thÃ´ng tin tiá»n/balance cá»§a tÃ i khoáº£n TikTok."""
         try:
             if not await self._check_logged_in(cdp):
-                self.status_update.emit("⚠️ Chưa đăng nhập, bỏ qua cập nhật thông tin để không ghi dữ liệu rỗng.", "orange")
+                self.status_update.emit("âš ï¸ ChÆ°a Ä‘Äƒng nháº­p, bá» qua cáº­p nháº­t thÃ´ng tin Ä‘á»ƒ khÃ´ng ghi dá»¯ liá»‡u rá»—ng.", "orange")
                 return False
 
             info = {
@@ -2047,7 +2197,7 @@ class CDPWorker(QThread):
                 "balance": "",
             }
 
-            self.status_update.emit("👤 Mở trang profile để lấy follow...", "blue")
+            self.status_update.emit("ðŸ‘¤ Má»Ÿ trang profile Ä‘á»ƒ láº¥y follow...", "blue")
             await self._navigate_like_human(cdp, "tiktok.com/profile", wait=4)
             await asyncio.sleep(1)
             profile_info = await cdp.evaluate(r"""
@@ -2065,12 +2215,12 @@ class CDPWorker(QThread):
             """) or {}
             info["t_follows"] = profile_info.get("followers", "")
 
-            self.status_update.emit("🌍 Mở cài đặt tài khoản để lấy quốc gia...", "blue")
+            self.status_update.emit("ðŸŒ Má»Ÿ cÃ i Ä‘áº·t tÃ i khoáº£n Ä‘á»ƒ láº¥y quá»‘c gia...", "blue")
             await self._navigate_like_human(cdp, "tiktok.com/setting/account", wait=4)
             await asyncio.sleep(1)
             country = await cdp.evaluate(r"""
             (() => {
-                const labels = ['country/region', 'country', 'region', 'quốc gia', 'khu vực'];
+                const labels = ['country/region', 'country', 'region', 'quá»‘c gia', 'khu vá»±c'];
                 const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
                 const norm = (s) => clean(s).toLowerCase();
                 const rows = Array.from(document.querySelectorAll('div, section, li, p, span'));
@@ -2084,9 +2234,9 @@ class CDPWorker(QThread):
                         .replace(/country\/region/i, '')
                         .replace(/country/i, '')
                         .replace(/region/i, '')
-                        .replace(/quốc gia/i, '')
-                        .replace(/khu vực/i, '')
-                        .replace(/[:：]/g, '')
+                        .replace(/quá»‘c gia/i, '')
+                        .replace(/khu vá»±c/i, '')
+                        .replace(/[:ï¼š]/g, '')
                         .trim();
                     if (value && value.length <= 60) return value;
                     const parent = el.parentElement;
@@ -2096,9 +2246,9 @@ class CDPWorker(QThread):
                             .replace(/country\/region/i, '')
                             .replace(/country/i, '')
                             .replace(/region/i, '')
-                            .replace(/quốc gia/i, '')
-                            .replace(/khu vực/i, '')
-                            .replace(/[:：]/g, '')
+                            .replace(/quá»‘c gia/i, '')
+                            .replace(/khu vá»±c/i, '')
+                            .replace(/[:ï¼š]/g, '')
                             .trim();
                         if (value && value.length <= 80) return value;
                     }
@@ -2108,18 +2258,18 @@ class CDPWorker(QThread):
             """) or ""
             info["country"] = country
 
-            self.status_update.emit("💵 Mở Balance để lấy tiền tệ/số dư...", "blue")
+            self.status_update.emit("ðŸ’µ Má»Ÿ Balance Ä‘á»ƒ láº¥y tiá»n tá»‡/sá»‘ dÆ°...", "blue")
             await self._navigate_like_human(cdp, "tiktok.com/setting/balance", wait=5)
             await asyncio.sleep(1)
             money_info = await cdp.evaluate(r"""
             (() => {
                 const body = (document.body && document.body.innerText) || '';
                 const lines = body.split(/\n+/).map(s => s.trim()).filter(Boolean);
-                const moneyRe = /(?:[$€£¥₫]\s*[0-9][0-9.,]*|[0-9][0-9.,]*\s*(?:USD|EUR|GBP|VND|JPY|US\$))/i;
+                const moneyRe = /(?:[$â‚¬Â£Â¥â‚«]\s*[0-9][0-9.,]*|[0-9][0-9.,]*\s*(?:USD|EUR|GBP|VND|JPY|US\$))/i;
                 const moneyLines = lines.filter(line => moneyRe.test(line));
                 const firstMoney = moneyLines[0] || '';
                 let currency = '';
-                const curMatch = firstMoney.match(/USD|EUR|GBP|VND|JPY|US\$|[$€£¥₫]/i);
+                const curMatch = firstMoney.match(/USD|EUR|GBP|VND|JPY|US\$|[$â‚¬Â£Â¥â‚«]/i);
                 if (curMatch) currency = curMatch[0];
                 return {
                     balance: firstMoney,
@@ -2134,33 +2284,33 @@ class CDPWorker(QThread):
 
             update_data = {k: v for k, v in info.items() if str(v or "").strip()}
             if not update_data:
-                self.status_update.emit("⚠️ Không lấy được thông tin hợp lệ, giữ nguyên dữ liệu cũ.", "orange")
+                self.status_update.emit("âš ï¸ KhÃ´ng láº¥y Ä‘Æ°á»£c thÃ´ng tin há»£p lá»‡, giá»¯ nguyÃªn dá»¯ liá»‡u cÅ©.", "orange")
                 return False
 
             self.profile_data.update(update_data)
             self.profile_update_signal.emit(self.profile_data)
             self.status_update.emit(
-                f"✅ Info: Follow={info['t_follows'] or 'N/A'} | QG={info['country'] or 'N/A'} | Balance={info['balance'] or 'N/A'}",
+                f"âœ… Info: Follow={info['t_follows'] or 'N/A'} | QG={info['country'] or 'N/A'} | Balance={info['balance'] or 'N/A'}",
                 "green"
             )
             return True
         except Exception as e:
-            self.status_update.emit(f"⚠️ Lỗi cập nhật thông tin: {str(e)[:60]}", "red")
+            self.status_update.emit(f"âš ï¸ Lá»—i cáº­p nháº­t thÃ´ng tin: {str(e)[:60]}", "red")
             return False
 
 
     async def _update_tiktok_stats(self, cdp):
-        """Quét trang Profile và Studio để cập nhật Follow, Views, Video."""
+        """QuÃ©t trang Profile vÃ  Studio Ä‘á»ƒ cáº­p nháº­t Follow, Views, Video."""
         try:
             if not await self._check_logged_in(cdp):
-                self.status_update.emit("⚠️ Chưa đăng nhập, bỏ qua cập nhật thống kê để không ghi dữ liệu rỗng.", "orange")
+                self.status_update.emit("âš ï¸ ChÆ°a Ä‘Äƒng nháº­p, bá» qua cáº­p nháº­t thá»‘ng kÃª Ä‘á»ƒ khÃ´ng ghi dá»¯ liá»‡u rá»—ng.", "orange")
                 return False
 
-            self.status_update.emit("🔄 Đang vào trang cá nhân...", "blue")
+            self.status_update.emit("ðŸ”„ Äang vÃ o trang cÃ¡ nhÃ¢n...", "blue")
             await cdp.navigate("https://www.tiktok.com/profile")
             await asyncio.sleep(4)
             
-            # Đợi load xong hoặc redirect xong
+            # Äá»£i load xong hoáº·c redirect xong
             await cdp.evaluate("""
                 new Promise(resolve => {
                     if (document.readyState === 'complete') resolve();
@@ -2194,7 +2344,7 @@ class CDPWorker(QThread):
                         if (v_els.length > 0) {
                             hasProfileSignal = true;
                         } else {
-                            // Cố đếm thẻ video nếu giao diện đổi
+                            // Cá»‘ Ä‘áº¿m tháº» video náº¿u giao diá»‡n Ä‘á»•i
                             const fallbackVideos = document.querySelectorAll('div[class*="DivItemContainerForProfile"]');
                             videos = fallbackVideos.length.toString();
                             if (fallbackVideos.length > 0) hasProfileSignal = true;
@@ -2209,29 +2359,29 @@ class CDPWorker(QThread):
             """)
             
             if not stats:
-                self.status_update.emit("⚠️ Không lấy được thông số từ trang cá nhân", "orange")
+                self.status_update.emit("âš ï¸ KhÃ´ng láº¥y Ä‘Æ°á»£c thÃ´ng sá»‘ tá»« trang cÃ¡ nhÃ¢n", "orange")
                 return False
 
             if not stats.get("hasProfileSignal"):
-                self.status_update.emit("⚠️ Trang profile chưa load đúng, giữ nguyên thống kê cũ.", "orange")
+                self.status_update.emit("âš ï¸ Trang profile chÆ°a load Ä‘Ãºng, giá»¯ nguyÃªn thá»‘ng kÃª cÅ©.", "orange")
                 return False
 
             followers = str(stats.get('followers', '') or '').strip()
             likes = str(stats.get('likes', '') or '').strip()
             videos = str(stats.get('videos', '') or '').strip()
             if not any([followers, likes, videos]):
-                self.status_update.emit("⚠️ Thống kê trả về rỗng, giữ nguyên dữ liệu cũ.", "orange")
+                self.status_update.emit("âš ï¸ Thá»‘ng kÃª tráº£ vá» rá»—ng, giá»¯ nguyÃªn dá»¯ liá»‡u cÅ©.", "orange")
                 return False
             
-            self.status_update.emit(f"✅ Follow: {followers} | Likes: {likes} | Videos: {videos}", "green")
+            self.status_update.emit(f"âœ… Follow: {followers} | Likes: {likes} | Videos: {videos}", "green")
             
-            # Gửi signal về UI để update table
-            # Ta dùng profile_update_signal hoặc tự update vào profile_data
+            # Gá»­i signal vá» UI Ä‘á»ƒ update table
+            # Ta dÃ¹ng profile_update_signal hoáº·c tá»± update vÃ o profile_data
             update_data = {}
             if followers:
                 update_data["t_follows"] = followers
             if likes:
-                update_data["t_views"] = likes # Tạm dùng Likes cho cột T.Views vì profile chỉ hiện Likes
+                update_data["t_views"] = likes # Táº¡m dÃ¹ng Likes cho cá»™t T.Views vÃ¬ profile chá»‰ hiá»‡n Likes
             if videos:
                 update_data["t_video"] = videos
             self.profile_data.update(update_data)
@@ -2239,11 +2389,11 @@ class CDPWorker(QThread):
             return True
             
         except Exception as e:
-            self.status_update.emit(f"⚠️ Lỗi cập nhật thống kê: {str(e)[:50]}", "red")
+            self.status_update.emit(f"âš ï¸ Lá»—i cáº­p nháº­t thá»‘ng kÃª: {str(e)[:50]}", "red")
             return False
 
     async def _skip_tiktok_popup(self, cdp):
-        """Bỏ qua popup chọn chủ đề."""
+        """Bá» qua popup chá»n chá»§ Ä‘á»."""
         try:
             has_skip = await cdp.evaluate("""
                 (() => {
@@ -2255,13 +2405,13 @@ class CDPWorker(QThread):
                 })()
             """)
             if has_skip:
-                self.status_update.emit("✅ Đã bỏ qua popup chủ đề", "green")
+                self.status_update.emit("âœ… ÄÃ£ bá» qua popup chá»§ Ä‘á»", "green")
                 return
         except Exception:
             pass
 
         try:
-            # Chọn 1 ô rồi bấm Continue
+            # Chá»n 1 Ã´ rá»“i báº¥m Continue
             await cdp.evaluate("""
                 (() => {
                     const item = document.querySelector('[data-e2e="interest-item"]');
@@ -2274,12 +2424,12 @@ class CDPWorker(QThread):
                     }, 500);
                 })()
             """)
-            self.status_update.emit("✅ Đã bỏ qua popup (Continue)", "green")
+            self.status_update.emit("âœ… ÄÃ£ bá» qua popup (Continue)", "green")
         except Exception:
             pass
 
     async def _reinject_cookies(self, cdp, cookie_str=None):
-        """Nạp cookie dự phòng vào browser khi luồng đăng nhập/khôi phục cần dùng."""
+        """Náº¡p cookie dá»± phÃ²ng vÃ o browser khi luá»“ng Ä‘Äƒng nháº­p/khÃ´i phá»¥c cáº§n dÃ¹ng."""
         if cookie_str is None:
             cookie_str = self.profile_data.get("cookie", "")
         cookie_str = str(cookie_str or "")
@@ -2288,7 +2438,7 @@ class CDPWorker(QThread):
 
         try:
             import time as _time
-            expires_epoch = _time.time() + 30 * 24 * 3600  # 30 ngày
+            expires_epoch = _time.time() + 30 * 24 * 3600  # 30 ngÃ y
             cookies_to_set = []
             for pair in cookie_str.split(";"):
                 pair = pair.strip()
@@ -2311,19 +2461,19 @@ class CDPWorker(QThread):
             return 0
 
     async def _try_cookie_login_from_string(self, cdp, cookie_str: str, label: str) -> bool:
-        """Dùng cookie dự phòng chỉ trong luồng đăng nhập/khôi phục."""
+        """DÃ¹ng cookie dá»± phÃ²ng chá»‰ trong luá»“ng Ä‘Äƒng nháº­p/khÃ´i phá»¥c."""
         cookie_str = str(cookie_str or "").strip()
         if len(cookie_str) <= 20:
             return False
 
-        self.status_update.emit(f"🍪 Thử khôi phục phiên bằng {label}...", "blue")
+        self.status_update.emit(f"ðŸª Thá»­ khÃ´i phá»¥c phiÃªn báº±ng {label}...", "blue")
         await self._restore_tiktok_storage(cdp)
         injected_count = await self._reinject_cookies(cdp, cookie_str=cookie_str)
         if injected_count <= 0:
-            self.status_update.emit(f"⚠️ {label} không có cookie hợp lệ để nạp.", "orange")
+            self.status_update.emit(f"âš ï¸ {label} khÃ´ng cÃ³ cookie há»£p lá»‡ Ä‘á»ƒ náº¡p.", "orange")
             return False
 
-        self.status_update.emit(f"🍪 Đã nạp {injected_count} cookie từ {label}", "blue")
+        self.status_update.emit(f"ðŸª ÄÃ£ náº¡p {injected_count} cookie tá»« {label}", "blue")
         try:
             await cdp.send("Page.reload")
         except Exception:
@@ -2331,23 +2481,23 @@ class CDPWorker(QThread):
         await asyncio.sleep(5)
 
         if await self._check_logged_in(cdp):
-            self.status_update.emit("🔍 Cookie hợp lệ — đang xác minh ID...", "blue")
+            self.status_update.emit("ðŸ” Cookie há»£p lá»‡ â€” Ä‘ang xÃ¡c minh ID...", "blue")
             verified_id = await self._extract_profile_info(cdp, need_reload=False)
             if verified_id:
-                self.status_update.emit(f"✅ Đăng nhập cookie thành công! ({verified_id})", "green")
+                self.status_update.emit(f"âœ… ÄÄƒng nháº­p cookie thÃ nh cÃ´ng! ({verified_id})", "green")
             else:
-                self.status_update.emit("✅ Cookie login OK (chưa lấy được @username)", "green")
+                self.status_update.emit("âœ… Cookie login OK (chÆ°a láº¥y Ä‘Æ°á»£c @username)", "green")
             await self._persist_tiktok_cookies(cdp)
             return True
 
-        self.status_update.emit(f"⚠️ {label} không khôi phục được phiên.", "orange")
+        self.status_update.emit(f"âš ï¸ {label} khÃ´ng khÃ´i phá»¥c Ä‘Æ°á»£c phiÃªn.", "orange")
         return False
 
     async def _type_url_in_addressbar(self, url: str, wait: float = 6.0, cdp=None):
-        """★ Mở URL từ New Tab — dùng JS location.href (an toàn đa luồng).
+        """â˜… Má»Ÿ URL tá»« New Tab â€” dÃ¹ng JS location.href (an toÃ n Ä‘a luá»“ng).
 
-        Mỗi CDP session là độc lập → không conflict khi chạy nhiều profile.
-        Từ chrome://newtab → chuyển về about:blank trước → rồi location.href.
+        Má»—i CDP session lÃ  Ä‘á»™c láº­p â†’ khÃ´ng conflict khi cháº¡y nhiá»u profile.
+        Tá»« chrome://newtab â†’ chuyá»ƒn vá» about:blank trÆ°á»›c â†’ rá»“i location.href.
         """
         text_to_type = url.replace("https://", "").replace("http://", "").replace("www.", "")
         full_url = f"https://www.{text_to_type}"
@@ -2356,13 +2506,13 @@ class CDPWorker(QThread):
         if not cdp:
             return
 
-        # Chặn spam điều hướng liên tiếp gây loop reload.
+        # Cháº·n spam Ä‘iá»u hÆ°á»›ng liÃªn tiáº¿p gÃ¢y loop reload.
         if self._last_nav_url == full_url and (now_ts - self._last_nav_ts) < 8:
             return
 
         try:
-            # Chrome://newtab là trang đặc biệt — JS evaluate có thể fail
-            # → chuyển về about:blank trước (trang thường)
+            # Chrome://newtab lÃ  trang Ä‘áº·c biá»‡t â€” JS evaluate cÃ³ thá»ƒ fail
+            # â†’ chuyá»ƒn vá» about:blank trÆ°á»›c (trang thÆ°á»ng)
             try:
                 cur = await cdp.evaluate("window.location.href") or ""
                 if isinstance(cur, str) and ("tiktok.com" in cur and "login" not in cur):
@@ -2379,12 +2529,12 @@ class CDPWorker(QThread):
                     await cdp.navigate("about:blank")
                     await asyncio.sleep(0.5)
             except Exception:
-                # Nếu evaluate fail → chắc chắn đang ở trang đặc biệt
+                # Náº¿u evaluate fail â†’ cháº¯c cháº¯n Ä‘ang á»Ÿ trang Ä‘áº·c biá»‡t
                 await cdp.navigate("about:blank")
                 await asyncio.sleep(0.5)
 
-            # ★ Dùng JS location.href — giống người gõ URL rồi Enter
-            self.status_update.emit(f"⏳ Đang tải {text_to_type}...", "blue")
+            # â˜… DÃ¹ng JS location.href â€” giá»‘ng ngÆ°á»i gÃµ URL rá»“i Enter
+            self.status_update.emit(f"â³ Äang táº£i {text_to_type}...", "blue")
             await cdp.evaluate(f'window.location.href = "{full_url}"')
             self._last_nav_url = full_url
             self._last_nav_ts = time.time()
@@ -2408,7 +2558,7 @@ class CDPWorker(QThread):
         expected_host = proxy_payload.get("host", "")
         expected_type = proxy_payload.get("mode", "")
         self.status_update.emit(
-            f"Kiểm tra proxy trong browser: {expected_type}://{expected_host}:{proxy_payload.get('port')}",
+            f"Kiá»ƒm tra proxy trong browser: {expected_type}://{expected_host}:{proxy_payload.get('port')}",
             "blue"
         )
 
@@ -2417,7 +2567,7 @@ class CDPWorker(QThread):
             await asyncio.sleep(3)
             raw = await cdp.evaluate("document.body ? document.body.innerText : ''") or ""
         except Exception as e:
-            self.status_update.emit(f"❌ Browser không kiểm tra được proxy: {str(e)[:80]}", "red")
+            self.status_update.emit(f"âŒ Browser khÃ´ng kiá»ƒm tra Ä‘Æ°á»£c proxy: {str(e)[:80]}", "red")
             return False
 
         try:
@@ -2428,7 +2578,7 @@ class CDPWorker(QThread):
             browser_ip = match.group(0) if match else ""
 
         if not browser_ip:
-            self.status_update.emit(f"❌ Proxy check không trả về IP: {raw[:80]}", "red")
+            self.status_update.emit(f"âŒ Proxy check khÃ´ng tráº£ vá» IP: {raw[:80]}", "red")
             return False
 
         direct_ip = ""
@@ -2443,7 +2593,7 @@ class CDPWorker(QThread):
 
         if direct_ip and browser_ip == direct_ip:
             self.status_update.emit(
-                f"❌ Browser vẫn dùng IP máy thật ({browser_ip}), proxy chưa được áp dụng.",
+                f"âŒ Browser váº«n dÃ¹ng IP mÃ¡y tháº­t ({browser_ip}), proxy chÆ°a Ä‘Æ°á»£c Ã¡p dá»¥ng.",
                 "red"
             )
             return False
@@ -2451,12 +2601,12 @@ class CDPWorker(QThread):
         expected_is_ip = bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", expected_host))
         if expected_is_ip and browser_ip != expected_host:
             self.status_update.emit(
-                f"Proxy exit IP khác gateway ({browser_ip} != {expected_host}); có thể bình thường với proxy xoay/mobile.",
+                f"Proxy exit IP khÃ¡c gateway ({browser_ip} != {expected_host}); cÃ³ thá»ƒ bÃ¬nh thÆ°á»ng vá»›i proxy xoay/mobile.",
                 "orange"
             )
             return True
 
-        self.status_update.emit(f"✅ Browser đang đi qua proxy IP: {browser_ip}", "green")
+        self.status_update.emit(f"âœ… Browser Ä‘ang Ä‘i qua proxy IP: {browser_ip}", "green")
         return True
 
     async def _is_google_traffic_challenge(self, cdp) -> bool:
@@ -2486,20 +2636,20 @@ class CDPWorker(QThread):
         """Open Google briefly, then navigate directly to TikTok without Google search/click."""
         try:
             self._google_warmup_blocked = False
-            self.status_update.emit("🌐 Mở Google trước khi vào TikTok...", "blue")
+            self.status_update.emit("ðŸŒ Má»Ÿ Google trÆ°á»›c khi vÃ o TikTok...", "blue")
             await self._type_url_in_addressbar("google.com", wait=random.uniform(2.0, 3.0), cdp=cdp)
 
             if await self._is_google_traffic_challenge(cdp):
                 self._google_warmup_blocked = True
-                self.status_update.emit("⚠️ Google hiện CAPTCHA/unusual traffic — bỏ qua và vào TikTok trực tiếp", "orange")
+                self.status_update.emit("âš ï¸ Google hiá»‡n CAPTCHA/unusual traffic â€” bá» qua vÃ  vÃ o TikTok trá»±c tiáº¿p", "orange")
             else:
                 await asyncio.sleep(random.uniform(0.8, 1.4))
 
-            self.status_update.emit("➡️ Vào TikTok trực tiếp...", "blue")
+            self.status_update.emit("âž¡ï¸ VÃ o TikTok trá»±c tiáº¿p...", "blue")
             await self._type_url_in_addressbar("tiktok.com", wait=random.uniform(6.0, 7.0), cdp=cdp)
             return True
         except Exception as e:
-            self.status_update.emit(f"⚠️ Warm-up Google→TikTok lỗi: {str(e)[:60]}", "orange")
+            self.status_update.emit(f"âš ï¸ Warm-up Googleâ†’TikTok lá»—i: {str(e)[:60]}", "orange")
             try:
                 await self._type_url_in_addressbar("tiktok.com", wait=6, cdp=cdp)
                 return True
@@ -2510,11 +2660,11 @@ class CDPWorker(QThread):
         """Open Google, search TikTok, then click a TikTok result."""
         try:
             self._google_warmup_blocked = False
-            self.status_update.emit("🌐 Warm-up: mở Google trước khi vào TikTok...", "blue")
+            self.status_update.emit("ðŸŒ Warm-up: má»Ÿ Google trÆ°á»›c khi vÃ o TikTok...", "blue")
             await self._type_url_in_addressbar("google.com", wait=random.uniform(2.5, 3.5), cdp=cdp)
             if await self._is_google_traffic_challenge(cdp):
                 self._google_warmup_blocked = True
-                self.status_update.emit("❌ Google chặn unusual traffic/CAPTCHA ngay khi mở", "red")
+                self.status_update.emit("âŒ Google cháº·n unusual traffic/CAPTCHA ngay khi má»Ÿ", "red")
                 return False
 
             # Handle Google consent if it appears.
@@ -2522,7 +2672,7 @@ class CDPWorker(QThread):
                 consent_pos = await cdp.evaluate(r"""
                 (() => {
                     const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-                    const labels = ['accept all', 'i agree', 'agree', 'chấp nhận tất cả', 'tôi đồng ý'];
+                    const labels = ['accept all', 'i agree', 'agree', 'cháº¥p nháº­n táº¥t cáº£', 'tÃ´i Ä‘á»“ng Ã½'];
                     for (const el of Array.from(document.querySelectorAll('button, div[role="button"], input[type="submit"]'))) {
                         const text = norm(el.innerText || el.textContent || el.value || '');
                         if (!labels.some(k => text.includes(k))) continue;
@@ -2549,23 +2699,23 @@ class CDPWorker(QThread):
                 await asyncio.sleep(0.5)
 
             if not search_pos:
-                self.status_update.emit("⚠️ Warm-up: không thấy ô tìm kiếm Google", "orange")
+                self.status_update.emit("âš ï¸ Warm-up: khÃ´ng tháº¥y Ã´ tÃ¬m kiáº¿m Google", "orange")
                 return False
 
-            await self._human_move_and_click(cdp, *search_pos, "Click ô Google Search")
+            await self._human_move_and_click(cdp, *search_pos, "Click Ã´ Google Search")
             await asyncio.sleep(random.uniform(0.4, 0.8))
             await cdp.type_text("TikTok", delay=random.randint(90, 180))
             await asyncio.sleep(random.uniform(0.8, 1.2))
             if await self._is_google_traffic_challenge(cdp):
                 self._google_warmup_blocked = True
-                self.status_update.emit("❌ Google chặn unusual traffic/CAPTCHA sau khi nhập tìm kiếm", "red")
+                self.status_update.emit("âŒ Google cháº·n unusual traffic/CAPTCHA sau khi nháº­p tÃ¬m kiáº¿m", "red")
                 return False
 
             suggestion_pos = None
             for _ in range(8):
                 if await self._is_google_traffic_challenge(cdp):
                     self._google_warmup_blocked = True
-                    self.status_update.emit("❌ Google chặn unusual traffic/CAPTCHA ở trang gợi ý", "red")
+                    self.status_update.emit("âŒ Google cháº·n unusual traffic/CAPTCHA á»Ÿ trang gá»£i Ã½", "red")
                     return False
                 suggestion_pos = await cdp.evaluate(r"""
                 (() => {
@@ -2594,26 +2744,26 @@ class CDPWorker(QThread):
                 await asyncio.sleep(0.4)
 
             if suggestion_pos:
-                self.status_update.emit("👆 Warm-up: click gợi ý TikTok đầu tiên...", "blue")
+                self.status_update.emit("ðŸ‘† Warm-up: click gá»£i Ã½ TikTok Ä‘áº§u tiÃªn...", "blue")
                 await self._human_move_and_click(
-                    cdp, int(suggestion_pos["x"]), int(suggestion_pos["y"]), "Click gợi ý Google TikTok"
+                    cdp, int(suggestion_pos["x"]), int(suggestion_pos["y"]), "Click gá»£i Ã½ Google TikTok"
                 )
             else:
-                self.status_update.emit("⚠️ Warm-up: không thấy gợi ý Google — dùng Enter", "orange")
+                self.status_update.emit("âš ï¸ Warm-up: khÃ´ng tháº¥y gá»£i Ã½ Google â€” dÃ¹ng Enter", "orange")
                 await cdp.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Enter", "code": "Enter"})
                 await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter"})
 
             await asyncio.sleep(random.uniform(3.0, 4.5))
             if await self._is_google_traffic_challenge(cdp):
                 self._google_warmup_blocked = True
-                self.status_update.emit("❌ Google chặn unusual traffic/CAPTCHA ở trang kết quả", "red")
+                self.status_update.emit("âŒ Google cháº·n unusual traffic/CAPTCHA á»Ÿ trang káº¿t quáº£", "red")
                 return False
 
             tiktok_pos = None
             for _ in range(8):
                 if await self._is_google_traffic_challenge(cdp):
                     self._google_warmup_blocked = True
-                    self.status_update.emit("❌ Google chặn unusual traffic/CAPTCHA khi tìm link TikTok", "red")
+                    self.status_update.emit("âŒ Google cháº·n unusual traffic/CAPTCHA khi tÃ¬m link TikTok", "red")
                     return False
                 tiktok_pos = await cdp.evaluate(r"""
                 (() => {
@@ -2643,17 +2793,17 @@ class CDPWorker(QThread):
                 await asyncio.sleep(0.8)
 
             if not tiktok_pos:
-                self.status_update.emit("⚠️ Warm-up: không tìm thấy link TikTok trên Google", "orange")
+                self.status_update.emit("âš ï¸ Warm-up: khÃ´ng tÃ¬m tháº¥y link TikTok trÃªn Google", "orange")
                 return False
 
-            self.status_update.emit("👆 Warm-up: click kết quả TikTok từ Google...", "blue")
+            self.status_update.emit("ðŸ‘† Warm-up: click káº¿t quáº£ TikTok tá»« Google...", "blue")
             await self._human_move_and_click(
                 cdp, int(tiktok_pos["x"]), int(tiktok_pos["y"]), "Click Google result TikTok"
             )
             await asyncio.sleep(random.uniform(6.0, 8.0))
             return True
         except Exception as e:
-            self.status_update.emit(f"⚠️ Warm-up lỗi: {str(e)[:60]}", "orange")
+            self.status_update.emit(f"âš ï¸ Warm-up lá»—i: {str(e)[:60]}", "orange")
             return False
 
     async def _wait_for_tiktok_ready(self, cdp, timeout: float = 45) -> bool:
@@ -2691,7 +2841,7 @@ class CDPWorker(QThread):
                     chrome403_retries += 1
                     elapsed = int(time.time() - start)
                     self.status_update.emit(
-                        f"⚠️ Chrome kẹt lỗi 403 — làm mới cache TikTok, giữ nguyên cookie... ({elapsed}s, lần {chrome403_retries})",
+                        f"âš ï¸ Chrome káº¹t lá»—i 403 â€” lÃ m má»›i cache TikTok, giá»¯ nguyÃªn cookie... ({elapsed}s, láº§n {chrome403_retries})",
                         "orange"
                     )
                     try:
@@ -2726,12 +2876,12 @@ class CDPWorker(QThread):
 
                 if state.get("hasPleaseWait"):
                     elapsed = int(time.time() - start)
-                    self.status_update.emit(f"⏳ TikTok đang Please wait... ({elapsed}s)", "orange")
+                    self.status_update.emit(f"â³ TikTok Ä‘ang Please wait... ({elapsed}s)", "orange")
 
-                    # ── Lần reload 1: ở giây 12 ──
+                    # â”€â”€ Láº§n reload 1: á»Ÿ giÃ¢y 12 â”€â”€
                     if reload_count == 0 and elapsed >= 12:
                         reload_count = 1
-                        self.status_update.emit("🔄 Reload TikTok lần 1 do kẹt Please wait...", "orange")
+                        self.status_update.emit("ðŸ”„ Reload TikTok láº§n 1 do káº¹t Please wait...", "orange")
                         try:
                             await cdp.send("Page.reload")
                         except Exception:
@@ -2739,15 +2889,15 @@ class CDPWorker(QThread):
                         await asyncio.sleep(5)
                         continue
 
-                    # ── Lần reload 2: ở giây 25 — re-inject stealth trước khi reload ──
+                    # â”€â”€ Láº§n reload 2: á»Ÿ giÃ¢y 25 â€” re-inject stealth trÆ°á»›c khi reload â”€â”€
                     if reload_count == 1 and elapsed >= 25:
                         reload_count = 2
                         if self._should_preserve_gologin_fingerprint():
-                            self.status_update.emit("🔄 Reload TikTok lần 2 (giu nguyen fingerprint GoLogin)...", "orange")
+                            self.status_update.emit("ðŸ”„ Reload TikTok láº§n 2 (giu nguyen fingerprint GoLogin)...", "orange")
                         else:
-                            self.status_update.emit("🔄 Reload TikTok lần 2 + re-inject stealth...", "orange")
+                            self.status_update.emit("ðŸ”„ Reload TikTok láº§n 2 + re-inject stealth...", "orange")
                             try:
-                                # Re-inject stealth trước khi reload
+                                # Re-inject stealth trÆ°á»›c khi reload
                                 await cdp.evaluate("""
                                 Object.defineProperty(navigator, 'webdriver', {
                                     get: () => false, configurable: true
@@ -2775,28 +2925,28 @@ class CDPWorker(QThread):
 
 
     async def _navigate_like_human(self, cdp, url: str, wait: float = 5.0):
-        """★ Navigate tới URL giống người thật — KHÔNG dùng Page.navigate (CDP).
+        """â˜… Navigate tá»›i URL giá»‘ng ngÆ°á»i tháº­t â€” KHÃ”NG dÃ¹ng Page.navigate (CDP).
 
-        TikTok phát hiện `Page.navigate` (CDP programmatic) và đá session cookie.
-        Giải pháp: Dùng window.location.href (JS) để chuyển trang —
-        giống hệt người dùng gõ URL vào address bar rồi nhấn Enter.
-        Browser vẫn ở tab hiện tại (New Tab) → chuyển sang TikTok tự nhiên.
+        TikTok phÃ¡t hiá»‡n `Page.navigate` (CDP programmatic) vÃ  Ä‘Ã¡ session cookie.
+        Giáº£i phÃ¡p: DÃ¹ng window.location.href (JS) Ä‘á»ƒ chuyá»ƒn trang â€”
+        giá»‘ng há»‡t ngÆ°á»i dÃ¹ng gÃµ URL vÃ o address bar rá»“i nháº¥n Enter.
+        Browser váº«n á»Ÿ tab hiá»‡n táº¡i (New Tab) â†’ chuyá»ƒn sang TikTok tá»± nhiÃªn.
         """
         full_url = f"https://www.{url}" if not url.startswith("http") else url
         now_ts = time.time()
         if self._last_nav_url == full_url and (now_ts - self._last_nav_ts) < 8:
             return
 
-        # ═══════════════════════════════════════════════
-        #  CÁCH 1: window.location.href (JS navigation)
-        #  Chuyển trang NGAY trên tab hiện tại — giống gõ URL → Enter
-        #  Browser ở New Tab → chuyển sang TikTok (cùng tab)
-        # ═══════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  CÃCH 1: window.location.href (JS navigation)
+        #  Chuyá»ƒn trang NGAY trÃªn tab hiá»‡n táº¡i â€” giá»‘ng gÃµ URL â†’ Enter
+        #  Browser á»Ÿ New Tab â†’ chuyá»ƒn sang TikTok (cÃ¹ng tab)
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         try:
-            # Kiểm tra trang hiện tại — chrome://newtab không cho phép JS navigate
+            # Kiá»ƒm tra trang hiá»‡n táº¡i â€” chrome://newtab khÃ´ng cho phÃ©p JS navigate
             current_url = await cdp.evaluate("window.location.href") or ""
             if current_url.startswith("chrome://") or current_url.startswith("chrome-search://"):
-                # Trang New Tab đặc biệt → dùng cdp.navigate tới about:blank trước
+                # Trang New Tab Ä‘áº·c biá»‡t â†’ dÃ¹ng cdp.navigate tá»›i about:blank trÆ°á»›c
                 await cdp.navigate("about:blank")
                 await asyncio.sleep(0.5)
 
@@ -2808,9 +2958,9 @@ class CDPWorker(QThread):
         except Exception:
             pass
 
-        # ═══════════════════════════════════════════════
-        #  CÁCH 2 (Fallback): Target.createTarget (tab mới)
-        # ═══════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  CÃCH 2 (Fallback): Target.createTarget (tab má»›i)
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         try:
             current_targets = []
             try:
@@ -2847,25 +2997,25 @@ class CDPWorker(QThread):
         except Exception:
             pass
 
-        # ═══════════════════════════════════════════════
-        #  CÁCH 3 (Last resort): cdp.navigate
-        # ═══════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  CÃCH 3 (Last resort): cdp.navigate
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         await cdp.navigate(full_url)
         self._last_nav_url = full_url
         self._last_nav_ts = time.time()
         await asyncio.sleep(wait)
 
 
-    # ─── Helper: Human-like Click với chấm đỏ ──────────────────────────────
+    # â”€â”€â”€ Helper: Human-like Click vá»›i cháº¥m Ä‘á» â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
     async def _persist_tiktok_cookies(self, cdp):
-        """★ FIX 1: Biến session cookies → persistent cookies (30 ngày).
+        """â˜… FIX 1: Biáº¿n session cookies â†’ persistent cookies (30 ngÃ y).
 
-        TikTok set sessionid, sid_tt, sid_guard dưới dạng SESSION cookies
-        (không có expires) → Chrome XÓA khi đóng browser.
-        Fix: đọc tất cả TikTok cookies → ghi lại với expires = 30 ngày
-        → Chrome lưu persistent vào đĩa, không xóa khi đóng.
+        TikTok set sessionid, sid_tt, sid_guard dÆ°á»›i dáº¡ng SESSION cookies
+        (khÃ´ng cÃ³ expires) â†’ Chrome XÃ“A khi Ä‘Ã³ng browser.
+        Fix: Ä‘á»c táº¥t cáº£ TikTok cookies â†’ ghi láº¡i vá»›i expires = 30 ngÃ y
+        â†’ Chrome lÆ°u persistent vÃ o Ä‘Ä©a, khÃ´ng xÃ³a khi Ä‘Ã³ng.
         """
         try:
             import time as _time
@@ -2877,16 +3027,16 @@ class CDPWorker(QThread):
                 return
             if not self._has_valid_tiktok_auth_cookie(tiktok_cookies):
                 self.status_update.emit(
-                    "⚠️ Không thấy cookie đăng nhập TikTok, bỏ qua persist cookie.",
+                    "âš ï¸ KhÃ´ng tháº¥y cookie Ä‘Äƒng nháº­p TikTok, bá» qua persist cookie.",
                     "orange",
                 )
                 return
 
-            expires_epoch = _time.time() + 30 * 24 * 3600  # 30 ngày
+            expires_epoch = _time.time() + 30 * 24 * 3600  # 30 ngÃ y
             persisted = 0
 
             for cookie in tiktok_cookies:
-                # Chỉ convert cookies chưa có expires (session cookies)
+                # Chá»‰ convert cookies chÆ°a cÃ³ expires (session cookies)
                 if cookie.get('expires', 0) <= 0 or cookie.get('session', False):
                     try:
                         # Update expires in place. Do not delete first; if setCookie fails,
@@ -2910,15 +3060,15 @@ class CDPWorker(QThread):
 
             if persisted > 0:
                 self.status_update.emit(
-                    f"🔒 Đã chuyển {persisted} session cookie → persistent (30 ngày)", "green"
+                    f"ðŸ”’ ÄÃ£ chuyá»ƒn {persisted} session cookie â†’ persistent (30 ngÃ y)", "green"
                 )
         except Exception as e:
-            self.status_update.emit(f"⚠️ Persist cookie lỗi: {str(e)[:40]}", "orange")
+            self.status_update.emit(f"âš ï¸ Persist cookie lá»—i: {str(e)[:40]}", "orange")
 
     async def _resave_cookies_to_db(self, cdp):
-        """★ FIX 2: Đọc cookie mới nhất từ Chrome → lưu vào DB trước khi đóng browser.
+        """â˜… FIX 2: Äá»c cookie má»›i nháº¥t tá»« Chrome â†’ lÆ°u vÃ o DB trÆ°á»›c khi Ä‘Ã³ng browser.
 
-        Đảm bảo DB luôn có bản copy cookie mới nhất để inject lại lần sau.
+        Äáº£m báº£o DB luÃ´n cÃ³ báº£n copy cookie má»›i nháº¥t Ä‘á»ƒ inject láº¡i láº§n sau.
         """
         try:
             cookies_result = await cdp.send("Network.getAllCookies")
@@ -2929,7 +3079,7 @@ class CDPWorker(QThread):
                 return
             if not self._has_valid_tiktok_auth_cookie(tiktok_cookies):
                 self.status_update.emit(
-                    "⚠️ Không lưu cookie mới vì browser không còn cookie đăng nhập TikTok.",
+                    "âš ï¸ KhÃ´ng lÆ°u cookie má»›i vÃ¬ browser khÃ´ng cÃ²n cookie Ä‘Äƒng nháº­p TikTok.",
                     "orange",
                 )
                 return
@@ -2944,18 +3094,18 @@ class CDPWorker(QThread):
                     "refresh_token": self.profile_data.get("refresh_token", ""),
                 })
                 self.status_update.emit(
-                    f"🍪 Đã lưu {len(tiktok_cookies)} cookie vào DB", "green"
+                    f"ðŸª ÄÃ£ lÆ°u {len(tiktok_cookies)} cookie vÃ o DB", "green"
                 )
         except Exception as e:
-            self.status_update.emit(f"⚠️ Lưu cookie lỗi: {str(e)[:40]}", "orange")
+            self.status_update.emit(f"âš ï¸ LÆ°u cookie lá»—i: {str(e)[:40]}", "orange")
 
     async def _save_tiktok_storage(self, cdp):
-        """★ FIX 4 (Trường hợp A): Backup localStorage + sessionStorage → file JSON.
+        """â˜… FIX 4 (TrÆ°á»ng há»£p A): Backup localStorage + sessionStorage â†’ file JSON.
 
-        TikTok lưu thông tin user (webapp_user_info, cookie_consent, v.v.)
-        trong localStorage. Dữ liệu này giúp TikTok nhận diện phiên đăng nhập
-        mà không cần dựa 100% vào cookies.
-        Backup dữ liệu này vào file JSON trong profile dir → restore lần sau.
+        TikTok lÆ°u thÃ´ng tin user (webapp_user_info, cookie_consent, v.v.)
+        trong localStorage. Dá»¯ liá»‡u nÃ y giÃºp TikTok nháº­n diá»‡n phiÃªn Ä‘Äƒng nháº­p
+        mÃ  khÃ´ng cáº§n dá»±a 100% vÃ o cookies.
+        Backup dá»¯ liá»‡u nÃ y vÃ o file JSON trong profile dir â†’ restore láº§n sau.
         """
         try:
             storage_data = await cdp.evaluate("""
@@ -2986,15 +3136,15 @@ class CDPWorker(QThread):
                 ls_count = len(storage_data.get('localStorage', {}))
                 ss_count = len(storage_data.get('sessionStorage', {}))
                 self.status_update.emit(
-                    f"💾 Đã backup Storage (LS:{ls_count} + SS:{ss_count})", "green"
+                    f"ðŸ’¾ ÄÃ£ backup Storage (LS:{ls_count} + SS:{ss_count})", "green"
                 )
         except Exception as e:
-            self.status_update.emit(f"⚠️ Backup storage lỗi: {str(e)[:40]}", "orange")
+            self.status_update.emit(f"âš ï¸ Backup storage lá»—i: {str(e)[:40]}", "orange")
 
     async def _restore_tiktok_storage(self, cdp):
-        """★ FIX 4 (Trường hợp A): Restore localStorage + sessionStorage từ file JSON.
+        """â˜… FIX 4 (TrÆ°á»ng há»£p A): Restore localStorage + sessionStorage tá»« file JSON.
 
-        Phải gọi SAU KHI navigate tới tiktok.com (vì localStorage phụ thuộc origin).
+        Pháº£i gá»i SAU KHI navigate tá»›i tiktok.com (vÃ¬ localStorage phá»¥ thuá»™c origin).
         """
         storage_file = os.path.join(self._profile_dir, "tiktok_storage.json")
         if not os.path.exists(storage_file):
@@ -3041,13 +3191,13 @@ class CDPWorker(QThread):
                 """)
 
             self.status_update.emit(
-                f"💾 Đã restore Storage (LS:{len(ls_data)} + SS:{len(ss_data)})", "green"
+                f"ðŸ’¾ ÄÃ£ restore Storage (LS:{len(ls_data)} + SS:{len(ss_data)})", "green"
             )
         except Exception as e:
-            self.status_update.emit(f"⚠️ Restore storage lỗi: {str(e)[:40]}", "orange")
+            self.status_update.emit(f"âš ï¸ Restore storage lá»—i: {str(e)[:40]}", "orange")
 
     async def _ensure_cursor_dot(self, cdp):
-        """Tạo cursor dot SVG 1 lần duy nhất (nếu chưa có). Dùng transform để update vị trí."""
+        """Táº¡o cursor dot SVG 1 láº§n duy nháº¥t (náº¿u chÆ°a cÃ³). DÃ¹ng transform Ä‘á»ƒ update vá»‹ trÃ­."""
         await cdp.evaluate("""
         (() => {
             if (document.getElementById('__cursor_dot__')) return;
@@ -3068,7 +3218,7 @@ class CDPWorker(QThread):
         """)
 
     async def _move_cursor_dot(self, cdp, x, y):
-        """Update vị trí cursor bằng transform (GPU accelerated, không layout reflow)."""
+        """Update vá»‹ trÃ­ cursor báº±ng transform (GPU accelerated, khÃ´ng layout reflow)."""
         await cdp.evaluate(f"""
         (() => {{
             const d = document.getElementById('__cursor_dot__');
@@ -3077,12 +3227,12 @@ class CDPWorker(QThread):
         """)
 
     async def _show_cursor_dot(self, cdp, x, y):
-        """Compat wrapper — đảm bảo cursor tồn tại rồi move."""
+        """Compat wrapper â€” Ä‘áº£m báº£o cursor tá»“n táº¡i rá»“i move."""
         await self._ensure_cursor_dot(cdp)
         await self._move_cursor_dot(cdp, x, y)
 
     async def _smooth_mouse_drift(self, cdp, tx, ty, steps=None):
-        """Di chuyển chuột mượt từ vị trí hiện tại → (tx, ty) bằng micro-bezier."""
+        """Di chuyá»ƒn chuá»™t mÆ°á»£t tá»« vá»‹ trÃ­ hiá»‡n táº¡i â†’ (tx, ty) báº±ng micro-bezier."""
         await self._ensure_cursor_dot(cdp)
         cx = getattr(self, '_mouse_x', self.container_width // 2)
         cy = getattr(self, '_mouse_y', self.container_height // 2)
@@ -3102,21 +3252,21 @@ class CDPWorker(QThread):
         self._mouse_y = ty
 
     async def _human_move_and_click(self, cdp, x, y, label=""):
-        """Di chuyển chuột theo cubic bezier + smoothstep rồi click — giống người thật."""
+        """Di chuyá»ƒn chuá»™t theo cubic bezier + smoothstep rá»“i click â€” giá»‘ng ngÆ°á»i tháº­t."""
         if label:
-            self.status_update.emit(f"🖱️ {label}", "blue")
+            self.status_update.emit(f"ðŸ–±ï¸ {label}", "blue")
 
         await self._ensure_cursor_dot(cdp)
 
-        # Lấy vị trí chuột hiện tại (gần giữa màn hình nếu chưa có)
+        # Láº¥y vá»‹ trÃ­ chuá»™t hiá»‡n táº¡i (gáº§n giá»¯a mÃ n hÃ¬nh náº¿u chÆ°a cÃ³)
         cur_x = getattr(self, '_mouse_x', self.container_width // 2)
         cur_y = getattr(self, '_mouse_y', self.container_height // 2)
 
-        # Khoảng cách di chuyển → jitter tỷ lệ theo khoảng cách
+        # Khoáº£ng cÃ¡ch di chuyá»ƒn â†’ jitter tá»· lá»‡ theo khoáº£ng cÃ¡ch
         dist = max(1, ((x - cur_x)**2 + (y - cur_y)**2) ** 0.5)
-        jitter_scale = min(1.0, dist / 300)  # Khoảng cách ngắn → jitter ít
+        jitter_scale = min(1.0, dist / 300)  # Khoáº£ng cÃ¡ch ngáº¯n â†’ jitter Ã­t
 
-        # 2 điểm điều khiển cubic bezier (jitter nhỏ hơn, tự nhiên hơn)
+        # 2 Ä‘iá»ƒm Ä‘iá»u khiá»ƒn cubic bezier (jitter nhá» hÆ¡n, tá»± nhiÃªn hÆ¡n)
         jx = int(30 * jitter_scale)
         jy = int(15 * jitter_scale)
         ctrl1_x = cur_x + (x - cur_x) * random.uniform(0.2, 0.4) + random.randint(-jx, jx)
@@ -3124,14 +3274,14 @@ class CDPWorker(QThread):
         ctrl2_x = cur_x + (x - cur_x) * random.uniform(0.6, 0.8) + random.randint(-jx//2, jx//2)
         ctrl2_y = cur_y + (y - cur_y) * random.uniform(0.6, 0.8) + random.randint(-jy//2, jy//2)
 
-        # Nhiều bước hơn → mượt hơn
+        # Nhiá»u bÆ°á»›c hÆ¡n â†’ mÆ°á»£t hÆ¡n
         steps = random.randint(18, 30)
         for i in range(steps + 1):
             t = i / steps
-            # ★ Smoothstep easing: chậm đầu → nhanh giữa → chậm cuối
+            # â˜… Smoothstep easing: cháº­m Ä‘áº§u â†’ nhanh giá»¯a â†’ cháº­m cuá»‘i
             t_ease = t * t * (3.0 - 2.0 * t)
 
-            # Cubic bezier (4 điểm)
+            # Cubic bezier (4 Ä‘iá»ƒm)
             bx = int((1-t_ease)**3 * cur_x + 3*(1-t_ease)**2*t_ease * ctrl1_x +
                      3*(1-t_ease)*t_ease**2 * ctrl2_x + t_ease**3 * x)
             by = int((1-t_ease)**3 * cur_y + 3*(1-t_ease)**2*t_ease * ctrl1_y +
@@ -3141,20 +3291,20 @@ class CDPWorker(QThread):
             })
             await self._move_cursor_dot(cdp, bx, by)
 
-            # ★ Delay phi tuyến: chậm ở đầu/cuối, nhanh ở giữa
+            # â˜… Delay phi tuyáº¿n: cháº­m á»Ÿ Ä‘áº§u/cuá»‘i, nhanh á»Ÿ giá»¯a
             if t < 0.15 or t > 0.85:
                 await asyncio.sleep(random.uniform(0.018, 0.035))
             else:
                 await asyncio.sleep(random.uniform(0.006, 0.015))
 
-        # Lưu vị trí cuối — dùng tọa độ gốc (không jitter)
+        # LÆ°u vá»‹ trÃ­ cuá»‘i â€” dÃ¹ng tá»a Ä‘á»™ gá»‘c (khÃ´ng jitter)
         self._mouse_x = x
         self._mouse_y = y
 
-        # Dừng nhỏ trước khi click (giống người suy nghĩ)
+        # Dá»«ng nhá» trÆ°á»›c khi click (giá»‘ng ngÆ°á»i suy nghÄ©)
         await asyncio.sleep(random.uniform(0.08, 0.18))
 
-        # Click — chính xác vào tâm element
+        # Click â€” chÃ­nh xÃ¡c vÃ o tÃ¢m element
         for event_type in ["mousePressed", "mouseReleased"]:
             await cdp.send("Input.dispatchMouseEvent", {
                 "type": event_type, "x": x, "y": y,
@@ -3327,15 +3477,46 @@ class CDPWorker(QThread):
         return default
 
     async def _get_center(self, cdp, selector):
-        """Lấy tọa độ center của element theo selector. Trả về (x, y) hoặc None."""
+        """Láº¥y 1 Ä‘iá»ƒm click an toÃ n bÃªn trong element theo selector."""
+        selector_js = _json.dumps(selector or "")
         pos = await cdp.evaluate(f"""
         (() => {{
-            const el = document.querySelector('{selector}');
+            const selector = {selector_js};
+            const el = document.querySelector(selector);
             if (!el) return null;
-            el.scrollIntoView({{block: 'center', inline: 'center'}});
+            try {{ el.scrollIntoView({{block: 'center', inline: 'center'}}); }} catch (e) {{}}
             const r = el.getBoundingClientRect();
-            if (r.width === 0) return null;
-            return {{x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)}};
+            const left = Math.max(0, r.left);
+            const top = Math.max(0, r.top);
+            const right = Math.min(window.innerWidth, r.right);
+            const bottom = Math.min(window.innerHeight, r.bottom);
+            const width = Math.max(0, right - left);
+            const height = Math.max(0, bottom - top);
+            if (width < 2 || height < 2) return null;
+
+            const padX = Math.max(2, Math.min(Math.round(width * 0.18), Math.floor(width / 3)));
+            const padY = Math.max(2, Math.min(Math.round(height * 0.18), Math.floor(height / 3)));
+            const safeLeft = left + padX < right - padX ? left + padX : left;
+            const safeRight = left + padX < right - padX ? right - padX : right;
+            const safeTop = top + padY < bottom - padY ? top + padY : top;
+            const safeBottom = top + padY < bottom - padY ? bottom - padY : bottom;
+            const xs = [0.5, 0.42, 0.58, 0.35, 0.65];
+            const ys = [0.5, 0.42, 0.58, 0.32, 0.68];
+            const matchesTarget = (node) => !!node && (node === el || el.contains(node) || node.contains(el));
+
+            for (const py of ys) {{
+                for (const px of xs) {{
+                    const x = Math.round(safeLeft + (safeRight - safeLeft) * px);
+                    const y = Math.round(safeTop + (safeBottom - safeTop) * py);
+                    const topEl = document.elementFromPoint(x, y);
+                    if (matchesTarget(topEl)) return {{x, y}};
+                }}
+            }}
+
+            return {{
+                x: Math.round(left + width / 2),
+                y: Math.round(top + height / 2)
+            }};
         }})()
         """)
         if pos:
@@ -3343,32 +3524,54 @@ class CDPWorker(QThread):
         return None
 
     async def _get_center_by_text(self, cdp, text):
-        """Tìm element chứa text cụ thể → trả về center (x, y)."""
+        """TÃ¬m element chá»©a text cá»¥ thá»ƒ â†’ tráº£ vá» Ä‘iá»ƒm click an toÃ n."""
+        text_js = _json.dumps(text or "")
         pos = await cdp.evaluate(f"""
         (() => {{
+            const wanted = {text_js};
             const all = Array.from(document.querySelectorAll('*'));
+            const pickPoint = (el) => {{
+                const r = el.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0 || r.width >= 500 || r.height >= 150) return null;
+                const left = Math.max(0, r.left);
+                const top = Math.max(0, r.top);
+                const right = Math.min(window.innerWidth, r.right);
+                const bottom = Math.min(window.innerHeight, r.bottom);
+                const width = Math.max(0, right - left);
+                const height = Math.max(0, bottom - top);
+                if (width < 2 || height < 2) return null;
+                const xs = [0.5, 0.42, 0.58];
+                const ys = [0.5, 0.35, 0.65];
+                for (const py of ys) {{
+                    for (const px of xs) {{
+                        const x = Math.round(left + width * px);
+                        const y = Math.round(top + height * py);
+                        const topEl = document.elementFromPoint(x, y);
+                        if (topEl && (topEl === el || el.contains(topEl) || topEl.contains(el))) {{
+                            return {{x, y}};
+                        }}
+                    }}
+                }}
+                return {{x: Math.round(left + width / 2), y: Math.round(top + height / 2)}};
+            }};
+
             for (const el of all) {{
                 const tag = el.tagName.toLowerCase();
-                // Bỏ qua các thẻ container lớn có nhiều con
                 if ((tag === 'div' || tag === 'main' || tag === 'body') && el.childElementCount > 2) continue;
-
-                if (el.innerText && el.innerText.trim() === '{text}') {{
-                    const r = el.getBoundingClientRect();
-                    // Đảm bảo không phải là khung nền to (width < 500, height < 150)
-                    if (r.width > 0 && r.height > 0 && r.width < 500 && r.height < 150)
-                        return {{x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)}};
+                const txt = (el.innerText || '').trim();
+                if (txt && txt === wanted) {{
+                    const point = pickPoint(el);
+                    if (point) return point;
                 }}
             }}
-            
-            // Thử chứa text (fallback)
+
             for (const el of all) {{
                 const tag = el.tagName.toLowerCase();
                 if ((tag === 'div' || tag === 'main' || tag === 'body') && el.childElementCount > 2) continue;
-
-                if (el.innerText && el.innerText.includes('{text}')) {{
-                    const r = el.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0 && r.width < 500 && r.height < 150)
-                        return {{x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)}};
+                const txt = el.innerText || '';
+                if (txt && txt.includes(wanted)) {{
+                    const point = pickPoint(el);
+                    if (point) return point;
                 }}
             }}
             return null;
@@ -3379,7 +3582,7 @@ class CDPWorker(QThread):
         return None
 
     async def _get_center_by_texts(self, cdp, texts):
-        """Tìm theo nhiều text (ưu tiên theo thứ tự)."""
+        """TÃ¬m theo nhiá»u text (Æ°u tiÃªn theo thá»© tá»±)."""
         for text in texts:
             pos = await self._get_center_by_text(cdp, text)
             if pos:
@@ -3387,7 +3590,7 @@ class CDPWorker(QThread):
         return None
 
     async def _get_login_method_option_center(self, cdp):
-        """Tìm ô 'Use phone/email/username' theo cả EN/VI, chịu được xuống dòng."""
+        """TÃ¬m Ã´ 'Use phone/email/username' theo cáº£ EN/VI, chá»‹u Ä‘Æ°á»£c xuá»‘ng dÃ²ng."""
         pos = await cdp.evaluate(r"""
         (() => {
             const norm = (s) => (s || '')
@@ -3506,7 +3709,7 @@ class CDPWorker(QThread):
         return None
 
     async def _click_login_method_option_js(self, cdp):
-        """Click trực tiếp đúng ô phone/email/username, tránh bắt nhầm QR option."""
+        """Click trá»±c tiáº¿p Ä‘Ãºng Ã´ phone/email/username, trÃ¡nh báº¯t nháº§m QR option."""
         try:
             return bool(await cdp.evaluate(r"""
             (() => {
@@ -3727,7 +3930,7 @@ class CDPWorker(QThread):
             return False
 
     async def _click_mail_code_send_button_if_present(self, cdp):
-        """Click nút gửi mã email nếu TikTok yêu cầu bấm trước khi mail OTP được gửi."""
+        """Click nÃºt gá»­i mÃ£ email náº¿u TikTok yÃªu cáº§u báº¥m trÆ°á»›c khi mail OTP Ä‘Æ°á»£c gá»­i."""
         try:
             return bool(await cdp.evaluate(r"""
             (() => {
@@ -3878,7 +4081,7 @@ class CDPWorker(QThread):
             return False
 
     async def _get_login_button_center(self, cdp):
-        """Lấy tâm nút Log in/Đăng nhập (ưu tiên selector ổn định)."""
+        """Láº¥y tÃ¢m nÃºt Log in/ÄÄƒng nháº­p (Æ°u tiÃªn selector á»•n Ä‘á»‹nh)."""
         for sel in ['button[data-e2e="top-login-button"]', 'button#header-login-button']:
             pos = await self._get_center(cdp, sel)
             if pos:
@@ -3886,7 +4089,7 @@ class CDPWorker(QThread):
 
         pos = await cdp.evaluate("""
         (() => {
-            const labels = ['log in', 'đăng nhập'];
+            const labels = ['log in', 'Ä‘Äƒng nháº­p'];
             const all = Array.from(document.querySelectorAll('button, a'));
             for (const el of all) {
                 const text = (el.textContent || '').trim().toLowerCase();
@@ -3904,7 +4107,7 @@ class CDPWorker(QThread):
         return None
 
     async def _get_login_username_input_center(self, cdp):
-        """Lấy ô email/username, tránh bắt nhầm ô số điện thoại hoặc mã OTP."""
+        """Láº¥y Ã´ email/username, trÃ¡nh báº¯t nháº§m Ã´ sá»‘ Ä‘iá»‡n thoáº¡i hoáº·c mÃ£ OTP."""
         pos = await cdp.evaluate(r"""
         (() => {
             const norm = (s) => (s || '')
@@ -4120,7 +4323,7 @@ class CDPWorker(QThread):
         error_msg = str(error_msg or "Dang nhap that bai").strip()
         self._last_login_error = error_msg
         self._last_error = error_msg
-        # Login lỗi không được xóa cookie/tiktok_id cũ; đó có thể là phiên tốt để khôi phục.
+        # Login lá»—i khÃ´ng Ä‘Æ°á»£c xÃ³a cookie/tiktok_id cÅ©; Ä‘Ã³ cÃ³ thá»ƒ lÃ  phiÃªn tá»‘t Ä‘á»ƒ khÃ´i phá»¥c.
         self.profile_update_signal.emit({"login_error": error_msg})
 
     async def _hold_browser_for_login_recovery(self, cdp, reason: str) -> bool:
@@ -4165,7 +4368,7 @@ class CDPWorker(QThread):
 
     async def _hold_browser_for_action_issue(self, cdp, reason: str) -> None:
         """Keep Orbita open when an action stops before its target is completed."""
-        reason = str(reason or "Chức năng chưa hoàn tất").strip()
+        reason = str(reason or "Chá»©c nÄƒng chÆ°a hoÃ n táº¥t").strip()
         self._last_error = reason
         if self._is_batch_run():
             self.status_update.emit(
@@ -4174,14 +4377,14 @@ class CDPWorker(QThread):
             )
             return
         self.status_update.emit(
-            f"⚠️ {reason}. Giữ browser mở để kiểm tra, bấm Dừng khi muốn đóng.",
+            f"âš ï¸ {reason}. Giá»¯ browser má»Ÿ Ä‘á»ƒ kiá»ƒm tra, báº¥m Dá»«ng khi muá»‘n Ä‘Ã³ng.",
             "orange",
         )
 
         while not self._stop_flag:
             try:
                 if not self._browser_alive():
-                    self.status_update.emit("Browser đã đóng trong khi chờ kiểm tra lỗi.", "gray")
+                    self.status_update.emit("Browser Ä‘Ã£ Ä‘Ã³ng trong khi chá» kiá»ƒm tra lá»—i.", "gray")
                     return
             except Exception:
                 pass
@@ -4304,7 +4507,7 @@ class CDPWorker(QThread):
         )
         return False
 
-    # ─── Login Flow ─────────────────────────────────────────────────────────
+    # â”€â”€â”€ Login Flow â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _click_tiktok_button_by_text(self, cdp, labels, timeout: float = 12) -> bool:
         """Click the first visible button/link whose text or aria-label matches one of labels."""
@@ -4381,7 +4584,7 @@ class CDPWorker(QThread):
                 'button[data-e2e="edit-profile-entrance"]',
                 '[data-e2e="edit-profile-entrance"]',
                 'button[aria-label*="Edit" i]',
-                'button[aria-label*="Sửa" i]'
+                'button[aria-label*="Sá»­a" i]'
             ];
             for (const selector of selectors) {
                 const el = document.querySelector(selector);
@@ -4400,7 +4603,7 @@ class CDPWorker(QThread):
         if not opened:
             opened = await self._click_tiktok_button_by_text(
                 cdp,
-                ["Edit profile", "Sửa hồ sơ", "Sua ho so"],
+                ["Edit profile", "Sá»­a há»“ sÆ¡", "Sua ho so"],
                 timeout=10,
             )
         if not opened:
@@ -4420,8 +4623,8 @@ class CDPWorker(QThread):
             cdp,
             [
                 "Change photo", "Edit photo", "Upload photo",
-                "Thay đổi ảnh", "Thay doi anh", "Đổi ảnh", "Doi anh",
-                "Avatar", "Photo", "Ảnh", "Anh",
+                "Thay Ä‘á»•i áº£nh", "Thay doi anh", "Äá»•i áº£nh", "Doi anh",
+                "Avatar", "Photo", "áº¢nh", "Anh",
             ],
             timeout=4,
         )
@@ -4494,13 +4697,13 @@ class CDPWorker(QThread):
 
             await self._click_tiktok_button_by_text(
                 cdp,
-                ["Apply", "Confirm", "Done", "Áp dụng", "Ap dung", "Xong"],
+                ["Apply", "Confirm", "Done", "Ãp dá»¥ng", "Ap dung", "Xong"],
                 timeout=4,
             )
             await asyncio.sleep(1.5)
 
             self.status_update.emit("Dang luu avatar...", "blue")
-            saved = await self._click_tiktok_button_by_text(cdp, ["Save", "Lưu", "Luu"], timeout=12)
+            saved = await self._click_tiktok_button_by_text(cdp, ["Save", "LÆ°u", "Luu"], timeout=12)
             if not saved:
                 msg = "Khong tim thay nut Save/Luu avatar."
                 self.status_update.emit(msg, "red")
@@ -4510,7 +4713,7 @@ class CDPWorker(QThread):
             await asyncio.sleep(5)
             error_text = await cdp.evaluate("""
             (() => {
-                const markers = ['couldn\\'t update', 'failed', 'error', 'không thể', 'loi', 'lỗi'];
+                const markers = ['couldn\\'t update', 'failed', 'error', 'khÃ´ng thá»ƒ', 'loi', 'lá»—i'];
                 const nodes = Array.from(document.querySelectorAll('[role="alert"], [data-e2e*="toast"], [class*="toast"], [class*="error"]'));
                 for (const node of nodes) {
                     const r = node.getBoundingClientRect();
@@ -4547,20 +4750,20 @@ class CDPWorker(QThread):
             return False
 
     async def _do_login(self, cdp):
-        """Đăng nhập TikTok — 3 trường hợp:
-        TH0: Đã login từ phiên trước → bỏ qua
-        TH1: Auto login (có credentials) → bước 1→5 → chỉ check sau submit
-        TH2: Manual login (user tự nhập) → grace period → polling check
+        """ÄÄƒng nháº­p TikTok â€” 3 trÆ°á»ng há»£p:
+        TH0: ÄÃ£ login tá»« phiÃªn trÆ°á»›c â†’ bá» qua
+        TH1: Auto login (cÃ³ credentials) â†’ bÆ°á»›c 1â†’5 â†’ chá»‰ check sau submit
+        TH2: Manual login (user tá»± nháº­p) â†’ grace period â†’ polling check
         """
         cookie_str = self.profile_data.get("cookie", "")
         username   = self.profile_data.get("username", "").strip()
         password   = self.profile_data.get("password", "").strip()
 
-        # ── TH0: Đã đăng nhập từ phiên trước? ──────────────────
-        # Chờ TikTok render đầy đủ (cần 5-7s trên kết nối thường)
+        # â”€â”€ TH0: ÄÃ£ Ä‘Äƒng nháº­p tá»« phiÃªn trÆ°á»›c? â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Chá» TikTok render Ä‘áº§y Ä‘á»§ (cáº§n 5-7s trÃªn káº¿t ná»‘i thÆ°á»ng)
         await asyncio.sleep(6)
 
-        # ★ Retry 3 lần cách nhau 3 giây (tổng ~15s chờ)
+        # â˜… Retry 3 láº§n cÃ¡ch nhau 3 giÃ¢y (tá»•ng ~15s chá»)
         already_logged = False
         for attempt in range(3):
             if await self._check_logged_in(cdp):
@@ -4568,12 +4771,12 @@ class CDPWorker(QThread):
                 break
             if attempt < 2:
                 self.status_update.emit(
-                    f"🔍 Kiểm tra đăng nhập... (lần {attempt+2})", "blue"
+                    f"ðŸ” Kiá»ƒm tra Ä‘Äƒng nháº­p... (láº§n {attempt+2})", "blue"
                 )
                 await asyncio.sleep(3)
 
         if already_logged:
-            # ★ Verify lần cuối: chờ page render xong hẳn rồi check DOM
+            # â˜… Verify láº§n cuá»‘i: chá» page render xong háº³n rá»“i check DOM
             await asyncio.sleep(2)
             final_has_login = await cdp.evaluate("""
             (() => {
@@ -4588,7 +4791,7 @@ class CDPWorker(QThread):
                 for (const btn of all) {
                     const r = btn.getBoundingClientRect();
                     if (r.y < 80 && r.width > 0 &&
-                        (btn.textContent.trim() === 'Log in' || btn.textContent.trim() === 'Đăng nhập'))
+                        (btn.textContent.trim() === 'Log in' || btn.textContent.trim() === 'ÄÄƒng nháº­p'))
                         return true;
                 }
                 return false;
@@ -4596,24 +4799,24 @@ class CDPWorker(QThread):
             """) or False
 
             if final_has_login:
-                # Nút Log in vẫn hiện → session thực sự hết hạn
-                self.status_update.emit("⚠️ Session hết hạn — cần đăng nhập lại...", "orange")
+                # NÃºt Log in váº«n hiá»‡n â†’ session thá»±c sá»± háº¿t háº¡n
+                self.status_update.emit("âš ï¸ Session háº¿t háº¡n â€” cáº§n Ä‘Äƒng nháº­p láº¡i...", "orange")
                 already_logged = False
             else:
-                self.status_update.emit("🔍 Phát hiện phiên trước — lấy thông tin...", "blue")
+                self.status_update.emit("ðŸ” PhÃ¡t hiá»‡n phiÃªn trÆ°á»›c â€” láº¥y thÃ´ng tin...", "blue")
                 verified_id = await self._extract_profile_info(cdp, need_reload=False)
                 if verified_id:
-                    self.status_update.emit(f"✅ Đã đăng nhập từ phiên trước! ({verified_id})", "green")
+                    self.status_update.emit(f"âœ… ÄÃ£ Ä‘Äƒng nháº­p tá»« phiÃªn trÆ°á»›c! ({verified_id})", "green")
                 else:
-                    self.status_update.emit("✅ Đã đăng nhập (đang lấy hồ sơ...)", "green")
-                # ★ FIX 1: Biến session cookies → persistent (30 ngày)
+                    self.status_update.emit("âœ… ÄÃ£ Ä‘Äƒng nháº­p (Ä‘ang láº¥y há»“ sÆ¡...)", "green")
+                # â˜… FIX 1: Biáº¿n session cookies â†’ persistent (30 ngÃ y)
                 await self._persist_tiktok_cookies(cdp)
                 return True
 
-        # ── Chưa login → Chỉ lúc này mới thử cookie dự phòng từ tool ──
+        # â”€â”€ ChÆ°a login â†’ Chá»‰ lÃºc nÃ y má»›i thá»­ cookie dá»± phÃ²ng tá»« tool â”€â”€
         cookie_sources = [
-            ("cookie chính trong tool", cookie_str),
-            ("cookie backup trước đó", self.profile_data.get("cookie_backup", "")),
+            ("cookie chÃ­nh trong tool", cookie_str),
+            ("cookie backup trÆ°á»›c Ä‘Ã³", self.profile_data.get("cookie_backup", "")),
         ]
         tried_cookie_recovery = False
         seen_cookie_sources = set()
@@ -4627,57 +4830,57 @@ class CDPWorker(QThread):
                 return True
 
         if tried_cookie_recovery:
-            self.status_update.emit("⚠️ Cookie đã lưu không dùng được — chuyển sang đăng nhập...", "orange")
+            self.status_update.emit("âš ï¸ Cookie Ä‘Ã£ lÆ°u khÃ´ng dÃ¹ng Ä‘Æ°á»£c â€” chuyá»ƒn sang Ä‘Äƒng nháº­p...", "orange")
 
-        # ── Kiểm tra có credentials để auto login không ─────────
+        # â”€â”€ Kiá»ƒm tra cÃ³ credentials Ä‘á»ƒ auto login khÃ´ng â”€â”€â”€â”€â”€â”€â”€â”€â”€
         has_credentials = bool(username and password)
 
         if not has_credentials:
             if self._is_batch_run():
                 self._emit_login_error("Khong co email/password de dang nhap lai trong batch")
-            # Không có credentials → chuyển thẳng sang chờ thủ công
-            self.status_update.emit("👤 Không có Email/Password — chờ đăng nhập thủ công...", "orange")
+            # KhÃ´ng cÃ³ credentials â†’ chuyá»ƒn tháº³ng sang chá» thá»§ cÃ´ng
+            self.status_update.emit("ðŸ‘¤ KhÃ´ng cÃ³ Email/Password â€” chá» Ä‘Äƒng nháº­p thá»§ cÃ´ng...", "orange")
             return await self._wait_manual_login(cdp)
 
         self.status_update.emit("Mo thang trang TikTok email login...", "blue")
         return await self._do_login_direct(cdp, username, password, force_direct_url=True)
 
 
-        # ── BƯỚC 1: Click nút [Log in] trên trang hiện tại ──────────
-        # Trang đã load sẵn từ _run_cdp_automation → KHÔNG navigate lại
+        # â”€â”€ BÆ¯á»šC 1: Click nÃºt [Log in] trÃªn trang hiá»‡n táº¡i â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Trang Ä‘Ã£ load sáºµn tá»« _run_cdp_automation â†’ KHÃ”NG navigate láº¡i
         await asyncio.sleep(1)
 
-        self.status_update.emit("👆 Bước 1: Click Log in...", "blue")
+        self.status_update.emit("ðŸ‘† BÆ°á»›c 1: Click Log in...", "blue")
         login_btn_pos = await self._get_login_button_center(cdp)
             
         if not login_btn_pos:
-            self.status_update.emit("⚠️ Không tìm thấy nút Log in — thử direct URL", "orange")
+            self.status_update.emit("âš ï¸ KhÃ´ng tÃ¬m tháº¥y nÃºt Log in â€” thá»­ direct URL", "orange")
             return await self._do_login_direct(cdp, username, password)
 
-        await self._human_move_and_click(cdp, *login_btn_pos, "Click nút Log in")
+        await self._human_move_and_click(cdp, *login_btn_pos, "Click nÃºt Log in")
         
-        # Đợi Modal đăng nhập hiện lên
+        # Äá»£i Modal Ä‘Äƒng nháº­p hiá»‡n lÃªn
         modal_opened = False
         for _ in range(5):
             await asyncio.sleep(1)
-            # Check xem modal đã hiện chưa
+            # Check xem modal Ä‘Ã£ hiá»‡n chÆ°a
             modal = await self._get_login_method_option_center(cdp)
             if not modal:
                 modal = await self._get_center_by_texts(cdp, [
                     "Use phone / email / username",
                     "Use phone or email",
                     "Use phone/email",
-                    "Sử dụng số điện thoại hoặc email",
-                    "Sử dụng số điện thoại / email / tên người dùng",
-                    "Sử dụng điện thoại / email / tên người dùng",
-                    "Tiếp tục bằng điện thoại hoặc email",
+                    "Sá»­ dá»¥ng sá»‘ Ä‘iá»‡n thoáº¡i hoáº·c email",
+                    "Sá»­ dá»¥ng sá»‘ Ä‘iá»‡n thoáº¡i / email / tÃªn ngÆ°á»i dÃ¹ng",
+                    "Sá»­ dá»¥ng Ä‘iá»‡n thoáº¡i / email / tÃªn ngÆ°á»i dÃ¹ng",
+                    "Tiáº¿p tá»¥c báº±ng Ä‘iá»‡n thoáº¡i hoáº·c email",
                 ])
             if modal:
                 modal_opened = True
                 break
 
         if not modal_opened:
-            self.status_update.emit("⚠️ JS Click dự phòng (Log in)...", "orange")
+            self.status_update.emit("âš ï¸ JS Click dá»± phÃ²ng (Log in)...", "orange")
             await cdp.evaluate("""
             (() => {
                 const btn = document.querySelector('button[data-e2e="top-login-button"], #header-login-button');
@@ -4691,61 +4894,61 @@ class CDPWorker(QThread):
                     "Use phone / email / username",
                     "Use phone or email",
                     "Use phone/email",
-                    "Sử dụng số điện thoại hoặc email",
-                    "Sử dụng số điện thoại / email / tên người dùng",
-                    "Sử dụng điện thoại / email / tên người dùng",
-                    "Tiếp tục bằng điện thoại hoặc email",
+                    "Sá»­ dá»¥ng sá»‘ Ä‘iá»‡n thoáº¡i hoáº·c email",
+                    "Sá»­ dá»¥ng sá»‘ Ä‘iá»‡n thoáº¡i / email / tÃªn ngÆ°á»i dÃ¹ng",
+                    "Sá»­ dá»¥ng Ä‘iá»‡n thoáº¡i / email / tÃªn ngÆ°á»i dÃ¹ng",
+                    "Tiáº¿p tá»¥c báº±ng Ä‘iá»‡n thoáº¡i hoáº·c email",
                 ])
             if modal: modal_opened = True
 
         if not modal_opened:
-            self.status_update.emit("⚠️ Modal không mở — thử direct URL", "orange")
+            self.status_update.emit("âš ï¸ Modal khÃ´ng má»Ÿ â€” thá»­ direct URL", "orange")
             return await self._do_login_direct(cdp, username, password)
 
-        # ── BƯỚC 2: Click [Use phone / email / username] ────────
-        self.status_update.emit("👆 Bước 2: Click Use phone/email...", "blue")
+        # â”€â”€ BÆ¯á»šC 2: Click [Use phone / email / username] â”€â”€â”€â”€â”€â”€â”€â”€
+        self.status_update.emit("ðŸ‘† BÆ°á»›c 2: Click Use phone/email...", "blue")
         phone_pos = await self._get_login_method_option_center(cdp)
         if not phone_pos:
             phone_pos = await self._get_center_by_texts(cdp, [
                 "Use phone / email / username",
                 "Use phone or email",
                 "Use phone/email",
-                "Sử dụng số điện thoại hoặc email",
-                "Sử dụng số điện thoại / email / tên người dùng",
-                "Sử dụng điện thoại / email / tên người dùng",
-                "Tiếp tục bằng điện thoại hoặc email",
+                "Sá»­ dá»¥ng sá»‘ Ä‘iá»‡n thoáº¡i hoáº·c email",
+                "Sá»­ dá»¥ng sá»‘ Ä‘iá»‡n thoáº¡i / email / tÃªn ngÆ°á»i dÃ¹ng",
+                "Sá»­ dá»¥ng Ä‘iá»‡n thoáº¡i / email / tÃªn ngÆ°á»i dÃ¹ng",
+                "Tiáº¿p tá»¥c báº±ng Ä‘iá»‡n thoáº¡i hoáº·c email",
             ])
         if not phone_pos:
             phone_pos = await self._get_center_by_texts(cdp, [
                 "Continue with phone",
                 "Use phone or email",
-                "Tiếp tục bằng điện thoại",
-                "Sử dụng số điện thoại hoặc email",
+                "Tiáº¿p tá»¥c báº±ng Ä‘iá»‡n thoáº¡i",
+                "Sá»­ dá»¥ng sá»‘ Ä‘iá»‡n thoáº¡i hoáº·c email",
             ])
 
         if not phone_pos:
-            self.status_update.emit("⚠️ Không tìm thấy Use phone/email — thử direct URL", "orange")
+            self.status_update.emit("âš ï¸ KhÃ´ng tÃ¬m tháº¥y Use phone/email â€” thá»­ direct URL", "orange")
             return await self._do_login_direct(cdp, username, password)
 
         await self._human_move_and_click(cdp, *phone_pos, "Click Use phone/email")
         await asyncio.sleep(1)
 
-        # Nếu click tọa độ không ăn, dùng JS click đúng item đã match text.
+        # Náº¿u click tá»a Ä‘á»™ khÃ´ng Äƒn, dÃ¹ng JS click Ä‘Ãºng item Ä‘Ã£ match text.
         tab_probe = await self._get_center_by_texts(cdp, [
             "Log in with email or username",
             "Use email or username",
             "Use email",
-            "Sử dụng email hoặc tên người dùng",
-            "Đăng nhập bằng email hoặc tên người dùng",
+            "Sá»­ dá»¥ng email hoáº·c tÃªn ngÆ°á»i dÃ¹ng",
+            "ÄÄƒng nháº­p báº±ng email hoáº·c tÃªn ngÆ°á»i dÃ¹ng",
             "Log in with email",
-            "Đăng nhập bằng email",
+            "ÄÄƒng nháº­p báº±ng email",
         ])
         if not tab_probe:
             if await self._click_login_method_option_js(cdp):
-                self.status_update.emit("👆 JS Click Use phone/email...", "blue")
+                self.status_update.emit("ðŸ‘† JS Click Use phone/email...", "blue")
                 await asyncio.sleep(1.5)
         
-        # Đợi tab email hiện lên
+        # Äá»£i tab email hiá»‡n lÃªn
         email_ready = False
         for _ in range(4):
             await asyncio.sleep(1)
@@ -4753,17 +4956,17 @@ class CDPWorker(QThread):
                 "Log in with email or username",
                 "Use email or username",
                 "Use email",
-                "Sử dụng email hoặc tên người dùng",
-                "Đăng nhập bằng email hoặc tên người dùng",
+                "Sá»­ dá»¥ng email hoáº·c tÃªn ngÆ°á»i dÃ¹ng",
+                "ÄÄƒng nháº­p báº±ng email hoáº·c tÃªn ngÆ°á»i dÃ¹ng",
                 "Log in with email",
-                "Đăng nhập bằng email",
+                "ÄÄƒng nháº­p báº±ng email",
             ])
             if tab:
                 email_ready = True
                 break
                 
         if not email_ready:
-            self.status_update.emit("⚠️ JS Click dự phòng (Use phone)...", "orange")
+            self.status_update.emit("âš ï¸ JS Click dá»± phÃ²ng (Use phone)...", "orange")
             await cdp.evaluate("""
             (() => {
                 const all = document.querySelectorAll('div, button, a, p, span, label');
@@ -4772,10 +4975,10 @@ class CDPWorker(QThread):
                         el.innerText.includes('Use phone / email') ||
                         el.innerText.includes('Use phone or email') ||
                         el.innerText.includes('Use phone/email') ||
-                        el.innerText.includes('Sử dụng số điện thoại hoặc email') ||
-                        el.innerText.includes('Sử dụng số điện thoại / email / tên người dùng') ||
-                        el.innerText.includes('Sử dụng điện thoại / email / tên người dùng') ||
-                        el.innerText.includes('Tiếp tục bằng điện thoại hoặc email')
+                        el.innerText.includes('Sá»­ dá»¥ng sá»‘ Ä‘iá»‡n thoáº¡i hoáº·c email') ||
+                        el.innerText.includes('Sá»­ dá»¥ng sá»‘ Ä‘iá»‡n thoáº¡i / email / tÃªn ngÆ°á»i dÃ¹ng') ||
+                        el.innerText.includes('Sá»­ dá»¥ng Ä‘iá»‡n thoáº¡i / email / tÃªn ngÆ°á»i dÃ¹ng') ||
+                        el.innerText.includes('Tiáº¿p tá»¥c báº±ng Ä‘iá»‡n thoáº¡i hoáº·c email')
                     )) {
                         el.click(); break;
                     }
@@ -4787,39 +4990,39 @@ class CDPWorker(QThread):
                 "Log in with email or username",
                 "Use email or username",
                 "Use email",
-                "Sử dụng email hoặc tên người dùng",
-                "Đăng nhập bằng email hoặc tên người dùng",
+                "Sá»­ dá»¥ng email hoáº·c tÃªn ngÆ°á»i dÃ¹ng",
+                "ÄÄƒng nháº­p báº±ng email hoáº·c tÃªn ngÆ°á»i dÃ¹ng",
                 "Log in with email",
-                "Đăng nhập bằng email",
+                "ÄÄƒng nháº­p báº±ng email",
             ])
             if tab: email_ready = True
 
-        # ── BƯỚC 3: Click [Log in with email or username] ───────
+        # â”€â”€ BÆ¯á»šC 3: Click [Log in with email or username] â”€â”€â”€â”€â”€â”€â”€
         if email_ready:
-            self.status_update.emit("👆 Bước 3: Click tab email/username...", "blue")
+            self.status_update.emit("ðŸ‘† BÆ°á»›c 3: Click tab email/username...", "blue")
             email_tab_pos = await self._get_center_by_texts(cdp, [
                 "Log in with email or username",
                 "Use email or username",
                 "Use email",
-                "Sử dụng email hoặc tên người dùng",
-                "Đăng nhập bằng email hoặc tên người dùng",
+                "Sá»­ dá»¥ng email hoáº·c tÃªn ngÆ°á»i dÃ¹ng",
+                "ÄÄƒng nháº­p báº±ng email hoáº·c tÃªn ngÆ°á»i dÃ¹ng",
                 "Log in with email",
-                "Đăng nhập bằng email",
+                "ÄÄƒng nháº­p báº±ng email",
             ])
             
             if email_tab_pos:
                 await self._human_move_and_click(cdp, *email_tab_pos, "Click tab email/username")
             await asyncio.sleep(random.uniform(1.0, 1.5))
         else:
-            self.status_update.emit("⚠️ Không thấy tab email — thử direct URL", "orange")
+            self.status_update.emit("âš ï¸ KhÃ´ng tháº¥y tab email â€” thá»­ direct URL", "orange")
             return await self._do_login_direct(cdp, username, password)
 
-        # ── BƯỚC 4: Nhập Email + Password ──────────────────────
+        # â”€â”€ BÆ¯á»šC 4: Nháº­p Email + Password â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         return await self._do_login_direct(cdp, username, password)
 
     async def _do_login_direct(self, cdp, username, password, force_direct_url=False):
-        """Bước cuối: nhập email/pass và submit (dùng được độc lập nếu đã ở form)."""
-        # Chờ ô email/username. Nếu modal không mở đúng cách, rẽ sang URL login email thật sự.
+        """BÆ°á»›c cuá»‘i: nháº­p email/pass vÃ  submit (dÃ¹ng Ä‘Æ°á»£c Ä‘á»™c láº­p náº¿u Ä‘Ã£ á»Ÿ form)."""
+        # Chá» Ã´ email/username. Náº¿u modal khÃ´ng má»Ÿ Ä‘Ãºng cÃ¡ch, ráº½ sang URL login email tháº­t sá»±.
         if force_direct_url:
             try:
                 await self._navigate_like_human(
@@ -4836,7 +5039,7 @@ class CDPWorker(QThread):
 
         email_pos = await self._wait_login_username_input(cdp, timeout=12)
         if not email_pos:
-            self.status_update.emit("⚠️ Chưa thấy form login — mở URL đăng nhập email trực tiếp...", "orange")
+            self.status_update.emit("âš ï¸ ChÆ°a tháº¥y form login â€” má»Ÿ URL Ä‘Äƒng nháº­p email trá»±c tiáº¿p...", "orange")
             try:
                 await self._navigate_like_human(
                     cdp,
@@ -4853,35 +5056,35 @@ class CDPWorker(QThread):
             email_pos = await self._wait_login_username_input(cdp, timeout=15)
             if not email_pos:
                 self._emit_login_error("Timeout cho form dang nhap TikTok")
-                self.status_update.emit("❌ Timeout chờ form đăng nhập", "red")
+                self.status_update.emit("âŒ Timeout chá» form Ä‘Äƒng nháº­p", "red")
                 return False
 
         await asyncio.sleep(random.uniform(0.5, 1.0))
 
-        # Gõ email
-        self.status_update.emit("⌨️ Bước 4a: Nhập Email...", "blue")
+        # GÃµ email
+        self.status_update.emit("âŒ¨ï¸ BÆ°á»›c 4a: Nháº­p Email...", "blue")
         pos = email_pos or await self._get_center(cdp, 'input[name="username"]')
         if pos:
-            await self._human_move_and_click(cdp, *pos, "Click ô Email")
+            await self._human_move_and_click(cdp, *pos, "Click Ã´ Email")
         await asyncio.sleep(random.uniform(0.3, 0.6))
         if not await self._type_active_input_exact(cdp, username, "Email"):
             self._emit_login_error("Tool khong nhap dung Email - da dung de tranh mat luot thu")
             return False
         await asyncio.sleep(random.uniform(0.4, 0.8))
 
-        # Gõ password
-        self.status_update.emit("⌨️ Bước 4b: Nhập Password...", "blue")
+        # GÃµ password
+        self.status_update.emit("âŒ¨ï¸ BÆ°á»›c 4b: Nháº­p Password...", "blue")
         pos = await self._get_center(cdp, 'input[type="password"]')
         if pos:
-            await self._human_move_and_click(cdp, *pos, "Click ô Password")
+            await self._human_move_and_click(cdp, *pos, "Click Ã´ Password")
         await asyncio.sleep(random.uniform(0.3, 0.6))
         if not await self._type_active_input_exact(cdp, password, "Password", secret=True):
             self._emit_login_error("Tool khong nhap dung Password - da dung de tranh mat luot thu")
             return False
         await asyncio.sleep(random.uniform(0.5, 1.0))
 
-        # Click nút Login
-        self.status_update.emit("👆 Bước 5: Click nút Log in...", "blue")
+        # Click nÃºt Login
+        self.status_update.emit("ðŸ‘† BÆ°á»›c 5: Click nÃºt Log in...", "blue")
         form_state = await self._verify_login_form_values(cdp, username, password)
         if not form_state.get("username_ok") or not form_state.get("password_ok"):
             self.status_update.emit(
@@ -4894,16 +5097,16 @@ class CDPWorker(QThread):
 
         pos = await self._get_center(cdp, 'button[data-e2e="login-button"]')
         if not pos:
-            pos = await self._get_center_by_texts(cdp, ["Log in", "Đăng nhập"])
+            pos = await self._get_center_by_texts(cdp, ["Log in", "ÄÄƒng nháº­p"])
         if pos:
             await self._human_move_and_click(cdp, *pos, "Click Login")
         else:
             self._emit_login_error("Khong tim thay nut Log in")
-            self.status_update.emit("❌ Không tìm thấy nút Log in", "red")
+            self.status_update.emit("âŒ KhÃ´ng tÃ¬m tháº¥y nÃºt Log in", "red")
             return False
 
-        # ── BƯỚC 5: Chờ kết quả ────────────────────────────────
-        TOTAL_WAIT = 120   # giây (sẽ tăng thêm khi có CAPTCHA)
+        # â”€â”€ BÆ¯á»šC 5: Chá» káº¿t quáº£ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        TOTAL_WAIT = 120   # giÃ¢y (sáº½ tÄƒng thÃªm khi cÃ³ CAPTCHA)
         POLL = 2
         otp_handled = False
         verify_clicked = False
@@ -4919,7 +5122,7 @@ class CDPWorker(QThread):
             "timeout": 300,
         }
 
-        for step in range(999):  # Vòng lặp mở, thoát bằng điều kiện
+        for step in range(999):  # VÃ²ng láº·p má»Ÿ, thoÃ¡t báº±ng Ä‘iá»u kiá»‡n
             elapsed = (step + 1) * POLL
             if elapsed > TOTAL_WAIT + captcha_state.get("extra_time", 0):
                 if captcha_state.get("active"):
@@ -4927,7 +5130,7 @@ class CDPWorker(QThread):
                     self.status_update.emit(error_msg, "red")
                     self._emit_login_error(error_msg)
                     return False
-                break  # Hết thời gian
+                break  # Háº¿t thá»i gian
 
             await asyncio.sleep(POLL)
             if self._stop_flag:
@@ -4935,16 +5138,16 @@ class CDPWorker(QThread):
 
             remaining = TOTAL_WAIT + captcha_state.get("extra_time", 0) - elapsed
 
-            # CAPTCHA gate: khi CAPTCHA còn hiện thì không check lỗi/OTP/success.
+            # CAPTCHA gate: khi CAPTCHA cÃ²n hiá»‡n thÃ¬ khÃ´ng check lá»—i/OTP/success.
             captcha_gate = await self._handle_captcha_gate(cdp, captcha_state, remaining, poll=POLL)
             if captcha_gate.get("failed"):
                 return False
             if captcha_gate.get("blocked"):
                 continue
 
-            self.status_update.emit(f"⏳ Chờ đăng nhập... ({remaining}s)", "blue")
+            self.status_update.emit(f"â³ Chá» Ä‘Äƒng nháº­p... ({remaining}s)", "blue")
 
-            # ─ KIỂM TRA LỖI TRƯỚC — dòng chữ đỏ trên form login ─
+            # â”€ KIá»‚M TRA Lá»–I TRÆ¯á»šC â€” dÃ²ng chá»¯ Ä‘á» trÃªn form login â”€
             if not verify_clicked:
                 needs_verify = await cdp.evaluate(r"""
                 (() => {
@@ -4960,10 +5163,10 @@ class CDPWorker(QThread):
                            clean.includes("xac minh do la ban") ||
                            clean.includes("xac minh do thuc su la ban") ||
                            clean.includes("xac minh danh tinh") ||
-                           body.includes("Xác minh đó là bạn") ||
-                           body.includes("Xác minh danh tính") ||
-                           body.includes("Xác minh đó thực sự là bạn") ||
-                           body.includes("Xác minh danh tính");
+                           body.includes("XÃ¡c minh Ä‘Ã³ lÃ  báº¡n") ||
+                           body.includes("XÃ¡c minh danh tÃ­nh") ||
+                           body.includes("XÃ¡c minh Ä‘Ã³ thá»±c sá»± lÃ  báº¡n") ||
+                           body.includes("XÃ¡c minh danh tÃ­nh");
                 })()
                 """)
                 if needs_verify:
@@ -4974,7 +5177,7 @@ class CDPWorker(QThread):
                         email_btn = await self._get_center_by_texts(cdp, [
                             "Email",
                             "Gui ma qua email",
-                            "Gửi mã qua email",
+                            "Gá»­i mÃ£ qua email",
                         ])
                     if email_btn:
                         await self._human_move_and_click(cdp, *email_btn, "Chon xac minh Email")
@@ -4998,7 +5201,7 @@ class CDPWorker(QThread):
 
             error_msg = await cdp.evaluate("""
             (() => {
-                // === Cách 1: Tìm element có text màu đỏ trên form login ===
+                // === CÃ¡ch 1: TÃ¬m element cÃ³ text mÃ u Ä‘á» trÃªn form login ===
                 const redEls = document.querySelectorAll(
                     'span[style*="color: rgb(255"], span[style*="color: red"],' +
                     ' p[style*="color: rgb(255"], p[style*="color: red"],' +
@@ -5012,62 +5215,62 @@ class CDPWorker(QThread):
                         return t;
                 }
 
-                // === Cách 2: Text-based detection ===
+                // === CÃ¡ch 2: Text-based detection ===
                 const body = document.body.innerText || '';
 
-                // Sai mật khẩu / sai tài khoản (CHÍNH XÁC như screenshot TikTok)
+                // Sai máº­t kháº©u / sai tÃ i khoáº£n (CHÃNH XÃC nhÆ° screenshot TikTok)
                 if(body.includes("Incorrect account or password") || body.includes("Incorrect password")
-                   || body.includes("doesn't match our records") || body.includes("Sai mật khẩu")
-                   || body.includes("password is incorrect") || body.includes("Sai tài khoản"))
-                    return "Sai tài khoản hoặc mật khẩu";
+                   || body.includes("doesn't match our records") || body.includes("Sai máº­t kháº©u")
+                   || body.includes("password is incorrect") || body.includes("Sai tÃ i khoáº£n"))
+                    return "Sai tÃ i khoáº£n hoáº·c máº­t kháº©u";
 
-                // Còn bao nhiêu lần thử
+                // CÃ²n bao nhiÃªu láº§n thá»­
                 const attemptsMatch = body.match(/(\\d+)\\s*attempts?\\s*remaining/i);
                 if (attemptsMatch)
-                    return "Sai tài khoản/mật khẩu. Còn " + attemptsMatch[1] + " lần thử";
+                    return "Sai tÃ i khoáº£n/máº­t kháº©u. CÃ²n " + attemptsMatch[1] + " láº§n thá»­";
 
-                // Email/Username không tồn tại
+                // Email/Username khÃ´ng tá»“n táº¡i
                 if(body.includes("Couldn't find your account") || body.includes("account not found")
-                   || body.includes("user does not exist") || body.includes("không tìm thấy tài khoản")
+                   || body.includes("user does not exist") || body.includes("khÃ´ng tÃ¬m tháº¥y tÃ i khoáº£n")
                    || body.includes("This username isn't registered")
-                   || body.includes("Tên người dùng này chưa được đăng ký"))
-                    return "Email/Username không tồn tại";
+                   || body.includes("TÃªn ngÆ°á»i dÃ¹ng nÃ y chÆ°a Ä‘Æ°á»£c Ä‘Äƒng kÃ½"))
+                    return "Email/Username khÃ´ng tá»“n táº¡i";
 
-                // Vượt quá số lần thử
-                if(body.includes("Maximum number of attempts") || body.includes("vượt quá số lần")
+                // VÆ°á»£t quÃ¡ sá»‘ láº§n thá»­
+                if(body.includes("Maximum number of attempts") || body.includes("vÆ°á»£t quÃ¡ sá»‘ láº§n")
                    || body.includes("Too many attempts") || body.includes("too many failed attempts")
                    || body.includes("0 attempts remaining"))
-                    return "Vượt quá số lần thử";
+                    return "VÆ°á»£t quÃ¡ sá»‘ láº§n thá»­";
 
-                // Tài khoản bị khóa/đình chỉ
-                if(body.includes("Account currently locked") || body.includes("tạm thời bị khóa")
-                   || body.includes("account has been suspended") || body.includes("tài khoản đã bị đình chỉ")
+                // TÃ i khoáº£n bá»‹ khÃ³a/Ä‘Ã¬nh chá»‰
+                if(body.includes("Account currently locked") || body.includes("táº¡m thá»i bá»‹ khÃ³a")
+                   || body.includes("account has been suspended") || body.includes("tÃ i khoáº£n Ä‘Ã£ bá»‹ Ä‘Ã¬nh chá»‰")
                    || body.includes("account has been banned") || body.includes("permanently banned"))
-                    return "Tài khoản bị khóa/đình chỉ";
+                    return "TÃ i khoáº£n bá»‹ khÃ³a/Ä‘Ã¬nh chá»‰";
 
-                // Lỗi mạng / hệ thống
-                if(body.includes("Something went wrong") || body.includes("Đã xảy ra lỗi")
+                // Lá»—i máº¡ng / há»‡ thá»‘ng
+                if(body.includes("Something went wrong") || body.includes("ÄÃ£ xáº£y ra lá»—i")
                    || body.includes("network error") || body.includes("try again later"))
-                    return "Lỗi hệ thống TikTok";
+                    return "Lá»—i há»‡ thá»‘ng TikTok";
 
                 return '';
             })()
             """)
             if error_msg:
-                self.status_update.emit(f"❌ {error_msg}", "red")
-                # Emit lỗi về Dashboard để cập nhật cột Logged
+                self.status_update.emit(f"âŒ {error_msg}", "red")
+                # Emit lá»—i vá» Dashboard Ä‘á»ƒ cáº­p nháº­t cá»™t Logged
                 self._emit_login_error(error_msg)
                 return False
 
-            # ─ Kiểm tra đăng nhập thành công (CHỈ sau khi xác nhận KHÔNG có lỗi) ─
+            # â”€ Kiá»ƒm tra Ä‘Äƒng nháº­p thÃ nh cÃ´ng (CHá»ˆ sau khi xÃ¡c nháº­n KHÃ”NG cÃ³ lá»—i) â”€
             if await self._check_logged_in(cdp):
-                self.status_update.emit("✅ Đăng nhập thành công!", "green")
+                self.status_update.emit("âœ… ÄÄƒng nháº­p thÃ nh cÃ´ng!", "green")
                 await self._extract_profile_info(cdp)
-                # ★ FIX 1: Biến session cookies → persistent (30 ngày)
+                # â˜… FIX 1: Biáº¿n session cookies â†’ persistent (30 ngÃ y)
                 await self._persist_tiktok_cookies(cdp)
                 return True
 
-            # ─ Xử lý popup "Verify it's really you" (chọn Email) ─
+            # â”€ Xá»­ lÃ½ popup "Verify it's really you" (chá»n Email) â”€
             if not verify_clicked:
                 needs_verify = await cdp.evaluate(r"""
                 (() => {
@@ -5083,21 +5286,21 @@ class CDPWorker(QThread):
                            clean.includes("xac minh do la ban") ||
                            clean.includes("xac minh do thuc su la ban") ||
                            clean.includes("xac minh danh tinh") ||
-                           body.includes("Xác minh đó thực sự là bạn") ||
-                           body.includes("Xác minh danh tính");
+                           body.includes("XÃ¡c minh Ä‘Ã³ thá»±c sá»± lÃ  báº¡n") ||
+                           body.includes("XÃ¡c minh danh tÃ­nh");
                 })()
                 """)
                 if needs_verify:
                     verify_clicked = True
-                    self.status_update.emit("⚠️ TikTok yêu cầu xác minh danh tính...", "orange")
+                    self.status_update.emit("âš ï¸ TikTok yÃªu cáº§u xÃ¡c minh danh tÃ­nh...", "orange")
                     email_btn = await self._get_verify_email_option_center(cdp)
                     if not email_btn:
                         email_btn = await self._get_center_by_texts(cdp, [
                         "Email",
-                        "Gửi mã qua email",
+                        "Gá»­i mÃ£ qua email",
                         ])
                     if email_btn:
-                        await self._human_move_and_click(cdp, *email_btn, "Chọn xác minh Email")
+                        await self._human_move_and_click(cdp, *email_btn, "Chá»n xÃ¡c minh Email")
                     else:
                         await cdp.evaluate("""
                         (() => {
@@ -5114,17 +5317,17 @@ class CDPWorker(QThread):
                     await asyncio.sleep(1.5)
                     await self._click_verify_continue_if_present(cdp)
                     await asyncio.sleep(2)
-                    continue # Chờ trang OTP load
+                    continue # Chá» trang OTP load
 
-            # ─ Nếu TikTok hiện popup/nút "Gửi mã" thì phải bấm trước khi IMAP có mail ─
+            # â”€ Náº¿u TikTok hiá»‡n popup/nÃºt "Gá»­i mÃ£" thÃ¬ pháº£i báº¥m trÆ°á»›c khi IMAP cÃ³ mail â”€
             if not mail_code_requested:
                 if await self._click_mail_code_send_button_if_present(cdp):
                     mail_code_requested = True
-                    self.status_update.emit("📧 Đã bấm gửi mã email — chờ mail OTP...", "blue")
+                    self.status_update.emit("ðŸ“§ ÄÃ£ báº¥m gá»­i mÃ£ email â€” chá» mail OTP...", "blue")
                     await asyncio.sleep(5)
                     continue
 
-            # ─ Kiểm tra OTP (chỉ xử lý 1 lần) ─
+            # â”€ Kiá»ƒm tra OTP (chá»‰ xá»­ lÃ½ 1 láº§n) â”€
             if not otp_handled:
                 try:
                     has_otp = await cdp.evaluate(r"""
@@ -5145,8 +5348,8 @@ class CDPWorker(QThread):
                                body.includes('6-digit') ||
                                clean.includes('nhap ma gom 6 chu so') ||
                                clean.includes('ma xac minh') ||
-                               body.includes('Nhập mã gồm 6 chữ số') ||
-                               body.includes('mã xác minh');
+                               body.includes('Nháº­p mÃ£ gá»“m 6 chá»¯ sá»‘') ||
+                               body.includes('mÃ£ xÃ¡c minh');
                     })()
                     """)
                     if has_otp:
@@ -5154,30 +5357,30 @@ class CDPWorker(QThread):
                         if not mail_code_requested:
                             if await self._click_mail_code_send_button_if_present(cdp):
                                 mail_code_requested = True
-                                self.status_update.emit("📧 Đã bấm gửi mã email — chờ mail OTP...", "blue")
+                                self.status_update.emit("ðŸ“§ ÄÃ£ báº¥m gá»­i mÃ£ email â€” chá» mail OTP...", "blue")
                                 await asyncio.sleep(5)
-                        self.status_update.emit("📧 Cần OTP — đang lấy qua IMAP...", "orange")
+                        self.status_update.emit("ðŸ“§ Cáº§n OTP â€” Ä‘ang láº¥y qua IMAP...", "orange")
                         imap_pass = self.profile_data.get("password_mail", "") or password
                         otp_code  = await self._get_tiktok_code_via_imap(username, imap_pass)
                         if otp_code:
-                            self.status_update.emit(f"🔑 Nhập OTP: {otp_code}", "blue")
+                            self.status_update.emit(f"ðŸ”‘ Nháº­p OTP: {otp_code}", "blue")
                             pos = await self._get_center(cdp,
                                 'input[autocomplete="one-time-code"], input[name="code"], input[placeholder*="6"]')
                             if pos:
-                                await self._human_move_and_click(cdp, *pos, "Click ô OTP")
+                                await self._human_move_and_click(cdp, *pos, "Click Ã´ OTP")
                             await cdp.type_text(otp_code, delay=random.randint(80, 150))
                             await asyncio.sleep(random.uniform(0.8, 1.2))
                             if not await self._click_otp_submit_button(cdp):
-                                self.status_update.emit("⚠️ Không click được nút Tiếp OTP — thử Enter", "orange")
+                                self.status_update.emit("âš ï¸ KhÃ´ng click Ä‘Æ°á»£c nÃºt Tiáº¿p OTP â€” thá»­ Enter", "orange")
                                 await cdp.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Enter", "code": "Enter"})
                                 await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter"})
                         else:
-                            self.status_update.emit("❌ IMAP không lấy được OTP", "red")
+                            self.status_update.emit("âŒ IMAP khÃ´ng láº¥y Ä‘Æ°á»£c OTP", "red")
                             return False
                 except Exception:
                     pass
 
-        # ── TH2: Auto login thất bại → chờ người dùng tự nhập ──
+        # â”€â”€ TH2: Auto login tháº¥t báº¡i â†’ chá» ngÆ°á»i dÃ¹ng tá»± nháº­p â”€â”€
         if self._is_batch_run() and not self._last_login_error:
             self._emit_login_error("Auto login khong hoan tat")
         return await self._wait_manual_login(cdp)
@@ -5191,41 +5394,41 @@ class CDPWorker(QThread):
                 "orange",
             )
             return False
-        """TH2: Chờ người dùng tự đăng nhập thủ công (5 phút).
-        Polling mỗi 3 giây kiểm tra _check_logged_in().
+        """TH2: Chá» ngÆ°á»i dÃ¹ng tá»± Ä‘Äƒng nháº­p thá»§ cÃ´ng (5 phÃºt).
+        Polling má»—i 3 giÃ¢y kiá»ƒm tra _check_logged_in().
         """
-        self.status_update.emit("👤 Chờ đăng nhập thủ công (5 phút)...", "orange")
-        GRACE = 300  # 5 phút
+        self.status_update.emit("ðŸ‘¤ Chá» Ä‘Äƒng nháº­p thá»§ cÃ´ng (5 phÃºt)...", "orange")
+        GRACE = 300  # 5 phÃºt
         GRACE_POLL = 3
         for step in range(GRACE // GRACE_POLL):
             await asyncio.sleep(GRACE_POLL)
             if self._stop_flag:
                 return False
             remaining = GRACE - (step + 1) * GRACE_POLL
-            self.status_update.emit(f"👤 Chờ đăng nhập thủ công... ({remaining}s)", "orange")
+            self.status_update.emit(f"ðŸ‘¤ Chá» Ä‘Äƒng nháº­p thá»§ cÃ´ng... ({remaining}s)", "orange")
             if await self._check_logged_in(cdp):
-                self.status_update.emit("✅ Phát hiện đăng nhập thành công!", "green")
+                self.status_update.emit("âœ… PhÃ¡t hiá»‡n Ä‘Äƒng nháº­p thÃ nh cÃ´ng!", "green")
                 await self._extract_profile_info(cdp)
-                # ★ FIX 1: Biến session cookies → persistent (30 ngày)
+                # â˜… FIX 1: Biáº¿n session cookies â†’ persistent (30 ngÃ y)
                 await self._persist_tiktok_cookies(cdp)
                 return True
 
-        self.status_update.emit("❌ Hết thời gian — Không đăng nhập được", "red")
+        self.status_update.emit("âŒ Háº¿t thá»i gian â€” KhÃ´ng Ä‘Äƒng nháº­p Ä‘Æ°á»£c", "red")
         return False
 
 
     async def _check_logged_in(self, cdp) -> bool:
-        """Kiểm tra đã đăng nhập TikTok chưa — sessionid + DOM verify."""
+        """Kiá»ƒm tra Ä‘Ã£ Ä‘Äƒng nháº­p TikTok chÆ°a â€” sessionid + DOM verify."""
         try:
-            # Đọc cookie qua CDP (đọc được HttpOnly!)
+            # Äá»c cookie qua CDP (Ä‘á»c Ä‘Æ°á»£c HttpOnly!)
             cookies = await cdp.get_cookies()
             has_auth_cookie = self._has_valid_tiktok_auth_cookie(cookies)
             if not has_auth_cookie:
                 return False
 
-            # ★ Có cookie đăng nhập → check DOM (nút "Log in" có hiện không?)
-            # TikTok sau inject cookie: nút Login vẫn hiện 2-3s rồi mới ẩn
-            # → Retry tối đa 3 lần, mỗi lần 1s
+            # â˜… CÃ³ cookie Ä‘Äƒng nháº­p â†’ check DOM (nÃºt "Log in" cÃ³ hiá»‡n khÃ´ng?)
+            # TikTok sau inject cookie: nÃºt Login váº«n hiá»‡n 2-3s rá»“i má»›i áº©n
+            # â†’ Retry tá»‘i Ä‘a 3 láº§n, má»—i láº§n 1s
             for attempt in range(3):
                 has_login_btn = await cdp.evaluate("""
                 (() => {
@@ -5240,7 +5443,7 @@ class CDPWorker(QThread):
                     for (const btn of allBtns) {
                         const r = btn.getBoundingClientRect();
                         if (r.y < 80 && r.width > 0 &&
-                            (btn.textContent.trim() === 'Log in' || btn.textContent.trim() === 'Đăng nhập'))
+                            (btn.textContent.trim() === 'Log in' || btn.textContent.trim() === 'ÄÄƒng nháº­p'))
                             return true;
                     }
                     return false;
@@ -5248,73 +5451,73 @@ class CDPWorker(QThread):
                 """) or False
 
                 if not has_login_btn:
-                    # Có auth cookie + KHÔNG có nút Login → ĐÃ LOGIN ✅
+                    # CÃ³ auth cookie + KHÃ”NG cÃ³ nÃºt Login â†’ ÄÃƒ LOGIN âœ…
                     return True
 
-                # Có auth cookie + CÓ nút Login → TikTok chưa xử lý xong
+                # CÃ³ auth cookie + CÃ“ nÃºt Login â†’ TikTok chÆ°a xá»­ lÃ½ xong
                 if attempt < 2:
-                    await asyncio.sleep(1)  # Chờ TikTok process cookie
+                    await asyncio.sleep(1)  # Chá» TikTok process cookie
 
-            # Sau 3 lần vẫn có Login btn → cookie thật sự hết hạn
+            # Sau 3 láº§n váº«n cÃ³ Login btn â†’ cookie tháº­t sá»± háº¿t háº¡n
             return False
         except Exception:
             return False
 
     async def _extract_profile_info(self, cdp, need_reload=True) -> str:
-        """Lấy @username + cookie — click avatar → vào profile → đọc URL.
-        need_reload: True khi login thường (cần reload hiện avatar), False khi bơm cookie (đã reload).
-        Returns: tiktok_id (str) nếu thành công, rỗng nếu thất bại."""
+        """Láº¥y @username + cookie â€” click avatar â†’ vÃ o profile â†’ Ä‘á»c URL.
+        need_reload: True khi login thÆ°á»ng (cáº§n reload hiá»‡n avatar), False khi bÆ¡m cookie (Ä‘Ã£ reload).
+        Returns: tiktok_id (str) náº¿u thÃ nh cÃ´ng, rá»—ng náº¿u tháº¥t báº¡i."""
         try:
-            # ★ BƯỚC 1: Reload trang CHỈ KHI login thường (TikTok bug: avatar chưa hiện)
+            # â˜… BÆ¯á»šC 1: Reload trang CHá»ˆ KHI login thÆ°á»ng (TikTok bug: avatar chÆ°a hiá»‡n)
             if need_reload:
-                self.status_update.emit("🔄 Reload trang để hiển thị hồ sơ...", "blue")
+                self.status_update.emit("ðŸ”„ Reload trang Ä‘á»ƒ hiá»ƒn thá»‹ há»“ sÆ¡...", "blue")
                 try:
                     await cdp.send("Page.reload")
                 except Exception:
                     await self._navigate_like_human(cdp, "tiktok.com", wait=5)
                 await asyncio.sleep(5)
             else:
-                # Bơm cookie xong → skip popup trước khi tìm avatar
+                # BÆ¡m cookie xong â†’ skip popup trÆ°á»›c khi tÃ¬m avatar
                 await self._skip_tiktok_popup(cdp)
                 await asyncio.sleep(1)
 
-            # ─ Lấy cookie qua CDP ─
+            # â”€ Láº¥y cookie qua CDP â”€
             cookies = await cdp.get_cookies()
             tiktok_cookies = [c for c in cookies if 'tiktok' in c.get('domain', '')]
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in tiktok_cookies])
             if not cookie_str:
                 cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-            # ★ BƯỚC 2: Click vào avatar/profile icon ở sidebar
-            self.status_update.emit("👤 Click vào hồ sơ...", "blue")
+            # â˜… BÆ¯á»šC 2: Click vÃ o avatar/profile icon á»Ÿ sidebar
+            self.status_update.emit("ðŸ‘¤ Click vÃ o há»“ sÆ¡...", "blue")
 
             profile_pos = await cdp.evaluate(r"""
             (() => {
-                // Cách 1: Link profile chính thức
+                // CÃ¡ch 1: Link profile chÃ­nh thá»©c
                 const navProfile = document.querySelector('a[data-e2e="nav-profile"]');
                 if (navProfile) {
                     const r = navProfile.getBoundingClientRect();
                     if (r.width > 0) return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
                 }
 
-                // Cách 2: Link /@username trong sidebar (x < 100)
+                // CÃ¡ch 2: Link /@username trong sidebar (x < 100)
                 const sideLinks = document.querySelectorAll('a[href*="/@"]');
                 for (const a of sideLinks) {
                     const r = a.getBoundingClientRect();
                     if (r.width > 0 && r.x < 100) {
-                        // Ưu tiên link ở dưới cùng (profile thường ở cuối sidebar)
+                        // Æ¯u tiÃªn link á»Ÿ dÆ°á»›i cÃ¹ng (profile thÆ°á»ng á»Ÿ cuá»‘i sidebar)
                         if (r.y > 400)
                             return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
                     }
                 }
-                // Fallback: link /@... đầu tiên trong sidebar
+                // Fallback: link /@... Ä‘áº§u tiÃªn trong sidebar
                 for (const a of sideLinks) {
                     const r = a.getBoundingClientRect();
                     if (r.width > 0 && r.x < 100)
                         return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
                 }
 
-                // Cách 3: Avatar nhỏ ở sidebar
+                // CÃ¡ch 3: Avatar nhá» á»Ÿ sidebar
                 const imgs = document.querySelectorAll('img[class*="avatar" i], img[class*="Avatar"]');
                 for (const img of imgs) {
                     const r = img.getBoundingClientRect();
@@ -5332,10 +5535,10 @@ class CDPWorker(QThread):
 
             tiktok_id = ""
             if profile_pos:
-                await self._human_move_and_click(cdp, profile_pos['x'], profile_pos['y'], "Click hồ sơ")
+                await self._human_move_and_click(cdp, profile_pos['x'], profile_pos['y'], "Click há»“ sÆ¡")
                 await asyncio.sleep(3)
 
-                # ★ BƯỚC 3: Đọc @username từ URL (chính xác 100%)
+                # â˜… BÆ¯á»šC 3: Äá»c @username tá»« URL (chÃ­nh xÃ¡c 100%)
                 tiktok_id = await cdp.evaluate(r"""
                 (() => {
                     const match = location.pathname.match(/^\/@([^/?]+)/);
@@ -5344,10 +5547,10 @@ class CDPWorker(QThread):
                 })()
                 """) or ""
 
-            # ★ Fallback: localStorage
+            # â˜… Fallback: localStorage
             display_name = ""
             if not tiktok_id:
-                self.status_update.emit("🔍 Thử localStorage...", "blue")
+                self.status_update.emit("ðŸ” Thá»­ localStorage...", "blue")
                 tiktok_id = await cdp.evaluate("""
                 (() => {
                     try {
@@ -5359,14 +5562,14 @@ class CDPWorker(QThread):
                 })()
                 """) or ""
 
-            # ─ Kết quả ─
+            # â”€ Káº¿t quáº£ â”€
             if tiktok_id:
-                self.status_update.emit(f"✅ Lưu hồ sơ: {tiktok_id}", "green")
+                self.status_update.emit(f"âœ… LÆ°u há»“ sÆ¡: {tiktok_id}", "green")
             else:
-                self.status_update.emit("⚠️ Không lấy được @username", "orange")
-            # ★ KHÔNG navigate đi đâu — giữ nguyên trang, Feed tự xử lý sau
+                self.status_update.emit("âš ï¸ KhÃ´ng láº¥y Ä‘Æ°á»£c @username", "orange")
+            # â˜… KHÃ”NG navigate Ä‘i Ä‘Ã¢u â€” giá»¯ nguyÃªn trang, Feed tá»± xá»­ lÃ½ sau
 
-            # ─ Emit → Dashboard ─
+            # â”€ Emit â†’ Dashboard â”€
             self.profile_update_signal.emit({
                 "tiktok_id": tiktok_id,
                 "cookie": cookie_str,
@@ -5376,15 +5579,15 @@ class CDPWorker(QThread):
             return tiktok_id
 
         except Exception as e:
-            self.status_update.emit(f"❌ Lỗi lấy hồ sơ: {str(e)[:60]}", "red")
+            self.status_update.emit(f"âŒ Lá»—i láº¥y há»“ sÆ¡: {str(e)[:60]}", "red")
             return ""
 
     async def _get_tiktok_code_via_imap(self, email, password):
-        """Lấy OTP bằng module dùng chung với bảng Đăng Ký."""
+        """Láº¥y OTP báº±ng module dÃ¹ng chung vá»›i báº£ng ÄÄƒng KÃ½."""
         try:
             from hotmail_otp import fetch_otp_from_email
         except Exception as e:
-            self.status_update.emit(f"❌ Không import được hotmail_otp: {str(e)[:60]}", "red")
+            self.status_update.emit(f"âŒ KhÃ´ng import Ä‘Æ°á»£c hotmail_otp: {str(e)[:60]}", "red")
             return None
 
         email = (email or "").strip()
@@ -5393,10 +5596,10 @@ class CDPWorker(QThread):
         client_id = self.profile_data.get("client_id", "").strip()
 
         if not email:
-            self.status_update.emit("❌ Không có email để lấy OTP", "red")
+            self.status_update.emit("âŒ KhÃ´ng cÃ³ email Ä‘á»ƒ láº¥y OTP", "red")
             return None
         if not mailbox_password and not refresh_token:
-            self.status_update.emit("❌ Cần password_mail hoặc refresh_token để lấy OTP", "red")
+            self.status_update.emit("âŒ Cáº§n password_mail hoáº·c refresh_token Ä‘á»ƒ láº¥y OTP", "red")
             return None
 
         def progress(message):
@@ -5415,40 +5618,40 @@ class CDPWorker(QThread):
                 progress_callback=progress,
             )
         except Exception as e:
-            self.status_update.emit(f"❌ Lấy OTP lỗi: {str(e)[:80]}", "red")
+            self.status_update.emit(f"âŒ Láº¥y OTP lá»—i: {str(e)[:80]}", "red")
             return None
 
         if not isinstance(result, dict):
-            self.status_update.emit("❌ Lấy OTP không trả về kết quả hợp lệ", "red")
+            self.status_update.emit("âŒ Láº¥y OTP khÃ´ng tráº£ vá» káº¿t quáº£ há»£p lá»‡", "red")
             return None
 
         new_rt = (result.get("new_refresh_token") or "").strip()
         if new_rt and new_rt != refresh_token:
             self.profile_data["refresh_token"] = new_rt
             self.profile_update_signal.emit({"refresh_token": new_rt})
-            self.status_update.emit("🔄 Đã cập nhật refresh_token mới", "blue")
+            self.status_update.emit("ðŸ”„ ÄÃ£ cáº­p nháº­t refresh_token má»›i", "blue")
 
         otp = (result.get("otp") or "").strip()
         if result.get("status") == "success" and otp:
             return otp
 
-        message = result.get("message") or "Không lấy được OTP"
-        self.status_update.emit(f"❌ {message}", "red")
+        message = result.get("message") or "KhÃ´ng láº¥y Ä‘Æ°á»£c OTP"
+        self.status_update.emit(f"âŒ {message}", "red")
         return None
 
     async def _get_microsoft_oauth_token(self, email, password):
-        """Lấy OAuth2 access token cho Hotmail/Outlook.
-        Ưu tiên: refresh_token → ROPC (fallback).
-        Đọc refresh_token và client_id từ profile_data.
+        """Láº¥y OAuth2 access token cho Hotmail/Outlook.
+        Æ¯u tiÃªn: refresh_token â†’ ROPC (fallback).
+        Äá»c refresh_token vÃ  client_id tá»« profile_data.
         """
         try:
             import msal
         except ImportError:
-            self.status_update.emit("❌ Thiếu msal: pip install msal", "red")
+            self.status_update.emit("âŒ Thiáº¿u msal: pip install msal", "red")
             return None
 
         try:
-            # Lấy config từ profile
+            # Láº¥y config tá»« profile
             refresh_token = self.profile_data.get("refresh_token", "").strip()
             client_id = self.profile_data.get("client_id", "").strip()
 
@@ -5461,75 +5664,75 @@ class CDPWorker(QThread):
 
             app = msal.PublicClientApplication(client_id, authority=AUTHORITY)
 
-            # ═══ Cách 1: Dùng Refresh Token (ưu tiên) ═══
+            # â•â•â• CÃ¡ch 1: DÃ¹ng Refresh Token (Æ°u tiÃªn) â•â•â•
             if refresh_token:
-                self.status_update.emit("🔑 Đang lấy token bằng Refresh Token...", "blue")
+                self.status_update.emit("ðŸ”‘ Äang láº¥y token báº±ng Refresh Token...", "blue")
                 result = app.acquire_token_by_refresh_token(
                     refresh_token=refresh_token,
                     scopes=SCOPES
                 )
                 if "access_token" in result:
-                    # Cập nhật refresh_token mới (Microsoft trả về mới mỗi lần)
+                    # Cáº­p nháº­t refresh_token má»›i (Microsoft tráº£ vá» má»›i má»—i láº§n)
                     new_rt = result.get("refresh_token", "")
                     if new_rt and new_rt != refresh_token:
                         self.profile_data["refresh_token"] = new_rt
-                        self.status_update.emit("🔄 Refresh token đã được cập nhật", "blue")
-                    self.status_update.emit("✅ OAuth token OK (refresh)", "green")
+                        self.status_update.emit("ðŸ”„ Refresh token Ä‘Ã£ Ä‘Æ°á»£c cáº­p nháº­t", "blue")
+                    self.status_update.emit("âœ… OAuth token OK (refresh)", "green")
                     return result["access_token"]
                 else:
                     error = result.get("error_description", result.get("error", ""))
-                    self.status_update.emit(f"⚠️ Refresh token lỗi: {str(error)[:50]}", "orange")
-                    # Refresh token hết hạn → thử ROPC
+                    self.status_update.emit(f"âš ï¸ Refresh token lá»—i: {str(error)[:50]}", "orange")
+                    # Refresh token háº¿t háº¡n â†’ thá»­ ROPC
 
-            # ═══ Cách 2: ROPC flow (fallback — cần tài khoản không có 2FA) ═══
+            # â•â•â• CÃ¡ch 2: ROPC flow (fallback â€” cáº§n tÃ i khoáº£n khÃ´ng cÃ³ 2FA) â•â•â•
             if password:
-                self.status_update.emit("🔑 Thử ROPC flow...", "blue")
+                self.status_update.emit("ðŸ”‘ Thá»­ ROPC flow...", "blue")
                 result = app.acquire_token_by_username_password(
                     username=email,
                     password=password,
                     scopes=SCOPES
                 )
                 if "access_token" in result:
-                    # Lưu refresh_token mới để lần sau dùng
+                    # LÆ°u refresh_token má»›i Ä‘á»ƒ láº§n sau dÃ¹ng
                     new_rt = result.get("refresh_token", "")
                     if new_rt:
                         self.profile_data["refresh_token"] = new_rt
-                        self.status_update.emit("🔄 Đã lấy được refresh token mới", "blue")
-                    self.status_update.emit("✅ OAuth token OK (ROPC)", "green")
+                        self.status_update.emit("ðŸ”„ ÄÃ£ láº¥y Ä‘Æ°á»£c refresh token má»›i", "blue")
+                    self.status_update.emit("âœ… OAuth token OK (ROPC)", "green")
                     return result["access_token"]
                 else:
                     error = result.get("error_description", result.get("error", "Unknown"))
-                    self.status_update.emit(f"❌ OAuth lỗi: {str(error)[:60]}", "red")
+                    self.status_update.emit(f"âŒ OAuth lá»—i: {str(error)[:60]}", "red")
                     return None
 
-            self.status_update.emit("❌ Không có refresh_token và password_mail", "red")
+            self.status_update.emit("âŒ KhÃ´ng cÃ³ refresh_token vÃ  password_mail", "red")
             return None
 
         except Exception as e:
-            self.status_update.emit(f"❌ OAuth exception: {str(e)[:60]}", "red")
+            self.status_update.emit(f"âŒ OAuth exception: {str(e)[:60]}", "red")
             return None
 
-    # ════════════════════════════════════════════════════════════════
-    #  HELPER: kiểm tra tỉ lệ %
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    #  HELPER: kiá»ƒm tra tá»‰ lá»‡ %
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _hit(self, key: str) -> bool:
-        """True nếu ngẫu nhiên rơi vào tỉ lệ % cài trong feed_settings."""
+        """True náº¿u ngáº«u nhiÃªn rÆ¡i vÃ o tá»‰ lá»‡ % cÃ i trong feed_settings."""
         pct = self.feed_settings.get(key, 0)
         return pct > 0 and random.randint(1, 100) <= pct
 
-    # ════════════════════════════════════════════════════════════════
-    #  HELPER: Phát hiện loại video (LIVE / Ads / restricted / normal)
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    #  HELPER: PhÃ¡t hiá»‡n loáº¡i video (LIVE / Ads / restricted / normal)
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     async def _detect_video_type(self, cdp) -> str:
         """
-        Phát hiện loại video đang hiển thị trên màn hình.
+        PhÃ¡t hiá»‡n loáº¡i video Ä‘ang hiá»ƒn thá»‹ trÃªn mÃ n hÃ¬nh.
         Returns: 'normal' | 'live' | 'ads' | 'restricted' | 'no_comment'
         """
         vtype = await cdp.evaluate("""
         (() => {
-            // ── LIVE? Chỉ kiểm tra badge LIVE rõ ràng ──
+            // â”€â”€ LIVE? Chá»‰ kiá»ƒm tra badge LIVE rÃµ rÃ ng â”€â”€
             const liveEls = document.querySelectorAll(
                 '[data-e2e*="live"], [class*="LiveBadge"], [class*="LiveTag"]'
             );
@@ -5539,7 +5742,7 @@ class CDPWorker(QThread):
                     if (el.offsetWidth > 0) return 'live';
             }
 
-            // ── Ads / Sponsored? Chỉ kiểm tra label trực tiếp ──
+            // â”€â”€ Ads / Sponsored? Chá»‰ kiá»ƒm tra label trá»±c tiáº¿p â”€â”€
             const adSels = [
                 '[class*="Sponsored"]', '[class*="sponsored"]',
                 '[class*="AdBadge"]', '[data-e2e*="ad-"]'
@@ -5557,15 +5760,15 @@ class CDPWorker(QThread):
                     return 'ads';
             }
 
-            // ── Video bình thường: kiểm tra comment khả dụng ──
-            // Mode 1: ForYou feed — có icon comment trên sidebar
+            // â”€â”€ Video bÃ¬nh thÆ°á»ng: kiá»ƒm tra comment kháº£ dá»¥ng â”€â”€
+            // Mode 1: ForYou feed â€” cÃ³ icon comment trÃªn sidebar
             const cmtIcon = document.querySelector(
                 '[data-e2e="comment-icon"]'
             );
             if (cmtIcon && cmtIcon.getBoundingClientRect().width > 0)
                 return 'normal';
 
-            // Mode 2: Full-page video — comment panel đã mở sẵn bên phải
+            // Mode 2: Full-page video â€” comment panel Ä‘Ã£ má»Ÿ sáºµn bÃªn pháº£i
             const cmtPanel = document.querySelector(
                 '[data-e2e="comment-input"], [data-e2e="comment-list"],' +
                 ' div[class*="CommentListContainer"], div[class*="comment-list"],' +
@@ -5574,7 +5777,7 @@ class CDPWorker(QThread):
             if (cmtPanel && cmtPanel.getBoundingClientRect().width > 0)
                 return 'normal';
 
-            // Mode 3: Kiểm tra số comment hiển thị (text "937" bên cạnh icon)
+            // Mode 3: Kiá»ƒm tra sá»‘ comment hiá»ƒn thá»‹ (text "937" bÃªn cáº¡nh icon)
             const cmtCount = document.querySelector(
                 '[data-e2e="comment-count"], strong[data-e2e="comment-count"]'
             );
@@ -5585,24 +5788,24 @@ class CDPWorker(QThread):
         })()
         """)
         result = vtype or 'normal'
-        self.status_update.emit(f"🔍 Video type: {result}", "blue")
+        self.status_update.emit(f"ðŸ” Video type: {result}", "blue")
         return result
 
-    # ════════════════════════════════════════════════════════════════
-    #  HELPER: Tương tác Comment (mở panel, like, clone, view more)
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    #  HELPER: TÆ°Æ¡ng tÃ¡c Comment (má»Ÿ panel, like, clone, view more)
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-    EMOJIS = ["😂","❤️","🔥","😍","👏","🎉","💯","😭","🥰",
-              "✨","🤣","😊","👍","💕","🙌","🫶","😮","😘","🤩","🫀"]
+    EMOJIS = ["ðŸ˜‚","â¤ï¸","ðŸ”¥","ðŸ˜","ðŸ‘","ðŸŽ‰","ðŸ’¯","ðŸ˜­","ðŸ¥°",
+              "âœ¨","ðŸ¤£","ðŸ˜Š","ðŸ‘","ðŸ’•","ðŸ™Œ","ðŸ«¶","ðŸ˜®","ðŸ˜˜","ðŸ¤©","ðŸ«€"]
 
     async def _open_comment_panel(self, cdp) -> bool:
-        """Click icon comment để mở panel. Trả True nếu đã mở sẵn hoặc mở thành công."""
+        """Click icon comment Ä‘á»ƒ má»Ÿ panel. Tráº£ True náº¿u Ä‘Ã£ má»Ÿ sáºµn hoáº·c má»Ÿ thÃ nh cÃ´ng."""
 
-        # ── Hàm check panel đã mở ──
+        # â”€â”€ HÃ m check panel Ä‘Ã£ má»Ÿ â”€â”€
         async def _is_panel_open():
             return await cdp.evaluate("""
             (() => {
-                // ForYou: comment panel mở sẵn bên phải (comment list hiển thị)
+                // ForYou: comment panel má»Ÿ sáºµn bÃªn pháº£i (comment list hiá»ƒn thá»‹)
                 const listSels = [
                     '[data-e2e="comment-list"]',
                     'div[class*="CommentListContainer"]',
@@ -5615,7 +5818,7 @@ class CDPWorker(QThread):
                     if (el && el.getBoundingClientRect().width > 50) return 'list';
                 }
 
-                // Ô nhập comment
+                // Ã” nháº­p comment
                 const inputSels = [
                     '[data-e2e="comment-input"]',
                     'div[contenteditable="true"][class*="comment" i]',
@@ -5630,7 +5833,7 @@ class CDPWorker(QThread):
                 // Placeholder "Add comment..."
                 const placeholders = document.querySelectorAll(
                     '[placeholder*="comment" i], [data-placeholder*="comment" i],' +
-                    ' [placeholder*="bình luận" i]'
+                    ' [placeholder*="bÃ¬nh luáº­n" i]'
                 );
                 for (const el of placeholders) {
                     if (el.getBoundingClientRect().width > 0) return 'placeholder';
@@ -5640,14 +5843,14 @@ class CDPWorker(QThread):
             })()
             """)
 
-        # ── Check 1: panel đã mở sẵn? ──
+        # â”€â”€ Check 1: panel Ä‘Ã£ má»Ÿ sáºµn? â”€â”€
         status = await _is_panel_open()
         if status:
-            self.status_update.emit(f"💬 Comment panel đã mở ({status})", "blue")
+            self.status_update.emit(f"ðŸ’¬ Comment panel Ä‘Ã£ má»Ÿ ({status})", "blue")
             return True
 
-        # ── Check 2: click icon comment ──
-        self.status_update.emit("💬 Mở comment panel...", "blue")
+        # â”€â”€ Check 2: click icon comment â”€â”€
+        self.status_update.emit("ðŸ’¬ Má»Ÿ comment panel...", "blue")
         icon_sels = [
             '[data-e2e="comment-icon"]',
             'span[data-e2e="comment-icon"]',
@@ -5657,16 +5860,16 @@ class CDPWorker(QThread):
         for sel in icon_sels:
             pos = await self._get_center(cdp, sel)
             if pos:
-                await self._human_move_and_click(cdp, *pos, "Click icon 💬")
+                await self._human_move_and_click(cdp, *pos, "Click icon ðŸ’¬")
                 await asyncio.sleep(random.uniform(2.0, 3.0))
 
-                # Verify panel đã mở
+                # Verify panel Ä‘Ã£ má»Ÿ
                 status = await _is_panel_open()
                 if status:
-                    self.status_update.emit(f"💬 Panel đã mở sau click ({status})", "green")
+                    self.status_update.emit(f"ðŸ’¬ Panel Ä‘Ã£ má»Ÿ sau click ({status})", "green")
                     return True
 
-        # ── Check 3: Fallback — ForYou có thể hiển thị comment text trực tiếp ──
+        # â”€â”€ Check 3: Fallback â€” ForYou cÃ³ thá»ƒ hiá»ƒn thá»‹ comment text trá»±c tiáº¿p â”€â”€
         has_comments = await cdp.evaluate("""
         (() => {
             const cmts = document.querySelectorAll(
@@ -5678,19 +5881,19 @@ class CDPWorker(QThread):
         """) or False
 
         if has_comments:
-            self.status_update.emit("💬 Comment items hiện diện — panel mở", "green")
+            self.status_update.emit("ðŸ’¬ Comment items hiá»‡n diá»‡n â€” panel má»Ÿ", "green")
             return True
 
-        self.status_update.emit("⚠️ Không mở được comment panel", "orange")
+        self.status_update.emit("âš ï¸ KhÃ´ng má»Ÿ Ä‘Æ°á»£c comment panel", "orange")
         return False
 
     async def _like_comments(self, cdp, video_idx: int):
-        """Thả tim ngẫu nhiên N comment (giới hạn max_like_cmt)."""
+        """Tháº£ tim ngáº«u nhiÃªn N comment (giá»›i háº¡n max_like_cmt)."""
         max_n = self.feed_settings.get('max_like_cmt', 5)
         n = random.randint(1, max(1, max_n))
-        self.status_update.emit(f"❤️ Video #{video_idx}: Thả tim {n} comment...", "blue")
+        self.status_update.emit(f"â¤ï¸ Video #{video_idx}: Tháº£ tim {n} comment...", "blue")
 
-        # Lấy danh sách icon tim của comment
+        # Láº¥y danh sÃ¡ch icon tim cá»§a comment
         like_positions = await cdp.evaluate("""
         (() => {
             const btns = document.querySelectorAll(
@@ -5715,13 +5918,13 @@ class CDPWorker(QThread):
             await asyncio.sleep(random.uniform(1.0, 2.5))
 
     async def _view_more_replies(self, cdp, video_idx: int):
-        """Click nút 'View more replies' / 'Xem thêm' comment."""
-        self.status_update.emit(f"👀 Video #{video_idx}: Xem thêm comment...", "blue")
+        """Click nÃºt 'View more replies' / 'Xem thÃªm' comment."""
+        self.status_update.emit(f"ðŸ‘€ Video #{video_idx}: Xem thÃªm comment...", "blue")
         pos = await self._get_center_by_text(cdp, "View more replies")
         if not pos:
-            pos = await self._get_center_by_text(cdp, "Xem thêm")
+            pos = await self._get_center_by_text(cdp, "Xem thÃªm")
         if not pos:
-            # Tìm bất kỳ nút "view more" kiểu generic
+            # TÃ¬m báº¥t ká»³ nÃºt "view more" kiá»ƒu generic
             pos = await cdp.evaluate("""
             (() => {
                 const all = Array.from(document.querySelectorAll('*'));
@@ -5729,7 +5932,7 @@ class CDPWorker(QThread):
                     if (el.innerText && (
                         el.innerText.includes('View more') ||
                         el.innerText.includes('replies') ||
-                        el.innerText.includes('Xem thêm')
+                        el.innerText.includes('Xem thÃªm')
                     ) && el.childElementCount < 3) {
                         const r = el.getBoundingClientRect();
                         if (r.width > 0 && r.height > 0 && r.width < 400)
@@ -5748,24 +5951,24 @@ class CDPWorker(QThread):
 
     async def _clone_comment(self, cdp, video_idx: int):
         """
-        Clone 1 comment như người thật:
-        1. Lướt xem comment trong panel (scroll mượt)
-        2. Thu thập danh sách comment
-        3. Nguồn clone: 70% từ video hiện tại, 30% từ bank (video trước)
-        4. Biến thể: 50/50 giữ nguyên hoặc thêm emoji
-        5. Chống trùng lặp + verify + detect rate limit
+        Clone 1 comment nhÆ° ngÆ°á»i tháº­t:
+        1. LÆ°á»›t xem comment trong panel (scroll mÆ°á»£t)
+        2. Thu tháº­p danh sÃ¡ch comment
+        3. Nguá»“n clone: 70% tá»« video hiá»‡n táº¡i, 30% tá»« bank (video trÆ°á»›c)
+        4. Biáº¿n thá»ƒ: 50/50 giá»¯ nguyÃªn hoáº·c thÃªm emoji
+        5. Chá»‘ng trÃ¹ng láº·p + verify + detect rate limit
         """
-        # ── Rate limit cooldown? ──
+        # â”€â”€ Rate limit cooldown? â”€â”€
         if self._comment_cooldown:
-            self.status_update.emit(f"⏳ Video #{video_idx}: Đang cooldown comment...", "orange")
+            self.status_update.emit(f"â³ Video #{video_idx}: Äang cooldown comment...", "orange")
             return
 
-        # ════════════════════════════════════════════
-        #  BƯỚC 1: Lướt xem comment (giống người thật đọc)
-        # ════════════════════════════════════════════
-        self.status_update.emit(f"💬 Video #{video_idx}: Đọc comment...", "blue")
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 1: LÆ°á»›t xem comment (giá»‘ng ngÆ°á»i tháº­t Ä‘á»c)
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        self.status_update.emit(f"ðŸ’¬ Video #{video_idx}: Äá»c comment...", "blue")
 
-        # ★ Tìm vùng comment panel (tọa độ thực tế)
+        # â˜… TÃ¬m vÃ¹ng comment panel (tá»a Ä‘á»™ thá»±c táº¿)
         panel_bounds = await cdp.evaluate("""
         (() => {
             const sels = [
@@ -5787,7 +5990,7 @@ class CDPWorker(QThread):
                     };
                 }
             }
-            // Fallback: vùng bên phải (ForYou)
+            // Fallback: vÃ¹ng bÃªn pháº£i (ForYou)
             return {x: 800, top: 100, bottom: 550, left: 680, right: 950};
         })()
         """) or {"x": 800, "top": 100, "bottom": 550, "left": 680, "right": 950}
@@ -5797,18 +6000,28 @@ class CDPWorker(QThread):
         p_bot = panel_bounds['bottom']
         p_left = panel_bounds.get('left', 680)
         p_right = panel_bounds.get('right', 950)
+        p_left, p_right = sorted((int(p_left), int(p_right)))
+        p_top, p_bot = sorted((int(p_top), int(p_bot)))
+        if (p_right - p_left) < 80:
+            pad_x = max(20, (80 - (p_right - p_left)) // 2)
+            p_left -= pad_x
+            p_right += pad_x
+        if (p_bot - p_top) < 160:
+            pad_y = max(40, (160 - (p_bot - p_top)) // 2)
+            p_top = max(0, p_top - pad_y)
+            p_bot += pad_y
 
-        # ═══ Lướt đọc comment tự nhiên (lên/xuống xen kẽ) ═══
-        # Giống người thật: scroll xuống → dừng đọc → scroll lên xem lại → xuống tiếp
+        # â•â•â• LÆ°á»›t Ä‘á»c comment tá»± nhiÃªn (lÃªn/xuá»‘ng xen káº½) â•â•â•
+        # Giá»‘ng ngÆ°á»i tháº­t: scroll xuá»‘ng â†’ dá»«ng Ä‘á»c â†’ scroll lÃªn xem láº¡i â†’ xuá»‘ng tiáº¿p
         browse_actions = [
-            ("down", 200, 400),   # Scroll xuống — đọc comment đầu
-            ("pause", 0, 0),       # Dừng đọc 1-2s
-            ("down", 250, 450),   # Xuống tiếp — đọc thêm
-            ("hover", 0, 0),       # Di chuột vào 1 comment (tò mò)
-            ("up", 100, 250),     # Scroll LÊN — xem lại comment trước
-            ("pause", 0, 0),       # Đọc lại
-            ("down", 300, 500),   # Xuống hẳn — xem comment mới
-            ("hover", 0, 0),       # Di chuột vào comment khác
+            ("down", 200, 400),   # Scroll xuá»‘ng â€” Ä‘á»c comment Ä‘áº§u
+            ("pause", 0, 0),       # Dá»«ng Ä‘á»c 1-2s
+            ("down", 250, 450),   # Xuá»‘ng tiáº¿p â€” Ä‘á»c thÃªm
+            ("hover", 0, 0),       # Di chuá»™t vÃ o 1 comment (tÃ² mÃ²)
+            ("up", 100, 250),     # Scroll LÃŠN â€” xem láº¡i comment trÆ°á»›c
+            ("pause", 0, 0),       # Äá»c láº¡i
+            ("down", 300, 500),   # Xuá»‘ng háº³n â€” xem comment má»›i
+            ("hover", 0, 0),       # Di chuá»™t vÃ o comment khÃ¡c
         ]
 
         for idx_a, (action, scroll_min, scroll_max) in enumerate(browse_actions):
@@ -5818,11 +6031,11 @@ class CDPWorker(QThread):
                 action = "pause"
 
             if action == "down":
-                # Scroll xuống
+                # Scroll xuá»‘ng
                 scroll_amount = random.randint(scroll_min, scroll_max)
-                mx = random.randint(p_left + 20, p_right - 20)
-                my = random.randint(p_top + 50, p_bot - 50)
-                self.status_update.emit(f"👁️ Đọc comment... ⬇️ scroll xuống", "blue")
+                mx = _safe_randint(p_left + 20, p_right - 20)
+                my = _safe_randint(p_top + 50, p_bot - 50)
+                self.status_update.emit(f"ðŸ‘ï¸ Äá»c comment... â¬‡ï¸ scroll xuá»‘ng", "blue")
                 await self._smooth_mouse_drift(cdp, mx, my)
                 await cdp.evaluate(f"""
                 (() => {{
@@ -5840,32 +6053,32 @@ class CDPWorker(QThread):
                 await asyncio.sleep(random.uniform(1.2, 2.2))
 
             elif False and action == "up":
-                # Scroll LÊN (giống đang xem lại comment hay)
+                # Scroll LÃŠN (giá»‘ng Ä‘ang xem láº¡i comment hay)
                 scroll_amount = random.randint(scroll_min, scroll_max)
-                mx = random.randint(p_left + 20, p_right - 20)
-                my = random.randint(p_top + 50, p_bot - 50)
-                self.status_update.emit(f"👁️ Xem lại comment... ⬆️ scroll lên", "blue")
+                mx = _safe_randint(p_left + 20, p_right - 20)
+                my = _safe_randint(p_top + 50, p_bot - 50)
+                self.status_update.emit(f"ðŸ‘ï¸ Xem láº¡i comment... â¬†ï¸ scroll lÃªn", "blue")
                 await self._smooth_mouse_drift(cdp, mx, my)
                 await asyncio.sleep(0)
                 await asyncio.sleep(random.uniform(1.2, 2.0))
 
             elif action == "hover":
-                # Di chuột vào 1 comment cụ thể (tò mò đọc)
-                hx = random.randint(p_left + 30, p_right - 30)
-                hy = random.randint(p_top + 80, p_bot - 100)
-                self.status_update.emit(f"🖱️ Xem 1 comment...", "blue")
+                # Di chuá»™t vÃ o 1 comment cá»¥ thá»ƒ (tÃ² mÃ² Ä‘á»c)
+                hx = _safe_randint(p_left + 30, p_right - 30)
+                hy = _safe_randint(p_top + 80, p_bot - 100)
+                self.status_update.emit(f"ðŸ–±ï¸ Xem 1 comment...", "blue")
                 await self._smooth_mouse_drift(cdp, hx, hy)
                 await asyncio.sleep(random.uniform(1.0, 1.8))
 
             elif action == "pause":
-                # Dừng đọc (mắt dừng ở 1 comment)
-                self.status_update.emit(f"👁️ Đang đọc comment...", "blue")
+                # Dá»«ng Ä‘á»c (máº¯t dá»«ng á»Ÿ 1 comment)
+                self.status_update.emit(f"ðŸ‘ï¸ Äang Ä‘á»c comment...", "blue")
                 await asyncio.sleep(random.uniform(1.2, 2.2))
 
-        # ════════════════════════════════════════════
-        #  BƯỚC 2: Thu thập comment từ video hiện tại
-        # ════════════════════════════════════════════
-        self.status_update.emit(f"📝 Video #{video_idx}: Lấy danh sách comment...", "blue")
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 2: Thu tháº­p comment tá»« video hiá»‡n táº¡i
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        self.status_update.emit(f"ðŸ“ Video #{video_idx}: Láº¥y danh sÃ¡ch comment...", "blue")
 
         current_comments = await cdp.evaluate("""
         (() => {
@@ -5883,12 +6096,12 @@ class CDPWorker(QThread):
                 const items = document.querySelectorAll(sel);
                 for (const el of items) {
                     const t = (el.innerText || '').trim();
-                    // Chỉ lấy text comment thực (2-200 ký tự, không phải username/time)
+                    // Chá»‰ láº¥y text comment thá»±c (2-200 kÃ½ tá»±, khÃ´ng pháº£i username/time)
                     if (t.length > 2 && t.length < 200 &&
-                        !t.match(/^\\d+[smhd]?\\s*(ago)?$/) &&   // Bỏ "2h ago"
-                        !t.startsWith('@') &&                   // Bỏ @username
-                        !t.match(/^Reply$/i) &&                 // Bỏ "Reply"
-                        !t.match(/^View \\d+ replies/i))         // Bỏ "View 14 replies"
+                        !t.match(/^\\d+[smhd]?\\s*(ago)?$/) &&   // Bá» "2h ago"
+                        !t.startsWith('@') &&                   // Bá» @username
+                        !t.match(/^Reply$/i) &&                 // Bá» "Reply"
+                        !t.match(/^View \\d+ replies/i))         // Bá» "View 14 replies"
                         texts.add(t);
                 }
                 if (texts.size >= 10) break;
@@ -5898,68 +6111,68 @@ class CDPWorker(QThread):
         """) or []
 
         self.status_update.emit(
-            f"📝 Video #{video_idx}: {len(current_comments)} comment | Bank: {len(self._comment_bank)}",
+            f"ðŸ“ Video #{video_idx}: {len(current_comments)} comment | Bank: {len(self._comment_bank)}",
             "blue"
         )
 
-        # Lưu vào bank để dùng cho video sau (giữ tối đa 100)
+        # LÆ°u vÃ o bank Ä‘á»ƒ dÃ¹ng cho video sau (giá»¯ tá»‘i Ä‘a 100)
         for c in current_comments:
             if c not in self._comment_bank:
                 self._comment_bank.append(c)
         if len(self._comment_bank) > 100:
             self._comment_bank = self._comment_bank[-100:]
 
-        # ════════════════════════════════════════════
-        #  BƯỚC 3: Chọn nguồn clone (video hiện tại vs bank)
-        # ════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 3: Chá»n nguá»“n clone (video hiá»‡n táº¡i vs bank)
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         chosen = None
         source = ""
 
-        # Lọc bỏ comment đã dùng (chống trùng lặp)
+        # Lá»c bá» comment Ä‘Ã£ dÃ¹ng (chá»‘ng trÃ¹ng láº·p)
         avail_current = [c for c in current_comments if c not in self._comment_history]
         avail_bank = [c for c in self._comment_bank
                       if c not in self._comment_history and c not in current_comments]
 
-        # Quyết định nguồn: 70% video hiện tại, 30% bank (nếu có)
+        # Quyáº¿t Ä‘á»‹nh nguá»“n: 70% video hiá»‡n táº¡i, 30% bank (náº¿u cÃ³)
         use_bank = (random.random() < 0.3) and len(avail_bank) > 0
 
         if use_bank:
             chosen = random.choice(avail_bank)
-            source = "📦 Từ bank (video trước)"
+            source = "ðŸ“¦ Tá»« bank (video trÆ°á»›c)"
         elif avail_current:
             chosen = random.choice(avail_current)
-            source = "🎬 Từ video hiện tại"
+            source = "ðŸŽ¬ Tá»« video hiá»‡n táº¡i"
         elif avail_bank:
-            # Fallback: video hiện tại hết comment mới → dùng bank
+            # Fallback: video hiá»‡n táº¡i háº¿t comment má»›i â†’ dÃ¹ng bank
             chosen = random.choice(avail_bank)
-            source = "📦 Fallback bank"
+            source = "ðŸ“¦ Fallback bank"
         else:
             self.status_update.emit(
-                f"⚠️ Video #{video_idx}: Hết comment chưa dùng (bank + hiện tại)", "orange"
+                f"âš ï¸ Video #{video_idx}: Háº¿t comment chÆ°a dÃ¹ng (bank + hiá»‡n táº¡i)", "orange"
             )
             return
 
-        # Đánh dấu đã dùng
+        # ÄÃ¡nh dáº¥u Ä‘Ã£ dÃ¹ng
         self._comment_history.add(chosen)
 
-        # ════════════════════════════════════════════
-        #  BƯỚC 4: Biến thể (50/50 thêm emoji)
-        # ════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 4: Biáº¿n thá»ƒ (50/50 thÃªm emoji)
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         if random.random() < 0.5:
             chosen = chosen + " " + random.choice(self.EMOJIS)
-            self.status_update.emit(f"✏️ {source}: {chosen[:30]}... +emoji", "blue")
+            self.status_update.emit(f"âœï¸ {source}: {chosen[:30]}... +emoji", "blue")
         else:
-            self.status_update.emit(f"✏️ {source}: {chosen[:30]}...", "blue")
+            self.status_update.emit(f"âœï¸ {source}: {chosen[:30]}...", "blue")
 
-        # ════════════════════════════════════════════
-        #  BƯỚC 5: Click ô comment và gõ
-        # ════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 5: Click Ã´ comment vÃ  gÃµ
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         await asyncio.sleep(random.uniform(0.8, 1.5))
 
-        # Tìm ô "Add comment..." — TikTok có nhiều variant
+        # TÃ¬m Ã´ "Add comment..." â€” TikTok cÃ³ nhiá»u variant
         input_pos = await cdp.evaluate("""
         (() => {
-            // Cách 1: data-e2e comment-input (ô nhập chính)
+            // CÃ¡ch 1: data-e2e comment-input (Ã´ nháº­p chÃ­nh)
             const sels = [
                 '[data-e2e="comment-input"]',
                 '[data-e2e="comment-input"] div[contenteditable="true"]',
@@ -5977,7 +6190,7 @@ class CDPWorker(QThread):
                 }
             }
 
-            // Cách 2: Tìm placeholder "Add comment"
+            // CÃ¡ch 2: TÃ¬m placeholder "Add comment"
             const allEditable = document.querySelectorAll(
                 '[contenteditable], [role="textbox"], textarea, input[type="text"]'
             );
@@ -5987,15 +6200,15 @@ class CDPWorker(QThread):
                 const text = (el.innerText || el.textContent || '').toLowerCase();
                 if (r.width > 0 && r.height > 0 && r.y > 300 && (
                     ph.toLowerCase().includes('comment') ||
-                    ph.toLowerCase().includes('bình luận') ||
+                    ph.toLowerCase().includes('bÃ¬nh luáº­n') ||
                     text.includes('add comment') ||
-                    text.includes('thêm bình luận')
+                    text.includes('thÃªm bÃ¬nh luáº­n')
                 )) {
                     return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
                 }
             }
 
-            // Cách 3: Ô contenteditable ở dưới cùng comment panel (y > 500)
+            // CÃ¡ch 3: Ã” contenteditable á»Ÿ dÆ°á»›i cÃ¹ng comment panel (y > 500)
             for (const el of allEditable) {
                 const r = el.getBoundingClientRect();
                 if (r.width > 50 && r.height > 0 && r.y > 500)
@@ -6006,22 +6219,22 @@ class CDPWorker(QThread):
         """)
 
         if not input_pos:
-            self.status_update.emit("⚠️ Không tìm thấy ô comment", "orange")
+            self.status_update.emit("âš ï¸ KhÃ´ng tÃ¬m tháº¥y Ã´ comment", "orange")
             return
 
-        # Click vào ô comment
-        await self._human_move_and_click(cdp, input_pos['x'], input_pos['y'], "Click ô comment")
+        # Click vÃ o Ã´ comment
+        await self._human_move_and_click(cdp, input_pos['x'], input_pos['y'], "Click Ã´ comment")
         await asyncio.sleep(random.uniform(0.8, 1.2))
 
-        # ★ Sau khi click, TikTok chuyển placeholder → contenteditable
-        # Chờ ô focus và sẵn sàng nhận text
+        # â˜… Sau khi click, TikTok chuyá»ƒn placeholder â†’ contenteditable
+        # Chá» Ã´ focus vÃ  sáºµn sÃ ng nháº­n text
         for _ in range(3):
             focused = await cdp.evaluate("""
             (() => {
                 const active = document.activeElement;
                 if (active && (active.contentEditable === 'true' || active.tagName === 'TEXTAREA'))
                     return true;
-                // Thử focus trực tiếp
+                // Thá»­ focus trá»±c tiáº¿p
                 const ce = document.querySelector(
                     '[data-e2e="comment-input"] [contenteditable="true"],' +
                     ' div[contenteditable="true"][class*="DraftEditor"],' +
@@ -6034,17 +6247,17 @@ class CDPWorker(QThread):
             """) or False
             if focused:
                 break
-            # Click lại nếu chưa focus
-            await self._human_move_and_click(cdp, input_pos['x'], input_pos['y'], "Re-click ô comment")
+            # Click láº¡i náº¿u chÆ°a focus
+            await self._human_move_and_click(cdp, input_pos['x'], input_pos['y'], "Re-click Ã´ comment")
             await asyncio.sleep(0.5)
 
         await asyncio.sleep(0.3)
 
-        # Gõ từng ký tự (mô phỏng người thật)
+        # GÃµ tá»«ng kÃ½ tá»± (mÃ´ phá»ng ngÆ°á»i tháº­t)
         await cdp.type_text(chosen, delay=random.randint(50, 110))
         await asyncio.sleep(random.uniform(0.5, 0.8))
 
-        # ★ Verify text đã được nhập chưa
+        # â˜… Verify text Ä‘Ã£ Ä‘Æ°á»£c nháº­p chÆ°a
         has_text = await cdp.evaluate("""
         (() => {
             const ce = document.querySelector(
@@ -6061,9 +6274,9 @@ class CDPWorker(QThread):
         })()
         """) or False
 
-        # Nếu type_text không hoạt động → fallback insertText
+        # Náº¿u type_text khÃ´ng hoáº¡t Ä‘á»™ng â†’ fallback insertText
         if not has_text:
-            self.status_update.emit("🔄 Fallback: insertText...", "blue")
+            self.status_update.emit("ðŸ”„ Fallback: insertText...", "blue")
             await cdp.send("Input.dispatchKeyEvent", {
                 "type": "keyDown", "key": "a", "code": "KeyA",
                 "modifiers": 2  # Ctrl
@@ -6075,16 +6288,16 @@ class CDPWorker(QThread):
             await cdp.send("Input.insertText", {"text": chosen})
             await asyncio.sleep(0.5)
 
-        # ════════════════════════════════════════════
-        #  BƯỚC 6: Gửi comment (Enter / Click nút Post)
-        # ════════════════════════════════════════════
-        self.status_update.emit(f"📤 Video #{video_idx}: Gửi comment...", "blue")
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 6: Gá»­i comment (Enter / Click nÃºt Post)
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        self.status_update.emit(f"ðŸ“¤ Video #{video_idx}: Gá»­i comment...", "blue")
         comment_sent = False
 
-        # Cách 1: Tìm nút Post/Đăng và click
+        # CÃ¡ch 1: TÃ¬m nÃºt Post/ÄÄƒng vÃ  click
         send_pos = await cdp.evaluate("""
         (() => {
-            // Nút Post chính thức
+            // NÃºt Post chÃ­nh thá»©c
             const sels = [
                 '[data-e2e="comment-post"]',
                 'div[data-e2e="comment-post"]',
@@ -6103,17 +6316,17 @@ class CDPWorker(QThread):
                         return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), method: 'selector'};
                 }
             }
-            // Tìm nút có text "Post" hoặc "Đăng" gần ô comment
+            // TÃ¬m nÃºt cÃ³ text "Post" hoáº·c "ÄÄƒng" gáº§n Ã´ comment
             const btns = document.querySelectorAll('button, div[role="button"], span[role="button"]');
             for (const btn of btns) {
                 const text = (btn.textContent || '').trim();
                 const r = btn.getBoundingClientRect();
                 if (r.width > 0 && r.height > 0 && r.y > 400) {
-                    if (text === 'Post' || text === 'Đăng' || text === 'Gửi' || text === 'Send')
+                    if (text === 'Post' || text === 'ÄÄƒng' || text === 'Gá»­i' || text === 'Send')
                         return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), method: 'text'};
                 }
             }
-            // Nút icon gửi (arrow/send icon) ở cuối ô comment
+            // NÃºt icon gá»­i (arrow/send icon) á»Ÿ cuá»‘i Ã´ comment
             const icons = document.querySelectorAll(
                 'svg[class*="send"], svg[class*="Send"], svg[class*="post"], svg[class*="Post"],' +
                 ' [class*="SendIcon"], [class*="sendIcon"]'
@@ -6128,14 +6341,14 @@ class CDPWorker(QThread):
         """)
 
         if send_pos:
-            self.status_update.emit(f"📤 Click nút Post ({send_pos.get('method','')})", "blue")
+            self.status_update.emit(f"ðŸ“¤ Click nÃºt Post ({send_pos.get('method','')})", "blue")
             await self._human_move_and_click(cdp, send_pos['x'], send_pos['y'], "Post comment")
             comment_sent = True
         else:
-            # Cách 2: Enter key trên contenteditable — gửi comment
-            self.status_update.emit("📤 Enter để gửi comment...", "blue")
+            # CÃ¡ch 2: Enter key trÃªn contenteditable â€” gá»­i comment
+            self.status_update.emit("ðŸ“¤ Enter Ä‘á»ƒ gá»­i comment...", "blue")
 
-            # Focus lại ô comment trước khi Enter
+            # Focus láº¡i Ã´ comment trÆ°á»›c khi Enter
             await cdp.evaluate("""
             (() => {
                 const ce = document.querySelector(
@@ -6149,7 +6362,7 @@ class CDPWorker(QThread):
             """)
             await asyncio.sleep(0.2)
 
-            # Gửi Enter đầy đủ tham số
+            # Gá»­i Enter Ä‘áº§y Ä‘á»§ tham sá»‘
             for key_type in ["rawKeyDown", "keyDown"]:
                 await cdp.send("Input.dispatchKeyEvent", {
                     "type": key_type,
@@ -6167,10 +6380,10 @@ class CDPWorker(QThread):
             })
             comment_sent = True
 
-        # Cách 3 (backup): JS Enter event trực tiếp trên contenteditable
+        # CÃ¡ch 3 (backup): JS Enter event trá»±c tiáº¿p trÃªn contenteditable
         if comment_sent:
             await asyncio.sleep(0.3)
-            # Kiểm tra nếu text vẫn còn trong ô → Enter chưa gửi được → dispatch JS event
+            # Kiá»ƒm tra náº¿u text váº«n cÃ²n trong Ã´ â†’ Enter chÆ°a gá»­i Ä‘Æ°á»£c â†’ dispatch JS event
             still_has_text = await cdp.evaluate("""
             (() => {
                 const ce = document.querySelector(
@@ -6182,7 +6395,7 @@ class CDPWorker(QThread):
                 if (ce) {
                     const t = (ce.innerText || ce.textContent || '').trim();
                     if (t.length > 0) {
-                        // Text vẫn còn → Enter chưa gửi → dispatch JS event
+                        // Text váº«n cÃ²n â†’ Enter chÆ°a gá»­i â†’ dispatch JS event
                         ce.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true}));
                         ce.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true}));
                         ce.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true}));
@@ -6194,26 +6407,26 @@ class CDPWorker(QThread):
             })()
             """)
             if still_has_text == 'retried':
-                self.status_update.emit("📤 Retry Enter (JS event)...", "blue")
+                self.status_update.emit("ðŸ“¤ Retry Enter (JS event)...", "blue")
 
-        # ════════════════════════════════════════════
-        #  BƯỚC 7: Verify + Detect Rate Limit
-        # ════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 7: Verify + Detect Rate Limit
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         await asyncio.sleep(random.uniform(2.0, 3.0))
 
-        # Kiểm tra rate limit trước
+        # Kiá»ƒm tra rate limit trÆ°á»›c
         rate_limited = await cdp.evaluate("""
         (() => {
             const body = (document.body.innerText || '').toLowerCase();
             const phrases = [
                 'commenting too fast', 'too frequently', 'try again later',
                 'comment failed', 'unable to post', "can't post",
-                'bình luận quá nhanh', 'thử lại sau', 'bình luận thất bại'
+                'bÃ¬nh luáº­n quÃ¡ nhanh', 'thá»­ láº¡i sau', 'bÃ¬nh luáº­n tháº¥t báº¡i'
             ];
             for (const p of phrases) {
                 if (body.includes(p)) return true;
             }
-            // Kiểm tra toast/popup lỗi
+            // Kiá»ƒm tra toast/popup lá»—i
             const toasts = document.querySelectorAll(
                 '[class*="Toast"], [class*="toast"], [role="alert"],' +
                 ' [class*="Snackbar"], [class*="Notification"]'
@@ -6231,14 +6444,14 @@ class CDPWorker(QThread):
         if rate_limited:
             cooldown = random.randint(60, 120)
             self.status_update.emit(
-                f"🚫 Video #{video_idx}: TikTok rate limit! Tạm dừng comment {cooldown}s...", "orange"
+                f"ðŸš« Video #{video_idx}: TikTok rate limit! Táº¡m dá»«ng comment {cooldown}s...", "orange"
             )
             self._comment_cooldown = True
             await asyncio.sleep(cooldown)
             self._comment_cooldown = False
             return
 
-        # Verify: kiểm tra comment đã xuất hiện trong DOM chưa
+        # Verify: kiá»ƒm tra comment Ä‘Ã£ xuáº¥t hiá»‡n trong DOM chÆ°a
         check_text = chosen[:20].replace("'", "\\'")
         verified = await cdp.evaluate(f"""
         (() => {{
@@ -6257,40 +6470,40 @@ class CDPWorker(QThread):
         """) or False
 
         if verified:
-            self.status_update.emit(f"✅ Video #{video_idx}: Comment thành công!", "green")
+            self.status_update.emit(f"âœ… Video #{video_idx}: Comment thÃ nh cÃ´ng!", "green")
         else:
             self.status_update.emit(
-                f"⚠️ Video #{video_idx}: Đã gửi nhưng chưa thấy xuất hiện (có thể bị lọc)", "orange"
+                f"âš ï¸ Video #{video_idx}: ÄÃ£ gá»­i nhÆ°ng chÆ°a tháº¥y xuáº¥t hiá»‡n (cÃ³ thá»ƒ bá»‹ lá»c)", "orange"
             )
 
-    # ════════════════════════════════════════════════════════════════
-    #  FEED INTERACTION — Luồng chính
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    #  FEED INTERACTION â€” Luá»“ng chÃ­nh
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     async def _do_feed_interaction(self, cdp):
-        """Nuôi nick Feed — tương tác như người thật."""
+        """NuÃ´i nick Feed â€” tÆ°Æ¡ng tÃ¡c nhÆ° ngÆ°á»i tháº­t."""
         try:
             feed_type = int(self.feed_settings.get('feed_type', 1))
         except (TypeError, ValueError):
             feed_type = 1
         if feed_type == 0:
-            self.status_update.emit("⚠️ Feed đang tắt trong cài đặt, không chạy tương tác.", "orange")
+            self.status_update.emit("âš ï¸ Feed Ä‘ang táº¯t trong cÃ i Ä‘áº·t, khÃ´ng cháº¡y tÆ°Æ¡ng tÃ¡c.", "orange")
             return False
 
         if not await self._wait_captcha_clear_for_action(cdp, "Feed start"):
             return False
 
-        # Chỉ persist session hiện tại; không bơm cookie DB vào phiên GoLogin đang chạy.
+        # Chá»‰ persist session hiá»‡n táº¡i; khÃ´ng bÆ¡m cookie DB vÃ o phiÃªn GoLogin Ä‘ang cháº¡y.
         await self._persist_tiktok_cookies(cdp)
 
         if feed_type == 1:
-            # ── Kiểm tra đã ở foryou chưa — nếu rồi thì KHÔNG click Home ──
+            # â”€â”€ Kiá»ƒm tra Ä‘Ã£ á»Ÿ foryou chÆ°a â€” náº¿u rá»“i thÃ¬ KHÃ”NG click Home â”€â”€
             current_path = await cdp.evaluate("location.pathname") or ""
             if current_path in ('/', '/foryou') or current_path.startswith('/foryou'):
-                self.status_update.emit("🏠 Đã ở trang For You — bắt đầu xem video", "blue")
+                self.status_update.emit("ðŸ  ÄÃ£ á»Ÿ trang For You â€” báº¯t Ä‘áº§u xem video", "blue")
             else:
-                # Chỉ click Home khi CHƯA ở foryou
-                self.status_update.emit("🏠 Click vào icon Home...", "blue")
+                # Chá»‰ click Home khi CHÆ¯A á»Ÿ foryou
+                self.status_update.emit("ðŸ  Click vÃ o icon Home...", "blue")
                 home_pos = await cdp.evaluate("""
                 (() => {
                     const hrefs = ['/', '/foryou', '/?'];
@@ -6325,18 +6538,18 @@ class CDPWorker(QThread):
                     home_pos = (home_pos['x'], home_pos['y'])
 
                 if home_pos:
-                    await self._human_move_and_click(cdp, *home_pos, "Click icon 🏠 Home")
+                    await self._human_move_and_click(cdp, *home_pos, "Click icon ðŸ  Home")
                     await asyncio.sleep(random.uniform(2.5, 4.0))
                 else:
-                    self.status_update.emit("⚠️ Không tìm thấy icon Home", "orange")
+                    self.status_update.emit("âš ï¸ KhÃ´ng tÃ¬m tháº¥y icon Home", "orange")
                     await self._navigate_like_human(cdp, "tiktok.com/foryou", wait=random.uniform(3.0, 4.5))
 
         else:
-            # ── Click icon 🧭 Explore (la bàn) trên sidebar ───────────
-            self.status_update.emit("🧭 Click vào icon Explore...", "blue")
+            # â”€â”€ Click icon ðŸ§­ Explore (la bÃ n) trÃªn sidebar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            self.status_update.emit("ðŸ§­ Click vÃ o icon Explore...", "blue")
             explore_pos = await cdp.evaluate("""
             (() => {
-                // Tìm link Explore trong sidebar theo href
+                // TÃ¬m link Explore trong sidebar theo href
                 const el = document.querySelector('a[href="/explore"], a[href^="/explore?"]');
                 if (el) {
                     const r = el.getBoundingClientRect();
@@ -6349,7 +6562,7 @@ class CDPWorker(QThread):
                     const r = e2e.getBoundingClientRect();
                     if (r.width > 0) return {x: Math.round(r.x+r.width/2), y: Math.round(r.y+r.height/2)};
                 }
-                // Fallback: quét sidebar tìm link /explore
+                // Fallback: quÃ©t sidebar tÃ¬m link /explore
                 const navLinks = document.querySelectorAll(
                     '[class*="sidebar"] a, [class*="SideBar"] a, [class*="SideNav"] a, nav a'
                 );
@@ -6368,23 +6581,23 @@ class CDPWorker(QThread):
                 explore_pos = (explore_pos['x'], explore_pos['y'])
 
             if explore_pos:
-                await self._human_move_and_click(cdp, *explore_pos, "Click icon 🧭 Explore")
+                await self._human_move_and_click(cdp, *explore_pos, "Click icon ðŸ§­ Explore")
                 await asyncio.sleep(random.uniform(2.5, 4.0))
             else:
-                self.status_update.emit("⚠️ Không tìm thấy icon Explore", "orange")
+                self.status_update.emit("âš ï¸ KhÃ´ng tÃ¬m tháº¥y icon Explore", "orange")
                 await self._navigate_like_human(cdp, "tiktok.com/explore", wait=random.uniform(3.0, 4.5))
 
 
 
-        # Số video sẽ xem
+        # Sá»‘ video sáº½ xem
         view_min = int(self.feed_settings.get('view_min', 3) or 3)
         view_max = int(self.feed_settings.get('view_max', 5) or 5)
         if view_min > view_max:
             view_min, view_max = view_max, view_min
         n_videos = random.randint(view_min, view_max)
-        self.status_update.emit(f"📺 Sẽ xem {n_videos} video...", "blue")
+        self.status_update.emit(f"ðŸ“º Sáº½ xem {n_videos} video...", "blue")
 
-        # Tổng thời gian tối thiểu (giây) nếu bật tùy chọn thời gian
+        # Tá»•ng thá»i gian tá»‘i thiá»ƒu (giÃ¢y) náº¿u báº­t tÃ¹y chá»n thá»i gian
         use_time  = self.feed_settings.get('use_time', False)
         time_min = int(self.feed_settings.get('time_min', 3) or 3)
         time_max = int(self.feed_settings.get('time_max', 5) or 5)
@@ -6394,21 +6607,21 @@ class CDPWorker(QThread):
         session_elapsed = 0.0
 
         if feed_type == 2:
-            # ════ EXPLORE: Grid layout → click thumbnail → xem → back ════
+            # â•â•â•â• EXPLORE: Grid layout â†’ click thumbnail â†’ xem â†’ back â•â•â•â•
             feed_completed = await self._watch_explore_feed(cdp, n_videos, use_time, total_time_target)
         else:
-            # ════ FOR YOU: Cuộn dọc từng video ════════════════════════
+            # â•â•â•â• FOR YOU: Cuá»™n dá»c tá»«ng video â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             feed_completed = await self._watch_foryou_feed(cdp, n_videos, use_time, total_time_target)
 
         if feed_completed:
-            self.status_update.emit("✅ Xong Feed!", "green")
+            self.status_update.emit("âœ… Xong Feed!", "green")
         else:
-            self.status_update.emit("⚠️ Feed dừng sớm, chưa đủ mục tiêu đã cài.", "orange")
+            self.status_update.emit("âš ï¸ Feed dá»«ng sá»›m, chÆ°a Ä‘á»§ má»¥c tiÃªu Ä‘Ã£ cÃ i.", "orange")
         return bool(feed_completed)
 
-    # ════════════════════════════════════════════════════════════════
-    #  FOR YOU: cuộn dọc từng video
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    #  FOR YOU: cuá»™n dá»c tá»«ng video
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     async def _get_current_feed_signature(self, cdp) -> str:
         """Return a stable-ish signature for the currently visible TikTok item."""
@@ -6661,15 +6874,15 @@ class CDPWorker(QThread):
                     return r.width > 18 && r.height > 18 && r.top >= 0 && r.left >= 0;
                 };
                 const candidates = Array.from(document.querySelectorAll(
-                    'button[aria-label*="Close" i], button[aria-label*="Đóng" i], ' +
-                    'div[role="button"][aria-label*="Close" i], div[role="button"][aria-label*="Đóng" i], ' +
+                    'button[aria-label*="Close" i], button[aria-label*="ÄÃ³ng" i], ' +
+                    'div[role="button"][aria-label*="Close" i], div[role="button"][aria-label*="ÄÃ³ng" i], ' +
                     'button, div[role="button"]'
                 ));
                 for (const el of candidates) {
                     if (!isVisible(el)) continue;
                     const r = el.getBoundingClientRect();
                     const txt = ((el.innerText || el.textContent || el.getAttribute('aria-label') || '') + '').trim().toLowerCase();
-                    const looksClose = txt === 'x' || txt === '×' || txt.includes('close') || txt.includes('đóng') || txt.includes('dong');
+                    const looksClose = txt === 'x' || txt === 'Ã—' || txt.includes('close') || txt.includes('Ä‘Ã³ng') || txt.includes('dong');
                     if (r.x > window.innerWidth * 0.55 && r.y < window.innerHeight * 0.45 && (looksClose || r.width <= 60))
                         return {x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
                 }
@@ -6678,7 +6891,7 @@ class CDPWorker(QThread):
             """)
             if close_pos and (state.get("commentOpen") or state.get("overlayOpen")):
                 await self._human_move_and_click(
-                    cdp, int(close_pos["x"]), int(close_pos["y"]), "Đóng comment panel"
+                    cdp, int(close_pos["x"]), int(close_pos["y"]), "ÄÃ³ng comment panel"
                 )
                 await asyncio.sleep(random.uniform(0.6, 1.0))
         except Exception:
@@ -6690,7 +6903,7 @@ class CDPWorker(QThread):
 
         state = await _feed_state()
         if "/video/" in str(state.get("path") or ""):
-            self.status_update.emit("↩️ Đang ở trang video, quay lại Feed trước khi chuyển tiếp...", "blue")
+            self.status_update.emit("â†©ï¸ Äang á»Ÿ trang video, quay láº¡i Feed trÆ°á»›c khi chuyá»ƒn tiáº¿p...", "blue")
             try:
                 await cdp.evaluate("window.location.href = 'https://www.tiktok.com/foryou'")
                 await asyncio.sleep(random.uniform(1.5, 2.5))
@@ -6699,7 +6912,7 @@ class CDPWorker(QThread):
 
         state = await _feed_state()
         if "/video/" in str(state.get("path") or ""):
-            self.status_update.emit("🏠 Mở lại For You để thoát trang video...", "orange")
+            self.status_update.emit("ðŸ  Má»Ÿ láº¡i For You Ä‘á»ƒ thoÃ¡t trang video...", "orange")
             try:
                 await self._navigate_like_human(cdp, "tiktok.com/foryou", wait=random.uniform(3.0, 4.5))
             except Exception:
@@ -6727,7 +6940,7 @@ class CDPWorker(QThread):
             focus_pos = await self._get_safe_feed_focus_point(cdp)
             if focus_pos:
                 await self._human_move_and_click(
-                    cdp, int(focus_pos["x"]), int(focus_pos["y"]), "Focus vùng video"
+                    cdp, int(focus_pos["x"]), int(focus_pos["y"]), "Focus vÃ¹ng video"
                 )
                 await asyncio.sleep(random.uniform(0.3, 0.6))
         except Exception:
@@ -6751,7 +6964,7 @@ class CDPWorker(QThread):
                         el.innerText || '',
                         el.textContent || ''
                     ].join(' '));
-                    const looksDown = label.includes('next') || label.includes('down') || label.includes('xuống');
+                    const looksDown = label.includes('next') || label.includes('down') || label.includes('xuá»‘ng');
                     const hasSvg = false; // Do not click generic right-side action buttons by SVG only.
                     if (looksDown || hasSvg) items.push({
                         x: Math.round(r.x + r.width / 2),
@@ -6766,7 +6979,7 @@ class CDPWorker(QThread):
             """)
             if not pos:
                 return False
-            await self._human_move_and_click(cdp, int(pos["x"]), int(pos["y"]), "Click nút xuống")
+            await self._human_move_and_click(cdp, int(pos["x"]), int(pos["y"]), "Click nÃºt xuá»‘ng")
             return True
         except Exception:
             return False
@@ -6822,7 +7035,7 @@ class CDPWorker(QThread):
             before = after_cleanup
 
         for attempt in range(4):
-            self.status_update.emit(f"⬇️ Chuyển sang video #{next_idx}... (lần {attempt + 1})", "blue")
+            self.status_update.emit(f"â¬‡ï¸ Chuyá»ƒn sang video #{next_idx}... (láº§n {attempt + 1})", "blue")
             if attempt == 0:
                 await cdp.send("Input.dispatchKeyEvent", {
                     "type": "keyDown", "key": "ArrowDown", "code": "ArrowDown",
@@ -6867,10 +7080,10 @@ class CDPWorker(QThread):
             await asyncio.sleep(random.uniform(2.0, 3.0))
             after = await self._get_current_feed_signature(cdp)
             if after and after != before:
-                self.status_update.emit(f"✅ Đã chuyển sang video #{next_idx}", "green")
+                self.status_update.emit(f"âœ… ÄÃ£ chuyá»ƒn sang video #{next_idx}", "green")
                 return True
 
-        self.status_update.emit("🏠 Không xác nhận được video đổi, mở lại For You để tiếp tục...", "orange")
+        self.status_update.emit("ðŸ  KhÃ´ng xÃ¡c nháº­n Ä‘Æ°á»£c video Ä‘á»•i, má»Ÿ láº¡i For You Ä‘á»ƒ tiáº¿p tá»¥c...", "orange")
         if await self._is_foryou_feed_usable(cdp):
             self.status_update.emit("Feed van dung duoc nhung khong xac nhan duoc chu ky video, tiep tuc de tranh dung phien.", "orange")
             return True
@@ -6880,15 +7093,15 @@ class CDPWorker(QThread):
             await self._close_comment_panel_and_focus_video(cdp)
             after = await self._get_current_feed_signature(cdp)
             if after and after != before:
-                self.status_update.emit(f"✅ Đã khôi phục Feed và chuyển tiếp video #{next_idx}", "green")
+                self.status_update.emit(f"âœ… ÄÃ£ khÃ´i phá»¥c Feed vÃ  chuyá»ƒn tiáº¿p video #{next_idx}", "green")
                 return True
             if await self._is_foryou_feed_usable(cdp):
-                self.status_update.emit("⚠️ Feed vẫn dùng được nhưng không xác nhận được chữ ký video, tiếp tục để tránh dừng phiên.", "orange")
+                self.status_update.emit("âš ï¸ Feed váº«n dÃ¹ng Ä‘Æ°á»£c nhÆ°ng khÃ´ng xÃ¡c nháº­n Ä‘Æ°á»£c chá»¯ kÃ½ video, tiáº¿p tá»¥c Ä‘á»ƒ trÃ¡nh dá»«ng phiÃªn.", "orange")
                 return True
         except Exception:
             pass
 
-        self.status_update.emit("⚠️ Không xác nhận được video đã đổi — dừng để tránh log ảo", "orange")
+        self.status_update.emit("âš ï¸ KhÃ´ng xÃ¡c nháº­n Ä‘Æ°á»£c video Ä‘Ã£ Ä‘á»•i â€” dá»«ng Ä‘á»ƒ trÃ¡nh log áº£o", "orange")
         return False
 
     async def _advance_foryou_video(self, cdp, next_idx: int, seen_identities=None) -> bool:
@@ -6927,25 +7140,25 @@ class CDPWorker(QThread):
         return False
 
     async def _watch_foryou_feed(self, cdp, n_videos: int, use_time: bool, time_target: int) -> bool:
-        _session_start = time.time()  # ★ Thời gian bắt đầu thực tế
+        _session_start = time.time()  # â˜… Thá»i gian báº¯t Ä‘áº§u thá»±c táº¿
         session_elapsed = 0.0
         skipped = 0
         seen_identities = set()
         duplicate_retries = 0
 
-        # ★ Nếu user bật comment → giảm skip rate để đảm bảo comment hoạt động
+        # â˜… Náº¿u user báº­t comment â†’ giáº£m skip rate Ä‘á»ƒ Ä‘áº£m báº£o comment hoáº¡t Ä‘á»™ng
         has_comment = self.feed_settings.get('clone_cmt', 0) > 0
         skip_rate = 0.10 if has_comment else 0.40
 
-        # ★ Khi bật use_time: xem đến khi ĐỦ THỜI GIAN (không giới hạn số video)
-        # Khi tắt use_time: xem đúng n_videos rồi dừng
-        max_videos = 50 if use_time else n_videos  # Safety cap: tối đa 50 video
+        # â˜… Khi báº­t use_time: xem Ä‘áº¿n khi Äá»¦ THá»œI GIAN (khÃ´ng giá»›i háº¡n sá»‘ video)
+        # Khi táº¯t use_time: xem Ä‘Ãºng n_videos rá»“i dá»«ng
+        max_videos = 50 if use_time else n_videos  # Safety cap: tá»‘i Ä‘a 50 video
         i = 0
         finish_grace_seconds = 12
 
         if use_time:
             self.status_update.emit(
-                f"📺 Sẽ xem tối thiểu {n_videos} video, mục tiêu {time_target//60} phút", "blue"
+                f"ðŸ“º Sáº½ xem tá»‘i thiá»ƒu {n_videos} video, má»¥c tiÃªu {time_target//60} phÃºt", "blue"
             )
 
         while i < max_videos:
@@ -6954,17 +7167,17 @@ class CDPWorker(QThread):
             if not await self._wait_captcha_clear_for_action(cdp, f"Feed video #{i+1}"):
                 return False
 
-            # ── Kiểm tra đã đủ thời gian chưa ──
+            # â”€â”€ Kiá»ƒm tra Ä‘Ã£ Ä‘á»§ thá»i gian chÆ°a â”€â”€
             session_elapsed = time.time() - _session_start
             if use_time and session_elapsed >= time_target:
                 self.status_update.emit(
-                    f"✅ Đủ {session_elapsed/60:.1f}/{time_target//60} phút sau {i} video!", "green"
+                    f"âœ… Äá»§ {session_elapsed/60:.1f}/{time_target//60} phÃºt sau {i} video!", "green"
                 )
                 return True
             elif not use_time and i >= n_videos:
                 return True
 
-            # ── Random skip — video đầu KHÔNG BAO GIỜ skip ──
+            # â”€â”€ Random skip â€” video Ä‘áº§u KHÃ”NG BAO GIá»œ skip â”€â”€
             if use_time and (time_target - session_elapsed) <= finish_grace_seconds:
                 remaining_wait = max(0.0, time_target - session_elapsed)
                 if remaining_wait > 0:
@@ -6992,27 +7205,27 @@ class CDPWorker(QThread):
             if i > 0 and random.random() < skip_rate:
                 skipped += 1
                 skip_glance = random.uniform(1.0, 3.0)
-                remaining = f" | Còn {(time_target - session_elapsed)/60:.1f}p" if use_time else ""
+                remaining = f" | CÃ²n {(time_target - session_elapsed)/60:.1f}p" if use_time else ""
                 self.status_update.emit(
-                    f"⏩ Video #{i+1}: Lướt qua ({skip_glance:.1f}s){remaining}", "blue"
+                    f"â© Video #{i+1}: LÆ°á»›t qua ({skip_glance:.1f}s){remaining}", "blue"
                 )
                 await asyncio.sleep(skip_glance)
             else:
                 session_elapsed = time.time() - _session_start
-                remaining = f" | Còn {(time_target - session_elapsed)/60:.1f}p" if use_time else ""
+                remaining = f" | CÃ²n {(time_target - session_elapsed)/60:.1f}p" if use_time else ""
                 self.status_update.emit(
-                    f"🎬 Video #{i+1} — Đang xem...{remaining}", "blue"
+                    f"ðŸŽ¬ Video #{i+1} â€” Äang xem...{remaining}", "blue"
                 )
 
                 # Xem video
                 await self._watch_current_video(cdp, i + 1)
 
-                # Kiểm tra thời gian TRƯỚC KHI tương tác (tránh lố)
+                # Kiá»ƒm tra thá»i gian TRÆ¯á»šC KHI tÆ°Æ¡ng tÃ¡c (trÃ¡nh lá»‘)
                 session_elapsed = time.time() - _session_start
                 if use_time and session_elapsed >= time_target:
                     break
 
-                # Tương tác (chỉ khi xem, không tương tác video skip)
+                # TÆ°Æ¡ng tÃ¡c (chá»‰ khi xem, khÃ´ng tÆ°Æ¡ng tÃ¡c video skip)
                 if use_time and (time_target - session_elapsed) <= finish_grace_seconds:
                     remaining_wait = max(0.0, time_target - session_elapsed)
                     if remaining_wait > 0:
@@ -7029,7 +7242,7 @@ class CDPWorker(QThread):
             session_elapsed = time.time() - _session_start
             if use_time and session_elapsed >= time_target:
                 self.status_update.emit(
-                    f"✅ Đủ {session_elapsed/60:.1f}/{time_target//60} phút sau {i} video!", "green"
+                    f"âœ… Äá»§ {session_elapsed/60:.1f}/{time_target//60} phÃºt sau {i} video!", "green"
                 )
                 return True
             if not use_time and i >= n_videos:
@@ -7058,25 +7271,25 @@ class CDPWorker(QThread):
             if session_elapsed >= time_target:
                 return True
             self.status_update.emit(
-                f"⚠️ Feed chạm giới hạn {max_videos} video nhưng chưa đủ {time_target//60} phút.",
+                f"âš ï¸ Feed cháº¡m giá»›i háº¡n {max_videos} video nhÆ°ng chÆ°a Ä‘á»§ {time_target//60} phÃºt.",
                 "orange",
             )
             return False
         return i >= n_videos
 
-    # ════════════════════════════════════════════════════════════════
-    #  EXPLORE: click thumbnail → xem full → back về grid
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    #  EXPLORE: click thumbnail â†’ xem full â†’ back vá» grid
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     async def _watch_explore_feed(self, cdp, n_videos: int, use_time: bool, time_target: int) -> bool:
-        _session_start = time.time()  # ★ FIX: dùng real wall-clock time
-        clicked_indices: set = set()
+        _session_start = time.time()  # â˜… FIX: dÃ¹ng real wall-clock time
+        opened_hrefs: set = set()
         processed = 0
 
         max_videos = 50 if use_time else n_videos
         if use_time:
             self.status_update.emit(
-                f"📺 Explore: sẽ xem tối thiểu {n_videos} video, mục tiêu {time_target//60} phút", "blue"
+                f"ðŸ“º Explore: sáº½ xem tá»‘i thiá»ƒu {n_videos} video, má»¥c tiÃªu {time_target//60} phÃºt", "blue"
             )
 
         for i in range(max_videos):
@@ -7084,77 +7297,61 @@ class CDPWorker(QThread):
                 return False
             if not await self._wait_captcha_clear_for_action(cdp, f"Explore video #{i+1}"):
                 return False
-            session_elapsed = time.time() - _session_start  # ★ FIX: real elapsed
+            session_elapsed = time.time() - _session_start  # â˜… FIX: real elapsed
             if use_time and session_elapsed >= time_target:
-                self.status_update.emit(f"✅ Đủ thời gian Explore ({time_target//60}p), dừng sớm.", "green")
+                self.status_update.emit(f"âœ… Äá»§ thá»i gian Explore ({time_target//60}p), dá»«ng sá»›m.", "green")
                 return True
             if not use_time and processed >= n_videos:
                 return True
 
-            # Lấy danh sách thumbnail trên trang Explore
-            thumbnails = await cdp.evaluate("""
-            (() => {
-                const items = document.querySelectorAll(
-                    '[data-e2e="explore-item"], '+
-                    'div[class*="DivVideoCard"] a, '+
-                    'div[class*="video-card"] a, '+
-                    'a[href*="/video/"]'
-                );
-                const result = [];
-                for (const el of items) {
-                    const r = el.getBoundingClientRect();
-                    if (r.width > 50 && r.height > 50 && r.top >= 0 && r.bottom <= window.innerHeight + 200)
-                        result.push({x: Math.round(r.x+r.width/2), y: Math.round(r.y+r.height/2)});
-                }
-                return result;
-            })()
-            """) or []
+            cards = await self._collect_explore_video_cards(cdp, opened_hrefs)
 
-            # Nếu ít thumbnail hoặc đã click hết → scroll xuống load thêm
-            if len(thumbnails) < 3:
+            # Náº¿u Ã­t thumbnail hoáº·c Ä‘Ã£ click háº¿t â†’ scroll xuá»‘ng load thÃªm
+            if len(cards) < 3:
                 await cdp.scroll(400, 400, 0, random.randint(400, 700))
                 await asyncio.sleep(2)
                 continue
 
-            # Chọn ngẫu nhiên 1 thumbnail chưa click
-            available = [t for idx, t in enumerate(thumbnails) if idx not in clicked_indices]
-            if not available:
-                # Reset và scroll thêm
-                clicked_indices.clear()
+            if not cards:
+                opened_hrefs.clear()
                 await cdp.scroll(400, 400, 0, random.randint(600, 900))
                 await asyncio.sleep(2)
                 continue
 
-            chosen = random.choice(available)
-            clicked_indices.add(thumbnails.index(chosen))
+            chosen = random.choice(cards)
             current_idx = processed + 1
 
-            self.status_update.emit(f"🎬 Explore #{current_idx}/{n_videos} — Click vào video...", "blue")
-            await self._human_move_and_click(cdp, chosen['x'], chosen['y'], "Click thumbnail Explore")
-            await asyncio.sleep(random.uniform(2.0, 3.0))
+            self.status_update.emit(f"ðŸŽ¬ Explore #{current_idx}/{n_videos} â€” Má»Ÿ video...", "blue")
+            if not await self._open_explore_card(cdp, chosen, current_idx):
+                self.status_update.emit("âš ï¸ KhÃ´ng má»Ÿ Ä‘Æ°á»£c video Explore, bá» qua item nÃ y.", "orange")
+                await asyncio.sleep(random.uniform(0.5, 0.9))
+                continue
+            href = (chosen.get("href") or "").strip()
+            if href:
+                opened_hrefs.add(href)
 
-            # Xem video đang phát
+            # Xem video Ä‘ang phÃ¡t
             elapsed = await self._watch_current_video(cdp, current_idx)
             # session_elapsed now computed from wall-clock time (line above)
 
-            # Tương tác (like, follow, comment...)
+            # TÆ°Æ¡ng tÃ¡c (like, follow, comment...)
             await self._interact_current_video(cdp, current_idx)
             processed += 1
 
             if not await self._wait_captcha_clear_for_action(cdp, f"Explore back #{current_idx}"):
                 return False
 
-            # Nhấn Back về trang Explore (nút trình duyệt hoặc Escape)
-            self.status_update.emit("↩️ Quay về Explore...", "blue")
+            # Nháº¥n Back vá» trang Explore (nÃºt trÃ¬nh duyá»‡t hoáº·c Escape)
+            self.status_update.emit("â†©ï¸ Quay vá» Explore...", "blue")
             await cdp.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Escape"})
             await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp",   "key": "Escape"})
             await asyncio.sleep(0.3)
-            # Dùng History.back() để quay về grid
+            # DÃ¹ng History.back() Ä‘á»ƒ quay vá» grid
             await cdp.evaluate("window.history.back()")
             await asyncio.sleep(random.uniform(2.5, 4.0))
 
             if use_time and (time.time() - _session_start) >= time_target:
-                self.status_update.emit(f"✅ Đủ thời gian ({time_target//60}p), dừng sớm.", "green")
+                self.status_update.emit(f"âœ… Äá»§ thá»i gian ({time_target//60}p), dá»«ng sá»›m.", "green")
                 return True
             if not use_time and processed >= n_videos:
                 return True
@@ -7165,28 +7362,28 @@ class CDPWorker(QThread):
             return (time.time() - _session_start) >= time_target
         return processed >= n_videos
 
-    # ════════════════════════════════════════════════════════════════
-    #  HELPER: Xem video hiện tại (di chuột lờ đờ mượt mà)
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    #  HELPER: Xem video hiá»‡n táº¡i (di chuá»™t lá» Ä‘á» mÆ°á»£t mÃ )
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     async def _watch_current_video(self, cdp, video_idx: int) -> float:
         """
-        Xem video thông minh — detect thời lượng thật và lặp tự nhiên.
-        - LIVE:          xem 5-10s rồi skip
+        Xem video thÃ´ng minh â€” detect thá»i lÆ°á»£ng tháº­t vÃ  láº·p tá»± nhiÃªn.
+        - LIVE:          xem 5-10s rá»“i skip
         - Ads:           xem 5-8s
         - Slideshow:     xem 5-10s
-        - Video ≤ 15s:   lặp 2 lần
-        - Video 15-30s:  lặp 1 lần (xem hết 1 vòng)
-        - Video > 30s:   không lặp (xem hết 1 lần)
-        - Safety:        tối đa 120s
+        - Video â‰¤ 15s:   láº·p 2 láº§n
+        - Video 15-30s:  láº·p 1 láº§n (xem háº¿t 1 vÃ²ng)
+        - Video > 30s:   khÃ´ng láº·p (xem háº¿t 1 láº§n)
+        - Safety:        tá»‘i Ä‘a 120s
         """
         await self._ensure_cursor_dot(cdp)
         if not await self._wait_captcha_clear_for_action(cdp, f"Watch video #{video_idx}"):
             return 0.0
 
-        # ══════════════════════════════════════════
-        #  BƯỚC 1: Đọc thông tin video
-        # ══════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 1: Äá»c thÃ´ng tin video
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         video_info = None
         for _retry in range(3):
             video_info = await cdp.evaluate("""
@@ -7194,7 +7391,7 @@ class CDPWorker(QThread):
                 const v = document.querySelector('video');
                 if (!v) return null;
 
-                // ★ Detect slideshow/photo post
+                // â˜… Detect slideshow/photo post
                 const isSlideshow = !!(
                     document.querySelector('[class*="SlideShow"]') ||
                     document.querySelector('[class*="ImageCarousel"]') ||
@@ -7218,31 +7415,31 @@ class CDPWorker(QThread):
                 break
             await asyncio.sleep(1)
 
-        # ══════════════════════════════════════════
-        #  BƯỚC 2: Quyết định xem bao lâu
-        # ══════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 2: Quyáº¿t Ä‘á»‹nh xem bao lÃ¢u
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         duration = 0
         target_loops = 1
-        use_loop_detect = False  # True = đợi video hết, False = sleep cố định
+        use_loop_detect = False  # True = Ä‘á»£i video háº¿t, False = sleep cá»‘ Ä‘á»‹nh
 
-        # ★ Detect slideshow/ảnh: video paused ngay từ đầu HOẶC có carousel
+        # â˜… Detect slideshow/áº£nh: video paused ngay tá»« Ä‘áº§u HOáº¶C cÃ³ carousel
         is_photo = False
         if video_info:
             is_photo = video_info.get('isSlideshow', False)
             if video_info.get('paused', False) and video_info.get('currentTime', 0) < 0.5:
-                is_photo = True  # Video pause ở đầu = slideshow
+                is_photo = True  # Video pause á»Ÿ Ä‘áº§u = slideshow
 
         if is_photo:
-            # ★ SLIDESHOW / ẢNH → lướt qua nhanh 2-3s
+            # â˜… SLIDESHOW / áº¢NH â†’ lÆ°á»›t qua nhanh 2-3s
             watch_sec = random.uniform(2, 3)
             use_loop_detect = False
             self.status_update.emit(
-                f"🖼️ Video #{video_idx}: Slideshow/Ảnh — lướt qua {watch_sec:.0f}s", "blue"
+                f"ðŸ–¼ï¸ Video #{video_idx}: Slideshow/áº¢nh â€” lÆ°á»›t qua {watch_sec:.0f}s", "blue"
             )
         elif not video_info or not video_info.get('duration'):
             watch_sec = random.uniform(2, 3)
             self.status_update.emit(
-                f"🖼️ Video #{video_idx}: Không có video — lướt qua {watch_sec:.0f}s", "blue"
+                f"ðŸ–¼ï¸ Video #{video_idx}: KhÃ´ng cÃ³ video â€” lÆ°á»›t qua {watch_sec:.0f}s", "blue"
             )
         else:
             duration = video_info['duration']
@@ -7250,63 +7447,63 @@ class CDPWorker(QThread):
             if duration != duration:  # NaN check
                 watch_sec = random.uniform(2, 3)
                 self.status_update.emit(
-                    f"⚠️ Video #{video_idx}: Duration NaN — lướt qua {watch_sec:.0f}s", "orange"
+                    f"âš ï¸ Video #{video_idx}: Duration NaN â€” lÆ°á»›t qua {watch_sec:.0f}s", "orange"
                 )
             elif duration > 1e8 or duration == float('inf'):
-                # ── LIVE STREAM ──
+                # â”€â”€ LIVE STREAM â”€â”€
                 watch_sec = random.uniform(5, 10)
                 self.status_update.emit(
-                    f"🔴 Video #{video_idx}: LIVE — xem {watch_sec:.0f}s", "blue"
+                    f"ðŸ”´ Video #{video_idx}: LIVE â€” xem {watch_sec:.0f}s", "blue"
                 )
             elif duration <= 3:
-                # ── Clip cực ngắn / slideshow ──
+                # â”€â”€ Clip cá»±c ngáº¯n / slideshow â”€â”€
                 watch_sec = random.uniform(2, 3)
                 self.status_update.emit(
-                    f"🖼️ Video #{video_idx}: Clip {duration:.1f}s — lướt qua", "blue"
+                    f"ðŸ–¼ï¸ Video #{video_idx}: Clip {duration:.1f}s â€” lÆ°á»›t qua", "blue"
                 )
             elif duration <= 15:
-                # ── Video ngắn → lặp 2 lần ──
+                # â”€â”€ Video ngáº¯n â†’ láº·p 2 láº§n â”€â”€
                 target_loops = 2
                 watch_sec = duration * target_loops + random.uniform(1, 3)
                 use_loop_detect = True
                 self.status_update.emit(
-                    f"🎬 Video #{video_idx}: {duration:.0f}s × {target_loops} lần", "blue"
+                    f"ðŸŽ¬ Video #{video_idx}: {duration:.0f}s Ã— {target_loops} láº§n", "blue"
                 )
             elif duration <= 30:
-                # ── Video trung bình → xem hết 1 lần ──
+                # â”€â”€ Video trung bÃ¬nh â†’ xem háº¿t 1 láº§n â”€â”€
                 target_loops = 1
                 watch_sec = duration + random.uniform(1, 3)
                 use_loop_detect = True
                 self.status_update.emit(
-                    f"🎬 Video #{video_idx}: {duration:.0f}s × 1 lần", "blue"
+                    f"ðŸŽ¬ Video #{video_idx}: {duration:.0f}s Ã— 1 láº§n", "blue"
                 )
             elif duration <= 60:
-                # ── Video dài 30-60s → xem 50-80% ──
+                # â”€â”€ Video dÃ i 30-60s â†’ xem 50-80% â”€â”€
                 pct = random.uniform(0.5, 0.8)
                 watch_sec = duration * pct
                 watch_sec = max(15, min(watch_sec, 35))
                 use_loop_detect = False
                 self.status_update.emit(
-                    f"🎬 Video #{video_idx}: {duration:.0f}s — xem {watch_sec:.0f}s ({pct*100:.0f}%)", "blue"
+                    f"ðŸŽ¬ Video #{video_idx}: {duration:.0f}s â€” xem {watch_sec:.0f}s ({pct*100:.0f}%)", "blue"
                 )
             else:
-                # ── Video rất dài > 60s → xem 20-40s rồi lướt ──
+                # â”€â”€ Video ráº¥t dÃ i > 60s â†’ xem 20-40s rá»“i lÆ°á»›t â”€â”€
                 watch_sec = random.uniform(20, 40)
                 use_loop_detect = False
                 self.status_update.emit(
-                    f"🎬 Video #{video_idx}: {duration:.0f}s (dài) — xem {watch_sec:.0f}s rồi lướt", "blue"
+                    f"ðŸŽ¬ Video #{video_idx}: {duration:.0f}s (dÃ i) â€” xem {watch_sec:.0f}s rá»“i lÆ°á»›t", "blue"
                 )
 
-        # Safety cap: tối đa 30s mỗi video (tránh lố thời gian)
+        # Safety cap: tá»‘i Ä‘a 30s má»—i video (trÃ¡nh lá»‘ thá»i gian)
         watch_sec = min(watch_sec, 30)
 
-        # ══════════════════════════════════════════
-        #  BƯỚC 3: Xem video + drift chuột
-        # ══════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 3: Xem video + drift chuá»™t
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         elapsed = 0.0
         loops_done = 0
         last_ct = video_info['currentTime'] if video_info else 0
-        stall_count = 0  # Đếm số lần currentTime không đổi (buffer)
+        stall_count = 0  # Äáº¿m sá»‘ láº§n currentTime khÃ´ng Ä‘á»•i (buffer)
 
         while elapsed < watch_sec:
             if self._stop_flag:
@@ -7314,7 +7511,7 @@ class CDPWorker(QThread):
             if not await self._wait_captcha_clear_for_action(cdp, f"Watch video #{video_idx}"):
                 return elapsed
 
-            # Drift chuột mượt (giống người đang xem)
+            # Drift chuá»™t mÆ°á»£t (giá»‘ng ngÆ°á»i Ä‘ang xem)
             cx = getattr(self, '_mouse_x', 400)
             cy = getattr(self, '_mouse_y', 300)
             tx = max(80, min(cx + random.randint(-120, 120), 750))
@@ -7325,7 +7522,7 @@ class CDPWorker(QThread):
             await asyncio.sleep(pause)
             elapsed += pause
 
-            # ── Theo dõi tiến trình video (nếu dùng loop detect) ──
+            # â”€â”€ Theo dÃµi tiáº¿n trÃ¬nh video (náº¿u dÃ¹ng loop detect) â”€â”€
             if use_loop_detect:
                 state = await cdp.evaluate("""
                 (() => {
@@ -7338,78 +7535,78 @@ class CDPWorker(QThread):
                 if state:
                     ct = state['ct']
 
-                    # Video bị pause → đếm, KHÔNG trừ elapsed vô hạn
+                    # Video bá»‹ pause â†’ Ä‘áº¿m, KHÃ”NG trá»« elapsed vÃ´ háº¡n
                     if state['paused']:
                         stall_count += 1
                         if stall_count >= 3:
-                            # Pause quá lâu (slideshow/ảnh) → thoát
+                            # Pause quÃ¡ lÃ¢u (slideshow/áº£nh) â†’ thoÃ¡t
                             self.status_update.emit(
-                                f"🖼️ Video #{video_idx}: Video pause — lướt qua", "blue"
+                                f"ðŸ–¼ï¸ Video #{video_idx}: Video pause â€” lÆ°á»›t qua", "blue"
                             )
                             break
                         continue
 
-                    # Buffering: currentTime đứng yên
+                    # Buffering: currentTime Ä‘á»©ng yÃªn
                     if abs(ct - last_ct) < 0.1:
                         stall_count += 1
                         if stall_count >= 5:
-                            # Buffer quá lâu → thoát
+                            # Buffer quÃ¡ lÃ¢u â†’ thoÃ¡t
                             self.status_update.emit(
-                                f"⚠️ Video #{video_idx}: Buffer quá lâu — bỏ qua", "orange"
+                                f"âš ï¸ Video #{video_idx}: Buffer quÃ¡ lÃ¢u â€” bá» qua", "orange"
                             )
                             break
                     else:
                         stall_count = 0
 
-                    # Detect loop: currentTime nhảy ngược > 1s
+                    # Detect loop: currentTime nháº£y ngÆ°á»£c > 1s
                     if ct < last_ct - 1:
                         loops_done += 1
                         self.status_update.emit(
-                            f"🔄 Video #{video_idx}: Lặp lần {loops_done}/{target_loops}", "blue"
+                            f"ðŸ”„ Video #{video_idx}: Láº·p láº§n {loops_done}/{target_loops}", "blue"
                         )
                         if loops_done >= target_loops:
-                            # Đã xem đủ số lần → dừng
+                            # ÄÃ£ xem Ä‘á»§ sá»‘ láº§n â†’ dá»«ng
                             break
 
                     last_ct = ct
 
-        # ══════════════════════════════════════════
-        #  BƯỚC 4: Kết thúc
-        # ══════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  BÆ¯á»šC 4: Káº¿t thÃºc
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         if use_loop_detect and loops_done > 0:
             self.status_update.emit(
-                f"✅ Video #{video_idx}: Xem xong {loops_done} lần ({elapsed:.0f}s)", "green"
+                f"âœ… Video #{video_idx}: Xem xong {loops_done} láº§n ({elapsed:.0f}s)", "green"
             )
         else:
             self.status_update.emit(
-                f"✅ Video #{video_idx}: Xem {elapsed:.0f}s", "green"
+                f"âœ… Video #{video_idx}: Xem {elapsed:.0f}s", "green"
             )
         return elapsed
 
-    # ════════════════════════════════════════════════════════════════
-    #  HELPER: Tương tác với video hiện tại (Like/Fav/Repost/Follow/Cmt)
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    #  HELPER: TÆ°Æ¡ng tÃ¡c vá»›i video hiá»‡n táº¡i (Like/Fav/Repost/Follow/Cmt)
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     async def _interact_current_video(self, cdp, video_idx: int):
-        """Chạy tất cả tương tác theo tỉ lệ % cho video đang xem."""
+        """Cháº¡y táº¥t cáº£ tÆ°Æ¡ng tÃ¡c theo tá»‰ lá»‡ % cho video Ä‘ang xem."""
         if not await self._wait_captcha_clear_for_action(cdp, f"Interact video #{video_idx}"):
             return
 
-        # ── Phát hiện loại video trước ──
+        # â”€â”€ PhÃ¡t hiá»‡n loáº¡i video trÆ°á»›c â”€â”€
         vtype = await self._detect_video_type(cdp)
-        self.status_update.emit(f"🔍 Video #{video_idx}: type={vtype}", "blue")
+        self.status_update.emit(f"ðŸ” Video #{video_idx}: type={vtype}", "blue")
 
         if vtype == 'live':
-            self.status_update.emit(f"⏭️ Video #{video_idx}: LIVE — bỏ qua tương tác", "orange")
+            self.status_update.emit(f"â­ï¸ Video #{video_idx}: LIVE â€” bá» qua tÆ°Æ¡ng tÃ¡c", "orange")
             return
         if vtype == 'ads':
-            self.status_update.emit(f"⏭️ Video #{video_idx}: Quảng cáo — bỏ qua", "orange")
+            self.status_update.emit(f"â­ï¸ Video #{video_idx}: Quáº£ng cÃ¡o â€” bá» qua", "orange")
             return
         if vtype == 'restricted':
-            self.status_update.emit(f"⏭️ Video #{video_idx}: Bị hạn chế — bỏ qua", "orange")
+            self.status_update.emit(f"â­ï¸ Video #{video_idx}: Bá»‹ háº¡n cháº¿ â€” bá» qua", "orange")
             return
 
-        # ── Roll dice 1 LẦN DUY NHẤT cho mỗi tính năng ──
+        # â”€â”€ Roll dice 1 Láº¦N DUY NHáº¤T cho má»—i tÃ­nh nÄƒng â”€â”€
         do_like_video = self._hit('like_video')
         do_fav_video  = self._hit('fav_video')
         do_repost     = self._hit('repost_video')
@@ -7423,19 +7620,19 @@ class CDPWorker(QThread):
             try:
                 pos = await self._get_center(cdp, '[data-e2e="like-icon"]')
                 if pos:
-                    await self._human_move_and_click(cdp, *pos, f"❤️ Like #{video_idx}")
+                    await self._human_move_and_click(cdp, *pos, f"â¤ï¸ Like #{video_idx}")
                     await asyncio.sleep(random.uniform(0.6, 1.2))
             except Exception:
                 pass
 
-        # Thêm vào yêu thích
+        # ThÃªm vÃ o yÃªu thÃ­ch
         if do_fav_video:
             try:
                 for sel in ['[data-e2e="undefined-icon"]', '[data-e2e="favorite-icon"]',
                             'span[class*="Favorite"]']:
                     pos = await self._get_center(cdp, sel)
                     if pos:
-                        await self._human_move_and_click(cdp, *pos, f"🔖 Yêu thích #{video_idx}")
+                        await self._human_move_and_click(cdp, *pos, f"ðŸ”– YÃªu thÃ­ch #{video_idx}")
                         await asyncio.sleep(random.uniform(0.5, 1.0))
                         break
             except Exception:
@@ -7446,11 +7643,11 @@ class CDPWorker(QThread):
             try:
                 share_pos = await self._get_center(cdp, '[data-e2e="share-icon"]')
                 if share_pos:
-                    await self._human_move_and_click(cdp, *share_pos, "🔁 Mở share")
+                    await self._human_move_and_click(cdp, *share_pos, "ðŸ” Má»Ÿ share")
                     await asyncio.sleep(random.uniform(1.2, 1.8))
                     rp = await self._get_center_by_text(cdp, "Repost")
                     if rp:
-                        await self._human_move_and_click(cdp, *rp, f"🔁 Repost #{video_idx}")
+                        await self._human_move_and_click(cdp, *rp, f"ðŸ” Repost #{video_idx}")
                     await asyncio.sleep(random.uniform(0.8, 1.5))
                     await cdp.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Escape"})
                     await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp",   "key": "Escape"})
@@ -7458,31 +7655,31 @@ class CDPWorker(QThread):
             except Exception:
                 pass
 
-        # Follow kênh
+        # Follow kÃªnh
         if do_follow:
             try:
                 for sel in ['[data-e2e="follow-button"]', 'button[class*="follow"]']:
                     pos = await self._get_center(cdp, sel)
                     if pos:
-                        await self._human_move_and_click(cdp, *pos, f"➕ Follow #{video_idx}")
+                        await self._human_move_and_click(cdp, *pos, f"âž• Follow #{video_idx}")
                         await asyncio.sleep(random.uniform(0.8, 1.5))
                         break
             except Exception:
                 pass
 
-        # ── Tương tác comment (dùng kết quả đã roll ở trên) ──
+        # â”€â”€ TÆ°Æ¡ng tÃ¡c comment (dÃ¹ng káº¿t quáº£ Ä‘Ã£ roll á»Ÿ trÃªn) â”€â”€
         need_comment = do_clone_cmt or do_like_cmt or do_view_more
 
         if need_comment:
             self.status_update.emit(
-                f"💬 Video #{video_idx}: Cần comment (clone={do_clone_cmt}, like={do_like_cmt}, view={do_view_more})",
+                f"ðŸ’¬ Video #{video_idx}: Cáº§n comment (clone={do_clone_cmt}, like={do_like_cmt}, view={do_view_more})",
                 "blue"
             )
-            # Cho phép comment cả khi vtype='no_comment' — thử mở panel dù sao
-            # Vì _detect_video_type có thể nhận diện sai trên ForYou feed
+            # Cho phÃ©p comment cáº£ khi vtype='no_comment' â€” thá»­ má»Ÿ panel dÃ¹ sao
+            # VÃ¬ _detect_video_type cÃ³ thá»ƒ nháº­n diá»‡n sai trÃªn ForYou feed
             opened = await self._open_comment_panel(cdp)
             if opened:
-                # Chờ panel render đầy đủ
+                # Chá» panel render Ä‘áº§y Ä‘á»§
                 await asyncio.sleep(random.uniform(1.0, 1.5))
 
                 if do_like_cmt:
@@ -7492,57 +7689,57 @@ class CDPWorker(QThread):
                 if do_clone_cmt:
                     await self._clone_comment(cdp, video_idx)
 
-                # Đóng panel comment
+                # ÄÃ³ng panel comment
                 await cdp.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Escape"})
                 await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp",   "key": "Escape"})
                 await asyncio.sleep(random.uniform(0.5, 1.0))
             else:
-                self.status_update.emit(f"⚠️ Video #{video_idx}: Không mở được panel comment", "orange")
+                self.status_update.emit(f"âš ï¸ Video #{video_idx}: KhÃ´ng má»Ÿ Ä‘Æ°á»£c panel comment", "orange")
         else:
             self.status_update.emit(
-                f"🎲 Video #{video_idx}: Không trúng tỉ lệ comment (clone_cmt={self.feed_settings.get('clone_cmt',0)}%)",
+                f"ðŸŽ² Video #{video_idx}: KhÃ´ng trÃºng tá»‰ lá»‡ comment (clone_cmt={self.feed_settings.get('clone_cmt',0)}%)",
                 "blue"
             )
 
 
 
 
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     #  KEYWORD INTERACTION
-    # ════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     async def _do_keyword_interaction(self, cdp):
         """
-        ════════════════════════════════════════════════════════════
-        TƯƠNG TÁC THEO TỪ KHÓA — Luồng 4 giai đoạn (Human-like)
-        ════════════════════════════════════════════════════════════
-        GĐ1: Khởi động → Tìm Search Box → Gõ từng ký tự keyword → Enter
-        GĐ2: Click video đầu tiên → Chuyển sang Theater Mode (nền đen)
-        GĐ3: Vòng lặp nuôi nick: Xem video + Like/Fav + ArrowDown
-        GĐ4: Đóng gói — Thoát Theater Mode, trả kết quả
+        â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        TÆ¯Æ NG TÃC THEO Tá»ª KHÃ“A â€” Luá»“ng 4 giai Ä‘oáº¡n (Human-like)
+        â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        GÄ1: Khá»Ÿi Ä‘á»™ng â†’ TÃ¬m Search Box â†’ GÃµ tá»«ng kÃ½ tá»± keyword â†’ Enter
+        GÄ2: Click video Ä‘áº§u tiÃªn â†’ Chuyá»ƒn sang Theater Mode (ná»n Ä‘en)
+        GÄ3: VÃ²ng láº·p nuÃ´i nick: Xem video + Like/Fav + ArrowDown
+        GÄ4: ÄÃ³ng gÃ³i â€” ThoÃ¡t Theater Mode, tráº£ káº¿t quáº£
         """
         if not await self._wait_captcha_clear_for_action(cdp, "Keyword start"):
             return False
 
-        # ── Lấy danh sách từ khóa từ cài đặt ──
+        # â”€â”€ Láº¥y danh sÃ¡ch tá»« khÃ³a tá»« cÃ i Ä‘áº·t â”€â”€
         keywords = self.feed_settings.get('keywords', [])
         if not keywords:
-            self.status_update.emit("⚠️ Chưa có từ khóa. Hãy vào Cài đặt để thêm!", "orange")
+            self.status_update.emit("âš ï¸ ChÆ°a cÃ³ tá»« khÃ³a. HÃ£y vÃ o CÃ i Ä‘áº·t Ä‘á»ƒ thÃªm!", "orange")
             return False
 
-        # ── Lấy cấu hình số video xem mỗi từ khóa ──
+        # â”€â”€ Láº¥y cáº¥u hÃ¬nh sá»‘ video xem má»—i tá»« khÃ³a â”€â”€
         kw_min = int(self.feed_settings.get('keyword_min_videos', 3) or 3)
         kw_max = int(self.feed_settings.get('keyword_max_videos', 8) or 8)
         if kw_min > kw_max:
             kw_min, kw_max = kw_max, kw_min
 
         self.status_update.emit(
-            f"🔍 Bắt đầu tìm kiếm {len(keywords)} từ khóa ({kw_min}-{kw_max} video/từ khóa)", "blue"
+            f"ðŸ” Báº¯t Ä‘áº§u tÃ¬m kiáº¿m {len(keywords)} tá»« khÃ³a ({kw_min}-{kw_max} video/tá»« khÃ³a)", "blue"
         )
 
-        # ════════════════════════════════════════════════════
-        #  LOOP QUA TỪNG TỪ KHÓA
-        # ════════════════════════════════════════════════════
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        #  LOOP QUA Tá»ªNG Tá»ª KHÃ“A
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
         completed_keywords = 0
         for kw_idx, keyword in enumerate(keywords):
             if self._stop_flag:
@@ -7551,33 +7748,33 @@ class CDPWorker(QThread):
                 break
 
             self.status_update.emit(
-                f"🔍 [{kw_idx+1}/{len(keywords)}] Từ khóa: \"{keyword}\"", "blue"
+                f"ðŸ” [{kw_idx+1}/{len(keywords)}] Tá»« khÃ³a: \"{keyword}\"", "blue"
             )
 
             try:
                 success = await self._search_and_interact_one_keyword(cdp, keyword, kw_min, kw_max, kw_idx + 1, len(keywords))
                 if not success:
                     self.status_update.emit(
-                        f"⚠️ Từ khóa \"{keyword[:20]}\" không thành công — tiếp tục từ khóa kế", "orange"
+                        f"âš ï¸ Tá»« khÃ³a \"{keyword[:20]}\" khÃ´ng thÃ nh cÃ´ng â€” tiáº¿p tá»¥c tá»« khÃ³a káº¿", "orange"
                     )
                 else:
                     completed_keywords += 1
-                # Nghỉ giữa các từ khóa (giống người thật đổi chủ đề)
+                # Nghá»‰ giá»¯a cÃ¡c tá»« khÃ³a (giá»‘ng ngÆ°á»i tháº­t Ä‘á»•i chá»§ Ä‘á»)
                 if kw_idx < len(keywords) - 1 and not self._stop_flag:
                     pause = random.uniform(3, 6)
-                    self.status_update.emit(f"⏸️ Nghỉ {pause:.0f}s trước từ khóa kế...", "blue")
+                    self.status_update.emit(f"â¸ï¸ Nghá»‰ {pause:.0f}s trÆ°á»›c tá»« khÃ³a káº¿...", "blue")
                     await asyncio.sleep(pause)
             except Exception as e:
-                self.status_update.emit(f"❌ Lỗi từ khóa \"{keyword[:20]}\": {str(e)[:50]}", "red")
+                self.status_update.emit(f"âŒ Lá»—i tá»« khÃ³a \"{keyword[:20]}\": {str(e)[:50]}", "red")
                 continue
 
         if self._stop_flag:
             return False
         if completed_keywords <= 0:
-            self.status_update.emit("⚠️ Chưa hoàn tất từ khóa nào.", "orange")
+            self.status_update.emit("âš ï¸ ChÆ°a hoÃ n táº¥t tá»« khÃ³a nÃ o.", "orange")
             return False
 
-        self.status_update.emit("✅ Xong tất cả từ khóa!", "green")
+        self.status_update.emit("âœ… Xong táº¥t cáº£ tá»« khÃ³a!", "green")
         return True
 
     async def _collect_keyword_video_cards(self, cdp, clicked_hrefs: set, limit: int = 10):
@@ -7674,6 +7871,63 @@ class CDPWorker(QThread):
             await asyncio.sleep(0.8)
         return False
 
+    async def _collect_explore_video_cards(self, cdp, opened_hrefs: set, limit: int = 18):
+        """Collect visible Explore cards with href and a safer in-card click point."""
+        cards = await cdp.evaluate(r"""
+        (() => {
+            const result = [];
+            const seen = new Set();
+            const selectors = [
+                '[data-e2e="explore-item"] a[href]',
+                'div[class*="DivVideoCard"] a[href]',
+                'div[class*="video-card"] a[href]',
+                'a[href*="/video/"]',
+                'a[href*="/photo/"]'
+            ];
+            const pickPoint = (el, r) => {
+                const left = Math.max(0, r.left);
+                const top = Math.max(0, r.top);
+                const right = Math.min(window.innerWidth, r.right);
+                const bottom = Math.min(window.innerHeight, r.bottom);
+                const width = Math.max(0, right - left);
+                const height = Math.max(0, bottom - top);
+                if (width < 20 || height < 20) return null;
+                const xs = [0.50, 0.42, 0.58];
+                const ys = [0.34, 0.42, 0.50];
+                for (const py of ys) {
+                    for (const px of xs) {
+                        const x = Math.round(left + width * px);
+                        const y = Math.round(top + height * py);
+                        const topEl = document.elementFromPoint(x, y);
+                        if (topEl && (topEl === el || el.contains(topEl) || topEl.contains(el))) {
+                            return {x, y};
+                        }
+                    }
+                }
+                return {x: Math.round(left + width / 2), y: Math.round(top + Math.min(height * 0.42, height / 2))};
+            };
+
+            for (const sel of selectors) {
+                for (const node of document.querySelectorAll(sel)) {
+                    const a = node.closest('a[href]') || node;
+                    const href = a.href || a.getAttribute('href') || '';
+                    if (!href || (!href.includes('/video/') && !href.includes('/photo/'))) continue;
+                    if (seen.has(href)) continue;
+                    const r = a.getBoundingClientRect();
+                    if (r.width < 60 || r.height < 70) continue;
+                    if (r.bottom < 80 || r.top > window.innerHeight - 20) continue;
+                    const point = pickPoint(a, r);
+                    if (!point) continue;
+                    seen.add(href);
+                    result.push({href, x: point.x, y: point.y, top: r.top});
+                }
+            }
+            result.sort((a, b) => a.top - b.top);
+            return result.slice(0, 24);
+        })()
+        """) or []
+        return [c for c in cards if c.get("href") and c.get("href") not in (opened_hrefs or set())][:limit]
+
     async def _verify_keyword_video_opened(self, cdp, expected_href: str = "", timeout: float = 10) -> bool:
         start = time.time()
         expected_path = ""
@@ -7715,7 +7969,7 @@ class CDPWorker(QThread):
             return False
 
         self.status_update.emit(
-            f"[{kw_num}/{kw_total}] Mở video #{video_idx} bằng URL kết quả...", "blue"
+            f"[{kw_num}/{kw_total}] Má»Ÿ video #{video_idx} báº±ng URL káº¿t quáº£...", "blue"
         )
 
         for attempt in range(2):
@@ -7739,15 +7993,48 @@ class CDPWorker(QThread):
                 return True
 
             self.status_update.emit(
-                f"[{kw_num}/{kw_total}] Video #{video_idx} chưa khớp URL, thử lại ({attempt + 1}/2)", "orange"
+                f"[{kw_num}/{kw_total}] Video #{video_idx} chÆ°a khá»›p URL, thá»­ láº¡i ({attempt + 1}/2)", "orange"
             )
             await asyncio.sleep(random.uniform(0.8, 1.3))
 
         return False
 
+    async def _open_explore_card(self, cdp, card: dict, video_idx: int) -> bool:
+        """Open one Explore card by URL first, then safe-point click as fallback."""
+        href = (card.get("href") or "").strip()
+        if href:
+            for _ in range(2):
+                try:
+                    current_url = await cdp.evaluate("window.location.href") or ""
+                    if current_url.startswith("chrome://") or current_url.startswith("chrome-search://"):
+                        await cdp.navigate("about:blank")
+                        await asyncio.sleep(0.5)
+                    await cdp.evaluate(f"window.location.href = {_json.dumps(href)}")
+                    await asyncio.sleep(random.uniform(3.2, 4.8))
+                except Exception:
+                    try:
+                        await cdp.navigate(href)
+                        await asyncio.sleep(random.uniform(3.8, 5.2))
+                    except Exception:
+                        await asyncio.sleep(random.uniform(0.5, 0.9))
+                        continue
+
+                if await self._verify_keyword_video_opened(cdp, href, timeout=8):
+                    return True
+                await asyncio.sleep(random.uniform(0.5, 0.9))
+
+        x = int(card.get("x") or 0)
+        y = int(card.get("y") or 0)
+        if x > 0 and y > 0:
+            await self._human_move_and_click(cdp, x, y, f"Click thumbnail Explore #{video_idx}")
+            await asyncio.sleep(random.uniform(2.0, 3.0))
+            if await self._verify_keyword_video_opened(cdp, href, timeout=6):
+                return True
+        return False
+
     async def _return_to_keyword_results(self, cdp, keyword: str, kw_num: int, kw_total: int) -> bool:
         """Return to keyword results without browser history, so old videos are not reopened."""
-        self.status_update.emit(f"[{kw_num}/{kw_total}] Tải lại trang kết quả từ khóa...", "blue")
+        self.status_update.emit(f"[{kw_num}/{kw_total}] Táº£i láº¡i trang káº¿t quáº£ tá»« khÃ³a...", "blue")
         try:
             await cdp.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Escape", "code": "Escape"})
             await asyncio.sleep(0.05)
@@ -7759,21 +8046,21 @@ class CDPWorker(QThread):
 
     async def _search_by_clicking(self, cdp, keyword: str) -> bool:
         """
-        Tìm kiếm bằng cách click icon 🔍 kính lúp trên sidebar TikTok.
-        Luồng: Click icon → mở trang search → gõ từ khóa → Enter → chờ kết quả.
+        TÃ¬m kiáº¿m báº±ng cÃ¡ch click icon ðŸ” kÃ­nh lÃºp trÃªn sidebar TikTok.
+        Luá»“ng: Click icon â†’ má»Ÿ trang search â†’ gÃµ tá»« khÃ³a â†’ Enter â†’ chá» káº¿t quáº£.
         """
         try:
             if not await self._wait_captcha_clear_for_action(cdp, f"Search keyword {keyword[:20]}"):
                 return False
-            self.status_update.emit(f"🔍 Click icon kính lúp để tìm: \"{keyword[:25]}\"", "blue")
+            self.status_update.emit(f"ðŸ” Click icon kÃ­nh lÃºp Ä‘á»ƒ tÃ¬m: \"{keyword[:25]}\"", "blue")
 
-            # ═══════════════════════════════════════════════════
-            #  BƯỚC 1: Tìm icon kính lúp 🔍 trên sidebar/header
-            # ═══════════════════════════════════════════════════
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  BÆ¯á»šC 1: TÃ¬m icon kÃ­nh lÃºp ðŸ” trÃªn sidebar/header
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             search_icon_pos = await cdp.evaluate("""
             (() => {
-                // 1. Tìm link Explore/Search trên sidebar (TikTok desktop)
-                //    Icon kính lúp thường là <a> với href="/search" hoặc "/explore"
+                // 1. TÃ¬m link Explore/Search trÃªn sidebar (TikTok desktop)
+                //    Icon kÃ­nh lÃºp thÆ°á»ng lÃ  <a> vá»›i href="/search" hoáº·c "/explore"
                 const searchSelectors = [
                     'a[href="/search"]',
                     'a[href^="/search?"]',
@@ -7789,7 +8076,7 @@ class CDPWorker(QThread):
                     }
                 }
 
-                // 2. Tìm icon SVG kính lúp trong sidebar (quét tất cả link trên sidebar)
+                // 2. TÃ¬m icon SVG kÃ­nh lÃºp trong sidebar (quÃ©t táº¥t cáº£ link trÃªn sidebar)
                 const sidebarLinks = document.querySelectorAll(
                     '[class*="sidebar"] a, [class*="SideBar"] a, [class*="SideNav"] a, ' +
                     'nav a, [class*="Navigation"] a'
@@ -7803,28 +8090,28 @@ class CDPWorker(QThread):
                     }
                 }
 
-                // 3. Tìm icon kính lúp bằng SVG path (TikTok dùng SVG cho icon)
+                // 3. TÃ¬m icon kÃ­nh lÃºp báº±ng SVG path (TikTok dÃ¹ng SVG cho icon)
                 const svgs = document.querySelectorAll('svg');
                 for (const svg of svgs) {
                     const parent = svg.closest('a, button, div[role="button"]');
                     if (!parent) continue;
                     const parentHref = (parent.getAttribute('href') || '').toLowerCase();
                     const ariaLabel = (parent.getAttribute('aria-label') || '').toLowerCase();
-                    if (parentHref.includes('search') || ariaLabel.includes('search') || ariaLabel.includes('tìm')) {
+                    if (parentHref.includes('search') || ariaLabel.includes('search') || ariaLabel.includes('tÃ¬m')) {
                         const r = parent.getBoundingClientRect();
                         if (r.width > 0 && r.height > 0)
                             return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), type: 'svg'};
                     }
                 }
 
-                // 4. Fallback: tìm bất kỳ element nào giống nút search
+                // 4. Fallback: tÃ¬m báº¥t ká»³ element nÃ o giá»‘ng nÃºt search
                 const all = document.querySelectorAll('a, button');
                 for (const el of all) {
                     const r = el.getBoundingClientRect();
-                    if (r.width < 10 || r.height < 10 || r.x > 150) continue; // Sidebar thường ở trái, x < 150
+                    if (r.width < 10 || r.height < 10 || r.x > 150) continue; // Sidebar thÆ°á»ng á»Ÿ trÃ¡i, x < 150
                     const href = (el.getAttribute('href') || '');
                     const text = (el.textContent || '').toLowerCase();
-                    if (href.includes('/search') || text.includes('search') || text.includes('tìm kiếm')) {
+                    if (href.includes('/search') || text.includes('search') || text.includes('tÃ¬m kiáº¿m')) {
                         return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), type: 'fallback'};
                     }
                 }
@@ -7834,38 +8121,38 @@ class CDPWorker(QThread):
             """)
 
             if not search_icon_pos:
-                self.status_update.emit("⚠️ Không tìm thấy icon kính lúp trên sidebar", "orange")
+                self.status_update.emit("âš ï¸ KhÃ´ng tÃ¬m tháº¥y icon kÃ­nh lÃºp trÃªn sidebar", "orange")
                 return False
 
             self.status_update.emit(
-                f"👆 Tìm thấy icon search ({search_icon_pos.get('type','?')}) — click...", "blue"
+                f"ðŸ‘† TÃ¬m tháº¥y icon search ({search_icon_pos.get('type','?')}) â€” click...", "blue"
             )
             await self._human_move_and_click(
-                cdp, search_icon_pos['x'], search_icon_pos['y'], "Click icon 🔍 Search"
+                cdp, search_icon_pos['x'], search_icon_pos['y'], "Click icon ðŸ” Search"
             )
 
-            # ═══════════════════════════════════════════════════
-            #  BƯỚC 2: Chờ trang search mở → tìm ô input
-            # ═══════════════════════════════════════════════════
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  BÆ¯á»šC 2: Chá» trang search má»Ÿ â†’ tÃ¬m Ã´ input
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             await asyncio.sleep(random.uniform(1.5, 2.5))
 
-            # Tìm ô input search sau khi click icon
+            # TÃ¬m Ã´ input search sau khi click icon
             search_input = None
             for attempt in range(5):
                 search_input = await cdp.evaluate("""
                 (() => {
-                    // Ưu tiên: input đang active (focus)
+                    // Æ¯u tiÃªn: input Ä‘ang active (focus)
                     const active = document.activeElement;
                     if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
                         const r = active.getBoundingClientRect();
                         if (r.width > 50) return {x: Math.round(r.x+r.width/2), y: Math.round(r.y+r.height/2)};
                     }
-                    // Tìm input search
+                    // TÃ¬m input search
                     const selectors = [
                         'input[data-e2e="search-user-input"]',
                         'input[type="search"]',
                         'input[placeholder*="Search" i]',
-                        'input[placeholder*="Tìm" i]',
+                        'input[placeholder*="TÃ¬m" i]',
                         'input[name="q"]'
                     ];
                     for (const sel of selectors) {
@@ -7875,10 +8162,10 @@ class CDPWorker(QThread):
                             if (r.width > 50) return {x: Math.round(r.x+r.width/2), y: Math.round(r.y+r.height/2)};
                         }
                     }
-                    // Fallback: bất kỳ input nào có placeholder search
+                    // Fallback: báº¥t ká»³ input nÃ o cÃ³ placeholder search
                     for (const inp of document.querySelectorAll('input')) {
                         const ph = (inp.placeholder || '').toLowerCase();
-                        if (ph.includes('search') || ph.includes('tìm')) {
+                        if (ph.includes('search') || ph.includes('tÃ¬m')) {
                             const r = inp.getBoundingClientRect();
                             if (r.width > 50) return {x: Math.round(r.x+r.width/2), y: Math.round(r.y+r.height/2)};
                         }
@@ -7891,17 +8178,17 @@ class CDPWorker(QThread):
                 await asyncio.sleep(0.8)
 
             if not search_input:
-                self.status_update.emit("⚠️ Không tìm thấy ô nhập search sau khi click icon", "orange")
+                self.status_update.emit("âš ï¸ KhÃ´ng tÃ¬m tháº¥y Ã´ nháº­p search sau khi click icon", "orange")
                 return False
 
-            # Click vào ô input search
-            await self._human_move_and_click(cdp, search_input['x'], search_input['y'], "Click ô nhập search")
+            # Click vÃ o Ã´ input search
+            await self._human_move_and_click(cdp, search_input['x'], search_input['y'], "Click Ã´ nháº­p search")
             await asyncio.sleep(random.uniform(0.5, 0.8))
 
-            # ═══════════════════════════════════════════════════
-            #  BƯỚC 3: Xóa text cũ + Gõ từ khóa + Enter
-            # ═══════════════════════════════════════════════════
-            # Ctrl+A → Backspace (xóa text cũ nếu có)
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  BÆ¯á»šC 3: XÃ³a text cÅ© + GÃµ tá»« khÃ³a + Enter
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # Ctrl+A â†’ Backspace (xÃ³a text cÅ© náº¿u cÃ³)
             await cdp.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": "a", "code": "KeyA", "modifiers": 2})
             await asyncio.sleep(0.05)
             await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": "a", "code": "KeyA"})
@@ -7910,29 +8197,29 @@ class CDPWorker(QThread):
             await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Backspace", "code": "Backspace"})
             await asyncio.sleep(random.uniform(0.3, 0.5))
 
-            # Gõ từng ký tự (100-300ms delay — giống người thật)
-            self.status_update.emit(f"⌨️ Gõ: \"{keyword}\"", "blue")
+            # GÃµ tá»«ng kÃ½ tá»± (100-300ms delay â€” giá»‘ng ngÆ°á»i tháº­t)
+            self.status_update.emit(f"âŒ¨ï¸ GÃµ: \"{keyword}\"", "blue")
             await cdp.type_text(keyword, delay=random.randint(100, 300))
             await asyncio.sleep(random.uniform(1.0, 2.0))
 
-            # ═══════════════════════════════════════════════════
-            #  BƯỚC 4: Chờ dropdown gợi ý → Click dòng gợi ý
-            # ═══════════════════════════════════════════════════
-            self.status_update.emit("👆 Chờ dropdown gợi ý hiện ra...", "blue")
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  BÆ¯á»šC 4: Chá» dropdown gá»£i Ã½ â†’ Click dÃ²ng gá»£i Ã½
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            self.status_update.emit("ðŸ‘† Chá» dropdown gá»£i Ã½ hiá»‡n ra...", "blue")
 
-            # Chờ dropdown suggestions xuất hiện (tối đa 5 giây)
+            # Chá» dropdown suggestions xuáº¥t hiá»‡n (tá»‘i Ä‘a 5 giÃ¢y)
             suggestion_clicked = False
             for wait_attempt in range(6):
                 suggestion_pos = await cdp.evaluate("""
                 (() => {
                     const results = [];
 
-                    // 1. Tìm link "Xem tất cả kết quả" / "View all results" — ưu tiên cao nhất
+                    // 1. TÃ¬m link "Xem táº¥t cáº£ káº¿t quáº£" / "View all results" â€” Æ°u tiÃªn cao nháº¥t
                     const allEls = document.querySelectorAll('a, div[role="link"], div[role="button"], span, p, div');
                     for (const el of allEls) {
                         const text = (el.textContent || '').trim().toLowerCase();
-                        if ((text.includes('xem tất cả') || text.includes('view all') ||
-                             text.includes('tất cả kết quả') || text.includes('all results')) &&
+                        if ((text.includes('xem táº¥t cáº£') || text.includes('view all') ||
+                             text.includes('táº¥t cáº£ káº¿t quáº£') || text.includes('all results')) &&
                             text.length < 100) {
                             const r = el.getBoundingClientRect();
                             if (r.width > 50 && r.height > 10 && r.y > 50)
@@ -7940,8 +8227,8 @@ class CDPWorker(QThread):
                         }
                     }
 
-                    // 2. Tìm các dòng gợi ý có icon kính lúp (Q) — trong dropdown suggestions
-                    //    TikTok thường dùng <a> hoặc <div> với class chứa "SearchSuggestion" hoặc tương tự
+                    // 2. TÃ¬m cÃ¡c dÃ²ng gá»£i Ã½ cÃ³ icon kÃ­nh lÃºp (Q) â€” trong dropdown suggestions
+                    //    TikTok thÆ°á»ng dÃ¹ng <a> hoáº·c <div> vá»›i class chá»©a "SearchSuggestion" hoáº·c tÆ°Æ¡ng tá»±
                     const suggestionSelectors = [
                         '[class*="suggestion" i] a',
                         '[class*="suggestion" i] div[role="button"]',
@@ -7950,7 +8237,7 @@ class CDPWorker(QThread):
                         '[class*="SearchSuggest" i] a',
                         '[data-e2e="search-suggest"] a',
                         '[data-e2e*="suggest"] a',
-                        // Tìm link có text matching từ khóa
+                        // TÃ¬m link cÃ³ text matching tá»« khÃ³a
                     ];
                     for (const sel of suggestionSelectors) {
                         for (const el of document.querySelectorAll(sel)) {
@@ -7960,14 +8247,14 @@ class CDPWorker(QThread):
                         }
                     }
 
-                    // 3. Fallback: tìm các <a> hoặc div bên dưới search input có nội dung liên quan
-                    const searchInput = document.querySelector('input[data-e2e="search-user-input"], input[type="search"], input[placeholder*="Search" i], input[placeholder*="Tìm" i]');
+                    // 3. Fallback: tÃ¬m cÃ¡c <a> hoáº·c div bÃªn dÆ°á»›i search input cÃ³ ná»™i dung liÃªn quan
+                    const searchInput = document.querySelector('input[data-e2e="search-user-input"], input[type="search"], input[placeholder*="Search" i], input[placeholder*="TÃ¬m" i]');
                     if (searchInput) {
                         const inputRect = searchInput.getBoundingClientRect();
-                        // Tìm container cha chứa cả input và dropdown
+                        // TÃ¬m container cha chá»©a cáº£ input vÃ  dropdown
                         let container = searchInput.closest('[class*="search" i], [class*="Search" i], form') || searchInput.parentElement;
                         if (container) {
-                            // Mở rộng lên vài cấp nếu cần
+                            // Má»Ÿ rá»™ng lÃªn vÃ i cáº¥p náº¿u cáº§n
                             for (let i = 0; i < 5 && container.parentElement; i++) {
                                 const links = container.querySelectorAll('a[href], div[role="button"], div[role="link"]');
                                 if (links.length > 2) break;
@@ -7976,7 +8263,7 @@ class CDPWorker(QThread):
                             const items = container.querySelectorAll('a[href], div[role="button"], div[role="link"]');
                             for (const item of items) {
                                 const r = item.getBoundingClientRect();
-                                // Chỉ lấy các item DƯỚI search input (dropdown)
+                                // Chá»‰ láº¥y cÃ¡c item DÆ¯á»šI search input (dropdown)
                                 if (r.y > inputRect.bottom - 5 && r.width > 50 && r.height > 15 && r.y < inputRect.bottom + 500) {
                                     const text = (item.textContent || '').trim();
                                     if (text.length > 2 && text.length < 100) {
@@ -7989,13 +8276,13 @@ class CDPWorker(QThread):
 
                     if (results.length === 0) return null;
 
-                    // Ưu tiên: view_all > suggest_sel > dropdown_item
-                    // Nhưng nếu có suggest, click dòng 1 hoặc 2 (ngẫu nhiên, giống người thật)
+                    // Æ¯u tiÃªn: view_all > suggest_sel > dropdown_item
+                    // NhÆ°ng náº¿u cÃ³ suggest, click dÃ²ng 1 hoáº·c 2 (ngáº«u nhiÃªn, giá»‘ng ngÆ°á»i tháº­t)
                     const viewAll = results.find(r => r.type === 'view_all');
                     const suggests = results.filter(r => r.type !== 'view_all');
 
                     if (suggests.length > 0) {
-                        // Click dòng 1 hoặc 2 ngẫu nhiên
+                        // Click dÃ²ng 1 hoáº·c 2 ngáº«u nhiÃªn
                         const idx = Math.min(Math.floor(Math.random() * 2), suggests.length - 1);
                         return suggests[idx];
                     }
@@ -8006,23 +8293,23 @@ class CDPWorker(QThread):
 
                 if suggestion_pos:
                     self.status_update.emit(
-                        f"👆 Click gợi ý: \"{suggestion_pos.get('text','')}\" ({suggestion_pos.get('type','')})", "blue"
+                        f"ðŸ‘† Click gá»£i Ã½: \"{suggestion_pos.get('text','')}\" ({suggestion_pos.get('type','')})", "blue"
                     )
                     await self._human_move_and_click(
                         cdp, suggestion_pos['x'], suggestion_pos['y'],
-                        f"Click gợi ý search"
+                        f"Click gá»£i Ã½ search"
                     )
                     suggestion_clicked = True
                     break
 
                 await asyncio.sleep(0.8)
 
-            # ═══════════════════════════════════════════════════
-            #  BƯỚC 5: Nếu không tìm thấy dropdown → thử Enter
-            # ═══════════════════════════════════════════════════
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  BÆ¯á»šC 5: Náº¿u khÃ´ng tÃ¬m tháº¥y dropdown â†’ thá»­ Enter
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             if not suggestion_clicked:
-                self.status_update.emit("⚠️ Không thấy dropdown gợi ý — thử nhấn Enter...", "orange")
-                # Focus lại input
+                self.status_update.emit("âš ï¸ KhÃ´ng tháº¥y dropdown gá»£i Ã½ â€” thá»­ nháº¥n Enter...", "orange")
+                # Focus láº¡i input
                 await cdp.evaluate("""
                 (() => {
                     const inp = document.querySelector('input[data-e2e="search-user-input"], input[type="search"]');
@@ -8030,14 +8317,14 @@ class CDPWorker(QThread):
                 })()
                 """)
                 await asyncio.sleep(0.2)
-                # Submit bằng form submit (JS)
+                # Submit báº±ng form submit (JS)
                 submitted = await cdp.evaluate("""
                 (() => {
                     const inp = document.querySelector('input[data-e2e="search-user-input"], input[type="search"]');
                     if (inp) {
                         const form = inp.closest('form');
                         if (form) { form.submit(); return 'form'; }
-                        // Dispatch Enter event trên input
+                        // Dispatch Enter event trÃªn input
                         inp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
                         inp.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
                         inp.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
@@ -8046,50 +8333,50 @@ class CDPWorker(QThread):
                     return null;
                 })()
                 """)
-                self.status_update.emit(f"↵ Submit method: {submitted}", "blue")
+                self.status_update.emit(f"â†µ Submit method: {submitted}", "blue")
 
-            # ═══════════════════════════════════════════════════
-            #  BƯỚC 6: Chờ kết quả tìm kiếm
-            # ═══════════════════════════════════════════════════
-            self.status_update.emit("⏳ Chờ kết quả tìm kiếm...", "blue")
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  BÆ¯á»šC 6: Chá» káº¿t quáº£ tÃ¬m kiáº¿m
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            self.status_update.emit("â³ Chá» káº¿t quáº£ tÃ¬m kiáº¿m...", "blue")
             await asyncio.sleep(random.uniform(3.0, 5.0))
 
             if await self._wait_keyword_results_ready(cdp, timeout=8):
                 return True
 
-            # Fallback cuối cùng: navigate URL
-            self.status_update.emit("🔄 Fallback: mở URL tìm kiếm...", "orange")
+            # Fallback cuá»‘i cÃ¹ng: navigate URL
+            self.status_update.emit("ðŸ”„ Fallback: má»Ÿ URL tÃ¬m kiáº¿m...", "orange")
             return await self._open_keyword_results_url(cdp, keyword, timeout=10)
 
         except Exception as e:
-            self.status_update.emit(f"⚠️ Search by click lỗi: {str(e)[:80]}", "orange")
+            self.status_update.emit(f"âš ï¸ Search by click lá»—i: {str(e)[:80]}", "orange")
             return False
 
     async def _search_and_interact_one_keyword(self, cdp, keyword: str, min_videos: int, max_videos: int, kw_num: int, kw_total: int) -> bool:
         """
-        Tìm kiếm và tương tác cho 1 từ khóa.
-        Luồng: Search → Grid kết quả → Cuộn lên/xuống tự nhiên → Click ngẫu nhiên video
-               → Xem + tương tác → Escape quay lại grid → Lặp lại.
+        TÃ¬m kiáº¿m vÃ  tÆ°Æ¡ng tÃ¡c cho 1 tá»« khÃ³a.
+        Luá»“ng: Search â†’ Grid káº¿t quáº£ â†’ Cuá»™n lÃªn/xuá»‘ng tá»± nhiÃªn â†’ Click ngáº«u nhiÃªn video
+               â†’ Xem + tÆ°Æ¡ng tÃ¡c â†’ Escape quay láº¡i grid â†’ Láº·p láº¡i.
         """
         try:
             if not await self._wait_captcha_clear_for_action(cdp, f"Keyword {kw_num}/{kw_total} start"):
                 return False
 
-            # ════════════════════════════════════════════════════
-            #  GIAI ĐOẠN 1: Mở trang chủ TikTok → Chờ load → Tìm kiếm
-            # ════════════════════════════════════════════════════
-            # ★ LUÔN navigate về trang chủ TikTok trước (giống người thật)
-            self.status_update.emit(f"🏠 [{kw_num}/{kw_total}] Mở trang chủ TikTok...", "blue")
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  GIAI ÄOáº N 1: Má»Ÿ trang chá»§ TikTok â†’ Chá» load â†’ TÃ¬m kiáº¿m
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # â˜… LUÃ”N navigate vá» trang chá»§ TikTok trÆ°á»›c (giá»‘ng ngÆ°á»i tháº­t)
+            self.status_update.emit(f"ðŸ  [{kw_num}/{kw_total}] Má»Ÿ trang chá»§ TikTok...", "blue")
             await self._navigate_like_human(cdp, "tiktok.com", wait=random.uniform(3, 5))
 
-            # ★ Persist lại session cookies
+            # â˜… Persist láº¡i session cookies
             await self._persist_tiktok_cookies(cdp)
 
-            # Chờ thêm 2-4s cho trang load hoàn toàn (giống người thật mở TikTok lên rồi lướt vài giây)
-            self.status_update.emit(f"⏳ [{kw_num}/{kw_total}] Chờ TikTok load...", "blue")
+            # Chá» thÃªm 2-4s cho trang load hoÃ n toÃ n (giá»‘ng ngÆ°á»i tháº­t má»Ÿ TikTok lÃªn rá»“i lÆ°á»›t vÃ i giÃ¢y)
+            self.status_update.emit(f"â³ [{kw_num}/{kw_total}] Chá» TikTok load...", "blue")
             await asyncio.sleep(random.uniform(2, 4))
 
-            # Ẩn viền focus
+            # áº¨n viá»n focus
             await cdp.evaluate("""
             (() => {
                 const s = document.createElement('style');
@@ -8098,27 +8385,27 @@ class CDPWorker(QThread):
             })()
             """)
 
-            # GĐ1: Mở trang kết quả bằng URL trước; click search chỉ là fallback.
-            self.status_update.emit(f"🔎 [{kw_num}/{kw_total}] Tìm kiếm: \"{keyword}\"...", "blue")
+            # GÄ1: Má»Ÿ trang káº¿t quáº£ báº±ng URL trÆ°á»›c; click search chá»‰ lÃ  fallback.
+            self.status_update.emit(f"ðŸ”Ž [{kw_num}/{kw_total}] TÃ¬m kiáº¿m: \"{keyword}\"...", "blue")
             if not await self._open_keyword_results_url(cdp, keyword, kw_num, kw_total, timeout=12):
-                self.status_update.emit(f"⚠️ [{kw_num}/{kw_total}] URL search chưa sẵn sàng, thử search bằng giao diện", "orange")
+                self.status_update.emit(f"âš ï¸ [{kw_num}/{kw_total}] URL search chÆ°a sáºµn sÃ ng, thá»­ search báº±ng giao diá»‡n", "orange")
                 if not await self._search_by_clicking(cdp, keyword):
-                    self.status_update.emit(f"❌ [{kw_num}/{kw_total}] Không tìm kiếm được \"{keyword[:20]}\"", "red")
+                    self.status_update.emit(f"âŒ [{kw_num}/{kw_total}] KhÃ´ng tÃ¬m kiáº¿m Ä‘Æ°á»£c \"{keyword[:20]}\"", "red")
                     return False
             if not await self._wait_keyword_results_ready(cdp, timeout=8):
-                self.status_update.emit(f"❌ [{kw_num}/{kw_total}] Không tìm kiếm được \"{keyword[:20]}\"", "red")
+                self.status_update.emit(f"âŒ [{kw_num}/{kw_total}] KhÃ´ng tÃ¬m kiáº¿m Ä‘Æ°á»£c \"{keyword[:20]}\"", "red")
                 return False
 
-            # ════════════════════════════════════════════════════
-            #  GIAI ĐOẠN 2: Duyệt grid kết quả — cuộn lên/xuống tự nhiên
-            #  rồi click ngẫu nhiên video → xem → back → lặp lại
-            # ════════════════════════════════════════════════════
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  GIAI ÄOáº N 2: Duyá»‡t grid káº¿t quáº£ â€” cuá»™n lÃªn/xuá»‘ng tá»± nhiÃªn
+            #  rá»“i click ngáº«u nhiÃªn video â†’ xem â†’ back â†’ láº·p láº¡i
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             n_videos = random.randint(min_videos, max_videos)
             self.status_update.emit(
-                f"📺 [{kw_num}/{kw_total}] Sẽ xem {n_videos} video cho \"{keyword[:15]}\"", "blue"
+                f"ðŸ“º [{kw_num}/{kw_total}] Sáº½ xem {n_videos} video cho \"{keyword[:15]}\"", "blue"
             )
 
-            clicked_hrefs = set()  # Chống click trùng video
+            clicked_hrefs = set()  # Chá»‘ng click trÃ¹ng video
             watched_count = 0
             attempt_count = 0
             max_attempts = max(n_videos * 3, n_videos + 3)
@@ -8131,26 +8418,26 @@ class CDPWorker(QThread):
                 if not await self._wait_captcha_clear_for_action(cdp, f"Keyword video #{video_no}"):
                     break
 
-                # ── Bước 2.1: Cuộn trang kết quả tự nhiên (giống người duyệt) ──
+                # â”€â”€ BÆ°á»›c 2.1: Cuá»™n trang káº¿t quáº£ tá»± nhiÃªn (giá»‘ng ngÆ°á»i duyá»‡t) â”€â”€
                 self.status_update.emit(
-                    f"👁️ [{kw_num}/{kw_total}] Video #{video_no}/{n_videos} — Duyệt kết quả...", "blue"
+                    f"ðŸ‘ï¸ [{kw_num}/{kw_total}] Video #{video_no}/{n_videos} â€” Duyá»‡t káº¿t quáº£...", "blue"
                 )
 
-                # Cuộn xuống ngẫu nhiên để xem thêm kết quả
+                # Cuá»™n xuá»‘ng ngáº«u nhiÃªn Ä‘á»ƒ xem thÃªm káº¿t quáº£
                 n_scrolls = random.randint(1, 3)
                 for s in range(n_scrolls):
                     if self._stop_flag:
                         break
-                    # Di chuột vào vùng grid trước khi cuộn
+                    # Di chuá»™t vÃ o vÃ¹ng grid trÆ°á»›c khi cuá»™n
                     mx = random.randint(200, 700)
                     my = random.randint(200, 500)
                     await self._smooth_mouse_drift(cdp, mx, my)
-                    # Cuộn xuống
+                    # Cuá»™n xuá»‘ng
                     scroll_amount = random.randint(200, 500)
                     await cdp.scroll(mx, my, 0, scroll_amount)
                     await asyncio.sleep(random.uniform(1.0, 2.0))
 
-                # Thỉnh thoảng cuộn lên (30% cơ hội) — giống người xem lại
+                # Thá»‰nh thoáº£ng cuá»™n lÃªn (30% cÆ¡ há»™i) â€” giá»‘ng ngÆ°á»i xem láº¡i
                 if False and random.random() < 0.3:
                     mx = random.randint(200, 700)
                     my = random.randint(200, 500)
@@ -8158,73 +8445,73 @@ class CDPWorker(QThread):
                     await asyncio.sleep(0)
                     await asyncio.sleep(random.uniform(0.8, 1.5))
 
-                # ── Bước 2.2: Lấy danh sách video/photo card đang hiển thị và chưa click ──
+                # â”€â”€ BÆ°á»›c 2.2: Láº¥y danh sÃ¡ch video/photo card Ä‘ang hiá»ƒn thá»‹ vÃ  chÆ°a click â”€â”€
                 available = await self._collect_keyword_video_cards(cdp, clicked_hrefs)
                 if not available:
-                    self.status_update.emit("⏬ Scroll thêm để tìm video mới...", "blue")
+                    self.status_update.emit("â¬ Scroll thÃªm Ä‘á»ƒ tÃ¬m video má»›i...", "blue")
                     await cdp.scroll(400, 400, 0, random.randint(500, 850))
                     await asyncio.sleep(random.uniform(1.5, 2.3))
                     available = await self._collect_keyword_video_cards(cdp, clicked_hrefs)
                 if not available:
-                    self.status_update.emit("⚠️ Chưa bắt được card video — tìm kiếm lại", "orange")
+                    self.status_update.emit("âš ï¸ ChÆ°a báº¯t Ä‘Æ°á»£c card video â€” tÃ¬m kiáº¿m láº¡i", "orange")
                     if await self._open_keyword_results_url(cdp, keyword, kw_num, kw_total, timeout=10):
                         await asyncio.sleep(random.uniform(1.2, 2.0))
                         available = await self._collect_keyword_video_cards(cdp, clicked_hrefs)
 
                 if not available:
-                    self.status_update.emit(f"⚠️ Hết video để xem cho \"{keyword[:15]}\"", "orange")
+                    self.status_update.emit(f"âš ï¸ Háº¿t video Ä‘á»ƒ xem cho \"{keyword[:15]}\"", "orange")
                     break
 
-                # ── Bước 2.3: Click ngẫu nhiên 1 video từ danh sách ──
+                # â”€â”€ BÆ°á»›c 2.3: Click ngáº«u nhiÃªn 1 video tá»« danh sÃ¡ch â”€â”€
                 chosen = random.choice(available)
                 clicked_hrefs.add(chosen.get('href', ''))
 
                 if not await self._open_keyword_card(cdp, chosen, video_no, kw_num, kw_total):
-                    self.status_update.emit("⚠️ Không mở được video từ card này — bỏ qua", "orange")
+                    self.status_update.emit("âš ï¸ KhÃ´ng má»Ÿ Ä‘Æ°á»£c video tá»« card nÃ y â€” bá» qua", "orange")
                     await self._open_keyword_results_url(cdp, keyword, kw_num, kw_total, timeout=8)
                     continue
 
-                # ── Bước 2.4: Xem video (trong Theater Mode / full page) ──
+                # â”€â”€ BÆ°á»›c 2.4: Xem video (trong Theater Mode / full page) â”€â”€
                 self.status_update.emit(
-                    f"🎬 [{kw_num}/{kw_total}] Đang xem video #{video_no}/{n_videos}...", "blue"
+                    f"ðŸŽ¬ [{kw_num}/{kw_total}] Äang xem video #{video_no}/{n_videos}...", "blue"
                 )
                 await self._watch_current_video(cdp, video_no)
                 watched_count += 1
 
-                # ── Bước 2.5: Tương tác (Like/Fav/Comment theo tỉ lệ %) ──
+                # â”€â”€ BÆ°á»›c 2.5: TÆ°Æ¡ng tÃ¡c (Like/Fav/Comment theo tá»‰ lá»‡ %) â”€â”€
                 await self._interact_current_video(cdp, video_no)
 
                 if not await self._wait_captcha_clear_for_action(cdp, f"Keyword back #{video_no}"):
                     break
 
-                # ── Bước 2.6: Quay lại trang kết quả bằng URL, không dùng history.back ──
+                # â”€â”€ BÆ°á»›c 2.6: Quay láº¡i trang káº¿t quáº£ báº±ng URL, khÃ´ng dÃ¹ng history.back â”€â”€
                 if watched_count < n_videos:
                     if not await self._return_to_keyword_results(cdp, keyword, kw_num, kw_total):
-                        self.status_update.emit("⚠️ Không thể quay lại kết quả, dừng keyword này", "orange")
+                        self.status_update.emit("âš ï¸ KhÃ´ng thá»ƒ quay láº¡i káº¿t quáº£, dá»«ng keyword nÃ y", "orange")
                         break
 
-            # ════════════════════════════════════════════════════
-            #  GIAI ĐOẠN 3: Hoàn thành từ khóa này
-            # ════════════════════════════════════════════════════
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            #  GIAI ÄOáº N 3: HoÃ n thÃ nh tá»« khÃ³a nÃ y
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             if watched_count < min_videos:
                 self.status_update.emit(
-                    f"❌ [{kw_num}/{kw_total}] Chưa đủ video cho \"{keyword[:20]}\" ({watched_count}/{min_videos})", "red"
+                    f"âŒ [{kw_num}/{kw_total}] ChÆ°a Ä‘á»§ video cho \"{keyword[:20]}\" ({watched_count}/{min_videos})", "red"
                 )
                 return False
 
             if watched_count < n_videos:
                 self.status_update.emit(
-                    f"⚠️ [{kw_num}/{kw_total}] Hoàn thành một phần \"{keyword[:20]}\" ({watched_count}/{n_videos} video)", "orange"
+                    f"âš ï¸ [{kw_num}/{kw_total}] HoÃ n thÃ nh má»™t pháº§n \"{keyword[:20]}\" ({watched_count}/{n_videos} video)", "orange"
                 )
             else:
                 self.status_update.emit(
-                    f"✅ [{kw_num}/{kw_total}] Hoàn thành \"{keyword[:20]}\" ({watched_count} video)", "green"
+                    f"âœ… [{kw_num}/{kw_total}] HoÃ n thÃ nh \"{keyword[:20]}\" ({watched_count} video)", "green"
                 )
             return True
 
         except Exception as e:
             self.status_update.emit(
-                f"❌ [{kw_num}/{kw_total}] Lỗi \"{keyword[:15]}\": {str(e)[:50]}", "red"
+                f"âŒ [{kw_num}/{kw_total}] Lá»—i \"{keyword[:15]}\": {str(e)[:50]}", "red"
             )
             return False
 
@@ -8232,14 +8519,14 @@ class CDPWorker(QThread):
 
 
     def _hide_browser_windows(self):
-        """Ẩn browser bằng cách di chuyển ra ngoài màn hình (vẫn render cho screencast)."""
+        """áº¨n browser báº±ng cÃ¡ch di chuyá»ƒn ra ngoÃ i mÃ n hÃ¬nh (váº«n render cho screencast)."""
         if not self._process:
             return
         try:
             import win32gui, win32con, win32process
             pid = self._process.pid
 
-            # Lấy tất cả PID (parent + children)
+            # Láº¥y táº¥t cáº£ PID (parent + children)
             all_pids = {pid}
             try:
                 import psutil
@@ -8258,7 +8545,7 @@ class CDPWorker(QThread):
             hwnds = []
             win32gui.EnumWindows(callback, hwnds)
             for hwnd in hwnds:
-                # Di chuyển ra ngoài màn hình (Chrome vẫn render)
+                # Di chuyá»ƒn ra ngoÃ i mÃ n hÃ¬nh (Chrome váº«n render)
                 win32gui.SetWindowPos(
                     hwnd, None,
                     -32000, -32000, 0, 0,
@@ -8266,26 +8553,26 @@ class CDPWorker(QThread):
                 )
 
             if hwnds:
-                self.status_update.emit(f"👁‍🗨 Ẩn {len(hwnds)} cửa sổ browser", "green")
+                self.status_update.emit(f"ðŸ‘â€ðŸ—¨ áº¨n {len(hwnds)} cá»­a sá»• browser", "green")
         except Exception as e:
-            self.status_update.emit(f"⚠️ Không ẩn được browser: {str(e)[:40]}", "orange")
+            self.status_update.emit(f"âš ï¸ KhÃ´ng áº©n Ä‘Æ°á»£c browser: {str(e)[:40]}", "orange")
 
     def stop(self):
-        """Dừng worker + đóng browser GRACEFULLY (không block UI)."""
+        """Dá»«ng worker + Ä‘Ã³ng browser GRACEFULLY (khÃ´ng block UI)."""
         self._stop_flag = True
         if self._async_close_started:
             return
         self._async_close_started = True
         self.status_update.emit("Dang don trinh duyet cu, vui long cho Orbita/GoLogin dong xong...", "orange")
 
-        # Lưu ref process trước khi clear
+        # LÆ°u ref process trÆ°á»›c khi clear
         proc = self._process
         self._process = None
         gologin = self._gologin
         self._gologin = None
         self._using_gologin_api = False
         debug_port = self._debug_port
-        profile_dir = self._profile_dir  # ★ Lưu để patch sau khi kill
+        profile_dir = self._profile_dir  # â˜… LÆ°u Ä‘á»ƒ patch sau khi kill
         manager_acquired = self._browser_manager_acquired
         self._browser_manager_acquired = False
         known_pids = set(self._browser_pids)
@@ -8293,15 +8580,15 @@ class CDPWorker(QThread):
             known_pids.add(self._process_pid)
 
         def _graceful_close():
-            """Chạy trong background thread — đóng Chrome graceful."""
+            """Cháº¡y trong background thread â€” Ä‘Ã³ng Chrome graceful."""
             import time
-            # Bước 1: Gửi Browser.close qua HTTP
+            # BÆ°á»›c 1: Gá»­i Browser.close qua HTTP
             try:
                 import http.client
                 conn = http.client.HTTPConnection("127.0.0.1", debug_port, timeout=2)
                 conn.request("GET", "/json/close/all")
                 conn.close()
-                time.sleep(3)  # ★ Chờ Chrome flush cookie ra đĩa
+                time.sleep(3)  # â˜… Chá» Chrome flush cookie ra Ä‘Ä©a
             except Exception:
                 pass
 
@@ -8311,7 +8598,7 @@ class CDPWorker(QThread):
                 except Exception:
                     pass
 
-            # Bước 2: Unlock/kill qua BrowserManager nếu vẫn còn sống
+            # BÆ°á»›c 2: Unlock/kill qua BrowserManager náº¿u váº«n cÃ²n sá»‘ng
             # GoLogin SDK chi kill PID goc; Orbita child co the con song.
             self._force_close_browser_processes(debug_port, profile_dir, known_pids)
 
@@ -8328,13 +8615,13 @@ class CDPWorker(QThread):
                     try: proc.kill()
                     except Exception: pass
 
-            # ★ Bước 3: Patch exit_type=Normal SAU KHI kill
-            # Chrome ghi "Crashed" khi bị kill → phải ghi đè lại ngay
-            time.sleep(0.5)  # Chờ Chrome flush xong
+            # â˜… BÆ°á»›c 3: Patch exit_type=Normal SAU KHI kill
+            # Chrome ghi "Crashed" khi bá»‹ kill â†’ pháº£i ghi Ä‘Ã¨ láº¡i ngay
+            time.sleep(0.5)  # Chá» Chrome flush xong
             try:
                 import json as _json, os as _os
-                prefs_path = _os.path.join(profile_dir, "Default", "Preferences")
-                if _os.path.exists(prefs_path):
+                prefs_path = _os.path.join(profile_dir, "Default", "Preferences") if profile_dir else ""
+                if prefs_path and _os.path.exists(prefs_path):
                     prefs = _json.load(open(prefs_path, encoding="utf-8"))
                     prefs.setdefault("profile", {})["exit_type"] = "Normal"
                     prefs["profile"]["exited_cleanly"] = True
@@ -8344,7 +8631,7 @@ class CDPWorker(QThread):
             except Exception:
                 pass
 
-        # ★ daemon=False → thread KHÔNG bị kill khi app đóng
+        # â˜… daemon=False â†’ thread KHÃ”NG bá»‹ kill khi app Ä‘Ã³ng
             self._process_pid = 0
             self._browser_pids.clear()
             self._emit_browser_closed_once("closed")
@@ -8353,7 +8640,7 @@ class CDPWorker(QThread):
         self._close_thread = threading.Thread(target=_graceful_close, daemon=False)
         self._close_thread.start()
 
-        # Dừng local proxy
+        # Dá»«ng local proxy
         if hasattr(self, '_local_proxy') and self._local_proxy:
             try: self._local_proxy.stop()
             except Exception: pass

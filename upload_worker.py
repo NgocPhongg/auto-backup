@@ -1,4 +1,4 @@
-"""
+﻿"""
 Upload Worker — Tự động hóa đăng video lên TikTok Studio.
 Tái sử dụng CDP engine từ cdp_worker.py.
 """
@@ -16,7 +16,9 @@ from datetime import datetime, timedelta
 from PyQt5.QtCore import QThread, pyqtSignal
 from gologin_config import load_gologin_settings
 from gologin_profile_utils import first_real_gologin_profile_id
-from app_paths import gologin_base_dir, gologin_profile_dir, resource_path
+from gologin_proxy_check import validate_profile_proxy
+from app_paths import resource_path, local_chrome_profile_dir
+from browser_backend_utils import LOCAL_CHROME_BACKEND, GOLOGIN_BACKEND, STEALTH_FIREFOX_BACKEND, normalize_browser_backend
 from proxy_utils import (
     normalize_proxy_type,
     parse_proxy_string,
@@ -25,7 +27,6 @@ from proxy_utils import (
     validate_proxy_connection,
 )
 
-GOLOGIN_BASE_DIR = str(gologin_base_dir())
 ZERO_PROFILE_ZIP = str(resource_path("gologin_zeroprofile.zip"))
 TIKTOK_STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload?from=webapp"
 _GOLOGIN_START_LOCK = threading.RLock()
@@ -44,10 +45,6 @@ Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en'], config
 """
 
 
-def _profile_dir_for_browser_id(browser_id):
-    if not browser_id:
-        return ""
-    return str(gologin_profile_dir(browser_id))
 
 
 def _parse_cookie_header(cookie_header):
@@ -148,24 +145,15 @@ def _sync_gologin_profile_proxy(token, profile_id, task):
     proxy_payload["autoProxyRegion"] = ""
     proxy_payload["torProxyRegion"] = ""
 
-    body = {
-        "proxies": [
-            {
-                "profileId": profile_id,
-                "proxy": proxy_payload,
-            }
-        ]
-    }
-
     try:
         import requests
         response = requests.patch(
-            "https://api.gologin.com/browser/proxy/many/v2",
+            f"https://api.gologin.com/browser/{profile_id}/proxy",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
-            json=body,
+            json=proxy_payload,
             timeout=25,
         )
     except Exception as exc:
@@ -197,6 +185,10 @@ def _validate_task_proxy(task, timeout=8):
     )
 
 
+def _proxy_bridge_base_port(task_index):
+    return 18080 + (max(int(task_index or 0), 0) * 10)
+
+
 class UploadWorker(QThread):
     """Worker thread xử lý upload video lên TikTok."""
     status_updated = pyqtSignal(int, str, str)    # (task_index, message, color)
@@ -209,7 +201,7 @@ class UploadWorker(QThread):
         super().__init__(parent)
         self.tasks = tasks
         # tasks: [{title, file_path, upload_to, schedule_time, gologin_profile_id, browser_id, proxy, proxy_type}, ...]
-        # settings: {delete_on_success, max_threads, delay_min, delay_max}
+        # settings: {delete_on_success, delay_min, delay_max}
         self.settings = settings
         self.preview_targets = preview_targets or {}
         self._embedded_hwnds = {}
@@ -218,6 +210,27 @@ class UploadWorker(QThread):
         self._embed_done_events = {}
         self._embed_results = {}
         self._current_embed_idx = None
+        self._local_proxy_bridges = {}
+        self._finished_tasks = set()
+
+    def _emit_task_completed(self, idx, success, detail):
+        idx = int(idx)
+        if idx in self._finished_tasks:
+            return
+        self._finished_tasks.add(idx)
+        self.task_completed.emit(idx, bool(success), str(detail or ""))
+
+    def _emit_task_aborted(self, idx, detail, status_message=None, color="orange"):
+        idx = int(idx)
+        if idx in self._finished_tasks:
+            return
+        if status_message:
+            self.status_updated.emit(idx, str(status_message), color)
+        self._emit_task_completed(idx, False, detail)
+
+    def _abort_profile_tasks(self, profile_tasks, detail, status_message=None, color="orange", start_at=0):
+        for idx, _task in list(profile_tasks or [])[max(0, int(start_at or 0)):]:
+            self._emit_task_aborted(idx, detail, status_message=status_message, color=color)
 
 
     def notify_embed_result(self, success=False, hwnd=0, pid=0, message="", task_index=None):
@@ -286,6 +299,7 @@ class UploadWorker(QThread):
         except Exception as e:
             print(f"[UploadWorker] Fatal: {e}")
         finally:
+            self._stop_all_local_proxy_bridges()
             loop.close()
             self.all_done.emit()
 
@@ -316,15 +330,28 @@ class UploadWorker(QThread):
         if not task.get("upload_to"):
             return False, "Chưa gán tài khoản Upload To"
 
-        # Check 5: GoLogin profile ID. Upload must use the real GoLogin/Orbita profile.
-        gologin_profile_id = first_real_gologin_profile_id(
-            task.get("gologin_profile_id"),
-            task.get("browser_id"),
-        )
-        if not gologin_profile_id:
-            return False, "Profile chua co GoLogin Profile ID that"
-        task["gologin_profile_id"] = gologin_profile_id
-        task["browser_id"] = gologin_profile_id
+        # Check 5: backend-aware browser identity.
+        backend = normalize_browser_backend(task.get("browser_backend"))
+        task["browser_backend"] = backend
+        if backend == LOCAL_CHROME_BACKEND:
+            browser_id = str(task.get("browser_id") or "").strip()
+            if not browser_id:
+                return False, "Profile Local Chrome chua co browser_id"
+            task["gologin_profile_id"] = ""
+            task["upload_profile_key"] = f"local_chrome:{browser_id}"
+        elif backend == STEALTH_FIREFOX_BACKEND:
+            return False, "Stealth Firefox chua duoc ho tro trong bang upload"
+        else:
+            gologin_profile_id = first_real_gologin_profile_id(
+                task.get("gologin_profile_id"),
+                task.get("browser_id"),
+            )
+            if not gologin_profile_id:
+                return False, "Profile chua co GoLogin Profile ID that"
+            task["browser_backend"] = GOLOGIN_BACKEND
+            task["gologin_profile_id"] = gologin_profile_id
+            task["browser_id"] = gologin_profile_id
+            task["upload_profile_key"] = f"gologin:{gologin_profile_id}"
 
         # Check 6: Schedule >= 30 phút
 
@@ -355,7 +382,7 @@ class UploadWorker(QThread):
             ok, reason = self._validate_task(i, task)
             if not ok:
                 self.status_updated.emit(i, f"❌ {reason}", "red")
-                self.task_completed.emit(i, False, reason)
+                self._emit_task_completed(i, False, reason)
             else:
                 valid_tasks.append((i, task))
 
@@ -376,35 +403,181 @@ class UploadWorker(QThread):
         grouped_tasks = []
         profile_map = {}
         for idx, task in valid_tasks:
-            profile = task.get("upload_to", "")
+            profile = (
+                task.get("upload_profile_key")
+                or f"gologin:{task.get('gologin_profile_id') or ''}"
+                or task.get("upload_to", "")
+            )
             if profile not in profile_map:
                 profile_map[profile] = []
                 grouped_tasks.append((profile, profile_map[profile]))
             profile_map[profile].append((idx, task))
 
-        for profile, profile_tasks in grouped_tasks:
+        for group_index, (profile, profile_tasks) in enumerate(grouped_tasks):
             if self._stop_flag:
-                for idx, _task in profile_tasks:
-                    self.status_updated.emit(idx, "⏹ Đã dừng bởi user", "orange")
+                for _profile, remaining_tasks in grouped_tasks[group_index:]:
+                    self._abort_profile_tasks(
+                        remaining_tasks,
+                        "Đã dừng bởi user",
+                        status_message="⏹ Đã dừng bởi user",
+                        color="orange",
+                    )
                 break
 
             while self._profile_locks.get(profile, False):
                 if self._stop_flag:
                     break
                 await asyncio.sleep(1)
+            if self._stop_flag:
+                for _profile, remaining_tasks in grouped_tasks[group_index:]:
+                    self._abort_profile_tasks(
+                        remaining_tasks,
+                        "Đã dừng bởi user",
+                        status_message="⏹ Đã dừng bởi user",
+                        color="orange",
+                    )
+                break
 
             self._profile_locks[profile] = True
             try:
                 await self._upload_profile_videos(profile, profile_tasks)
             except Exception as e:
-                for idx, _task in profile_tasks:
-                    self.status_updated.emit(idx, f"❌ Lỗi: {str(e)[:80]}", "red")
-                    self.task_completed.emit(idx, False, str(e))
+                self._abort_profile_tasks(
+                    profile_tasks,
+                    str(e),
+                    status_message=f"❌ Lỗi: {str(e)[:80]}",
+                    color="red",
+                )
             finally:
                 self._profile_locks[profile] = False
 
     def _gologin_install_help(self):
         return "Thieu GoLogin SDK. Cai truoc bang lenh: python -m pip install gologin"
+
+    def _validate_gologin_profile_proxy(self, gl, idx, task=None, timeout=8):
+        try:
+            profile = gl.getProfile()
+        except Exception as exc:
+            return False, f"Khong doc duoc proxy GoLogin profile: {exc}"
+
+        result = validate_profile_proxy(profile, timeout=timeout)
+        message = str(result.get("message") or "").strip()
+        proxy_info = result.get("proxy_info") or {}
+        has_proxy = bool(proxy_info.get("has_proxy"))
+        if isinstance(task, dict):
+            task["_gologin_profile_has_proxy"] = has_proxy
+        cached_proxy = (task.get("proxy") or "").strip() if isinstance(task, dict) else ""
+        if isinstance(task, dict):
+            task["proxy"] = str(proxy_info.get("proxy_string") or "").strip() if has_proxy else ""
+            task["proxy_type"] = str(proxy_info.get("proxy_type") or "").strip() if has_proxy else ""
+        if result.get("skipped"):
+            if cached_proxy:
+                self.status_updated.emit(idx, "GoLogin profile hien khong dung proxy; bo qua proxy cache trong task.", "blue")
+            if message:
+                self.status_updated.emit(idx, message, "blue")
+            return True, message
+        if result.get("ok"):
+            if message:
+                self.status_updated.emit(idx, message, "green")
+            return True, message
+        return False, message or "GoLogin proxy loi"
+
+    def _force_direct_browser_when_no_gologin_proxy(self, gl, idx, task):
+        if not isinstance(task, dict):
+            return
+        if task.get("_gologin_profile_has_proxy"):
+            return
+        params = getattr(gl, "extra_params", None)
+        if params is None:
+            params = []
+            try:
+                gl.extra_params = params
+            except Exception:
+                pass
+        if not any(str(param).startswith("--proxy-server") or str(param) == "--no-proxy-server" for param in params):
+            params.append("--no-proxy-server")
+        self.status_updated.emit(
+            idx,
+            "GoLogin profile khong co proxy; ep browser chay direct de tranh proxy cu trong Preferences.",
+            "blue",
+        )
+
+    def _local_proxy_key(self, browser_id):
+        return str(browser_id or "").strip()
+
+    def _stop_local_proxy_bridge(self, browser_id):
+        key = self._local_proxy_key(browser_id)
+        if not key:
+            return
+        bridge = self._local_proxy_bridges.pop(key, None)
+        if not bridge:
+            return
+        try:
+            bridge.stop()
+        except Exception:
+            pass
+
+    def _stop_all_local_proxy_bridges(self):
+        for key in list(self._local_proxy_bridges.keys()):
+            self._stop_local_proxy_bridge(key)
+
+    def _local_proxy_bridge_string(self, payload):
+        if not payload:
+            return ""
+        proxy = f"{payload.get('host')}:{payload.get('port')}"
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "").strip()
+        if username:
+            proxy += f":{username}:{password}"
+        return proxy
+
+    def _start_local_chrome_proxy_bridge(self, idx, task, browser_id):
+        proxy_string = (task.get("proxy") or "").strip()
+        if not proxy_string:
+            return ""
+
+        proxy_type = _normalize_proxy_mode(task.get("proxy_type", "http"))
+        parsed_proxy = _parse_proxy_string(proxy_string, proxy_type)
+        if not parsed_proxy:
+            raise RuntimeError("Proxy Local Chrome sai dinh dang. Can IP:Port hoac IP:Port:User:Pass.")
+
+        proxy_check = _validate_task_proxy(task, timeout=6)
+        if not proxy_check.get("ok"):
+            raise RuntimeError(f"Proxy Local Chrome loi: {proxy_check.get('message') or 'khong ket noi duoc'}")
+
+        detected_type = _normalize_proxy_mode(
+            proxy_check.get("scheme") or parsed_proxy.get("mode") or proxy_type
+        )
+        task["proxy_type"] = detected_type
+        parsed_proxy = _parse_proxy_string(proxy_string, detected_type) or parsed_proxy
+        bridge_proxy = self._local_proxy_bridge_string(parsed_proxy)
+        if not bridge_proxy:
+            raise RuntimeError("Proxy Local Chrome sai dinh dang. Can IP:Port hoac IP:Port:User:Pass.")
+
+        try:
+            from local_proxy import create_local_proxy
+        except Exception as exc:
+            raise RuntimeError(f"Khong import duoc local_proxy: {exc}") from exc
+
+        self._stop_local_proxy_bridge(browser_id)
+        base_port = _proxy_bridge_base_port(idx)
+        for offset in range(20):
+            local_port = base_port + offset
+            bridge = create_local_proxy(local_port, bridge_proxy, detected_type)
+            if not bridge:
+                continue
+            self._local_proxy_bridges[self._local_proxy_key(browser_id)] = bridge
+            display = proxy_display_text(bridge_proxy, detected_type) or bridge_proxy
+            proxy_ip = str(proxy_check.get("proxy_ip") or "").strip()
+            suffix = f" -> {proxy_ip}" if proxy_ip else ""
+            self.status_updated.emit(
+                idx,
+                f"Proxy bridge Local Chrome: {display} -> 127.0.0.1:{local_port}{suffix}",
+                "blue",
+            )
+            return f"127.0.0.1:{local_port}"
+
+        raise RuntimeError("Khong tao duoc proxy bridge Local Chrome; cac port local dang ban.")
 
     def _launch_gologin_profile(self, idx, task, width=1280, height=800):
         """Open the real GoLogin/Orbita profile and return (gl, debug_port, browser_pid)."""
@@ -419,30 +592,6 @@ class UploadWorker(QThread):
         if not gologin_profile_id:
             raise RuntimeError("Profile nay chua co GoLogin Profile ID that.")
         task["browser_id"] = gologin_profile_id
-
-        if (task.get("proxy") or "").strip():
-            proxy_check = _validate_task_proxy(task, timeout=8)
-            if not proxy_check.get("ok"):
-                raise RuntimeError(str(proxy_check.get("message") or "Proxy khong hop le"))
-
-            detected_mode = _normalize_proxy_mode(proxy_check.get("scheme"))
-            task["proxy_type"] = detected_mode
-            proxy_ip = str(proxy_check.get("proxy_ip") or "").strip()
-            direct_ip = str(proxy_check.get("direct_ip") or "").strip()
-            proxy_status = f"Proxy OK: {proxy_ip}" if proxy_ip else "Proxy OK"
-            if direct_ip and proxy_ip and direct_ip != proxy_ip:
-                proxy_status += f" (IP may: {direct_ip})"
-            self.status_updated.emit(idx, proxy_status, "green")
-
-            ok, message = _sync_gologin_profile_proxy(token, gologin_profile_id, task)
-            if not ok:
-                raise RuntimeError(message)
-            if message:
-                self.status_updated.emit(
-                    idx,
-                    f"GoLogin proxy synced: {message}",
-                    "blue",
-                )
 
         try:
             from gologin import GoLogin
@@ -473,6 +622,10 @@ class UploadWorker(QThread):
             "restore_last_session": True,
             "extra_params": extra_params,
         })
+        ok, proxy_message = self._validate_gologin_profile_proxy(gl, idx, task=task, timeout=8)
+        if not ok:
+            raise RuntimeError(proxy_message)
+        self._force_direct_browser_when_no_gologin_proxy(gl, idx, task)
 
         try:
             with _GOLOGIN_START_LOCK:
@@ -504,6 +657,43 @@ class UploadWorker(QThread):
             "green",
         )
         return gl, debug_port, browser_pid
+
+    def _launch_local_chrome_profile(self, idx, task, width=1280, height=800):
+        try:
+            from browser_manager import BrowserManager
+        except Exception as exc:
+            raise RuntimeError(f"Khong import duoc BrowserManager: {exc}") from exc
+
+        browser_id = str(task.get("browser_id") or "").strip()
+        if not browser_id:
+            raise RuntimeError("Profile Local Chrome chua co browser_id.")
+
+        profile_dir = str(local_chrome_profile_dir(browser_id))
+        task["profile_dir"] = profile_dir
+
+        proxy_server = self._start_local_chrome_proxy_bridge(idx, task, browser_id)
+        extra_params = [
+            f"--window-size={int(width)},{int(height)}",
+            "--window-position=0,0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--disable-infobars",
+        ]
+        self.status_updated.emit(idx, f"Mo Local Chrome profile {browser_id}...", "blue")
+        process, debug_port = BrowserManager().launch_browser(
+            profile_id=browser_id,
+            profile_dir=profile_dir,
+            width=width,
+            height=height,
+            proxy_server=proxy_server,
+            extra_args=extra_params,
+            browser_backend=LOCAL_CHROME_BACKEND,
+        )
+        browser_pid = int(getattr(process, "pid", 0) or 0)
+        self.status_updated.emit(idx, f"Local Chrome da mo profile (CDP port {debug_port}).", "green")
+        return process, debug_port, browser_pid
 
     def _stop_gologin_profile(self, gl, debug_port=0):
         if not gl:
@@ -544,9 +734,11 @@ class UploadWorker(QThread):
         from cdp_client import CDPClient
 
         first_idx, first_task = profile_tasks[0]
+        profile_label = first_task.get("upload_to") or profile
         debug_port = 0
         browser_pid = 0
         gl = None
+        process = None
         cdp = None
         preview_target = self.preview_targets.get(first_idx, {})
         if preview_target:
@@ -554,27 +746,44 @@ class UploadWorker(QThread):
             first_task["_container_height"] = preview_target.get("height", 800)
 
         try:
-            self.status_updated.emit(first_idx, f"🚀 Mở GoLogin/Orbita cho {profile}...", "blue")
+            backend = normalize_browser_backend(first_task.get("browser_backend"))
+            browser_label = "Local Chrome" if backend == LOCAL_CHROME_BACKEND else "GoLogin/Orbita"
+            self.status_updated.emit(first_idx, f"🚀 Mở {browser_label} cho {profile_label}...", "blue")
             try:
-                gl, debug_port, browser_pid = self._launch_gologin_profile(
-                    first_idx,
-                    first_task,
-                    width=first_task.get("_container_width", 1280),
-                    height=first_task.get("_container_height", 800),
-                )
+                if backend == LOCAL_CHROME_BACKEND:
+                    process, debug_port, browser_pid = self._launch_local_chrome_profile(
+                        first_idx,
+                        first_task,
+                        width=first_task.get("_container_width", 1280),
+                        height=first_task.get("_container_height", 800),
+                    )
+                else:
+                    gl, debug_port, browser_pid = self._launch_gologin_profile(
+                        first_idx,
+                        first_task,
+                        width=first_task.get("_container_width", 1280),
+                        height=first_task.get("_container_height", 800),
+                    )
             except Exception as e:
                 detail = str(e)
                 lowered = detail.lower()
                 if "using" in lowered or "already" in lowered or "đang" in lowered or "dang" in lowered:
                     detail = "Loi: GoLogin profile dang duoc su dung hoac chua dong xong"
-                for idx, _task in profile_tasks:
-                    self.status_updated.emit(idx, f"❌ {detail}", "red")
-                    self.task_completed.emit(idx, False, detail)
+                self._abort_profile_tasks(
+                    profile_tasks,
+                    detail,
+                    status_message=f"❌ {detail}",
+                    color="red",
+                )
                 return
 
             if not debug_port:
-                for idx, _task in profile_tasks:
-                    self.task_completed.emit(idx, False, "Khong mo duoc GoLogin browser")
+                self._abort_profile_tasks(
+                    profile_tasks,
+                    "Khong mo duoc GoLogin browser",
+                    status_message="❌ Khong mo duoc GoLogin browser",
+                    color="red",
+                )
                 return
 
             if preview_target:
@@ -588,7 +797,7 @@ class UploadWorker(QThread):
             self.status_updated.emit(first_idx, f"🔌 Kết nối CDP port {debug_port}...", "blue")
             cdp = CDPClient(port=debug_port)
             await cdp.connect(timeout=15)
-            self.status_updated.emit(first_idx if "first_idx" in locals() else idx, "GoLogin strict: giu nguyen fingerprint profile", "green")
+            self.status_updated.emit(first_idx, "Browser session da san sang", "green")
 
             if first_task.get("cookie"):
                 self.status_updated.emit(
@@ -599,7 +808,13 @@ class UploadWorker(QThread):
 
             for pos, (idx, task) in enumerate(profile_tasks):
                 if self._stop_flag:
-                    self.status_updated.emit(idx, "⏹ Đã dừng bởi user", "orange")
+                    self._abort_profile_tasks(
+                        profile_tasks,
+                        "Đã dừng bởi user",
+                        status_message="⏹ Đã dừng bởi user",
+                        color="orange",
+                        start_at=pos,
+                    )
                     break
 
                 if pos > 0:
@@ -607,7 +822,13 @@ class UploadWorker(QThread):
 
                 ok = await self._upload_video_in_open_browser(cdp, idx, task)
                 if not ok:
-                    self.status_updated.emit(idx, "⛔ Dừng queue vì video hiện tại bị lỗi", "red")
+                    self._abort_profile_tasks(
+                        profile_tasks,
+                        "Bỏ qua do video trước lỗi",
+                        status_message="⏭ Bỏ qua do video trước lỗi",
+                        color="orange",
+                        start_at=pos + 1,
+                    )
                     break
 
                 if pos < len(profile_tasks) - 1 and not self._stop_flag:
@@ -622,6 +843,14 @@ class UploadWorker(QThread):
                     await cdp.disconnect()
                 except Exception:
                     pass
+            if process is not None:
+                try:
+                    from browser_manager import BrowserManager
+                    BrowserManager().close_browser(first_task.get("browser_id"), first_task.get("profile_dir", ""))
+                except Exception:
+                    pass
+            if first_task:
+                self._stop_local_proxy_bridge(first_task.get("browser_id"))
             self._stop_gologin_profile(gl, debug_port)
 
     async def _upload_video_in_open_browser(self, cdp, idx, task):
@@ -639,7 +868,7 @@ class UploadWorker(QThread):
             self.status_updated.emit(idx, f"❌ {reason}", "red")
             recovered = await self._hold_browser_for_upload_issue(cdp, idx, reason)
             if not recovered:
-                self.task_completed.emit(idx, False, reason)
+                self._emit_task_completed(idx, False, reason)
                 return False
 
         await self._dismiss_popups(cdp, idx)
@@ -649,7 +878,7 @@ class UploadWorker(QThread):
         self.status_updated.emit(idx, f"📤 Đang upload: {os.path.basename(file_path)}", "blue")
         upload_ok = await self._inject_file(cdp, file_path)
         if not upload_ok:
-            self.task_completed.emit(idx, False, "Không tìm thấy input file")
+            self._emit_task_completed(idx, False, "Không tìm thấy input file")
             return False
 
         file_size_mb = os.path.getsize(task["file_path"]) / (1024**2)
@@ -657,7 +886,7 @@ class UploadWorker(QThread):
         render_ok = await self._wait_upload_complete(cdp, idx, timeout_sec)
         if not render_ok:
             await self._try_save_draft(cdp, idx)
-            self.task_completed.emit(idx, False, "Upload/Render timeout")
+            self._emit_task_completed(idx, False, "Upload/Render timeout")
             return False
         await self._dismiss_popups(cdp, idx)
 
@@ -674,7 +903,7 @@ class UploadWorker(QThread):
             schedule_ok = await self._set_schedule(cdp, sched, idx)
             if not schedule_ok:
                 task["_last_error"] = "Không đặt được lịch"
-                self.task_completed.emit(idx, False, "Không đặt được lịch")
+                self._emit_task_completed(idx, False, "Không đặt được lịch")
                 return False
             await asyncio.sleep(1)
             post_clicked = await self._click_post_button(cdp, is_schedule=True, idx=idx)
@@ -685,14 +914,14 @@ class UploadWorker(QThread):
         if not post_clicked:
             task["_last_error"] = "Không bấm được nút Đăng"
             await self._try_save_draft(cdp, idx)
-            self.task_completed.emit(idx, False, "Không bấm được nút Đăng")
+            self._emit_task_completed(idx, False, "Không bấm được nút Đăng")
             return False
 
         await asyncio.sleep(3)
-        success = await self._verify_post_success(cdp, idx)
+        success = await self._verify_post_success(cdp, idx, is_schedule=is_schedule)
         if success:
             self.status_updated.emit(idx, "✅ Đăng thành công!", "green")
-            self.task_completed.emit(idx, True, "OK")
+            self._emit_task_completed(idx, True, "OK")
             if self.settings.get("delete_on_success", False):
                 try:
                     os.remove(task["file_path"])
@@ -702,7 +931,7 @@ class UploadWorker(QThread):
             return True
 
         await self._try_save_draft(cdp, idx)
-        self.task_completed.emit(idx, False, "Không xác nhận được thành công")
+        self._emit_task_completed(idx, False, "Không xác nhận được thành công")
         return False
 
     async def _upload_single_video(self, idx, task):
@@ -712,6 +941,7 @@ class UploadWorker(QThread):
         debug_port = 0
         browser_pid = 0
         gl = None
+        process = None
         preview_target = self.preview_targets.get(idx, {})
         if preview_target:
             task["_container_width"] = preview_target.get("width", 1280)
@@ -719,27 +949,37 @@ class UploadWorker(QThread):
 
         try:
             # ── PHASE 1: Launch Browser ──
-            self.status_updated.emit(idx, "🚀 Đang mở GoLogin/Orbita...", "blue")
+            backend = normalize_browser_backend(task.get("browser_backend"))
+            browser_label = "Local Chrome" if backend == LOCAL_CHROME_BACKEND else "GoLogin/Orbita"
+            self.status_updated.emit(idx, f"🚀 Đang mở {browser_label}...", "blue")
             try:
-                gl, debug_port, browser_pid = self._launch_gologin_profile(
-                    idx,
-                    task,
-                    width=task.get("_container_width", 1280),
-                    height=task.get("_container_height", 800),
-                )
+                if backend == LOCAL_CHROME_BACKEND:
+                    process, debug_port, browser_pid = self._launch_local_chrome_profile(
+                        idx,
+                        task,
+                        width=task.get("_container_width", 1280),
+                        height=task.get("_container_height", 800),
+                    )
+                else:
+                    gl, debug_port, browser_pid = self._launch_gologin_profile(
+                        idx,
+                        task,
+                        width=task.get("_container_width", 1280),
+                        height=task.get("_container_height", 800),
+                    )
             except Exception as e:
                 detail = str(e)
                 lowered = detail.lower()
                 if "using" in lowered or "already" in lowered or "đang" in lowered or "dang" in lowered:
                     detail = "Loi: GoLogin profile dang duoc su dung hoac chua dong xong"
                 self.status_updated.emit(idx, f"❌ {detail}", "red")
-                self.task_completed.emit(idx, False, detail)
+                self._emit_task_completed(idx, False, detail)
                 return
             if preview_target and browser_pid:
                 self._request_browser_embed_from_ui(idx, task, debug_port, browser_pid, timeout=30.0)
 
             if not debug_port:
-                self.task_completed.emit(idx, False, "Khong mo duoc GoLogin browser")
+                self._emit_task_completed(idx, False, "Khong mo duoc GoLogin browser")
                 return
 
             await asyncio.sleep(4)  # Chờ browser ready
@@ -750,7 +990,7 @@ class UploadWorker(QThread):
             await cdp.connect(timeout=15)
 
             # Inject stealth
-            self.status_updated.emit(first_idx if "first_idx" in locals() else idx, "GoLogin strict: giu nguyen fingerprint profile", "green")
+            self.status_updated.emit(first_idx if "first_idx" in locals() else idx, "Browser session da san sang", "green")
 
             # ── PHASE 2: Navigate to TikTok Studio ──
             self.status_updated.emit(idx, "🌐 Đang vào TikTok Studio...", "blue")
@@ -771,7 +1011,7 @@ class UploadWorker(QThread):
                 self.status_updated.emit(idx, f"❌ {reason}", "red")
                 recovered = await self._hold_browser_for_upload_issue(cdp, idx, reason)
                 if not recovered:
-                    self.task_completed.emit(idx, False, reason)
+                    self._emit_task_completed(idx, False, reason)
                     return
 
             # Đóng popup nếu có
@@ -784,7 +1024,7 @@ class UploadWorker(QThread):
 
             upload_ok = await self._inject_file(cdp, file_path)
             if not upload_ok:
-                self.task_completed.emit(idx, False, "Không tìm thấy input file")
+                self._emit_task_completed(idx, False, "Không tìm thấy input file")
                 return
 
             # Chờ upload + render hoàn tất
@@ -794,7 +1034,7 @@ class UploadWorker(QThread):
             if not render_ok:
                 # Thử save draft
                 await self._try_save_draft(cdp, idx)
-                self.task_completed.emit(idx, False, "Upload/Render timeout")
+                self._emit_task_completed(idx, False, "Upload/Render timeout")
                 return
             await self._dismiss_popups(cdp, idx)
 
@@ -813,7 +1053,7 @@ class UploadWorker(QThread):
                 self.status_updated.emit(idx, f"📅 Đặt lịch: {sched}", "blue")
                 schedule_ok = await self._set_schedule(cdp, sched, idx)
                 if not schedule_ok:
-                    self.task_completed.emit(idx, False, "Không đặt được lịch")
+                    self._emit_task_completed(idx, False, "Không đặt được lịch")
                     return
                 await asyncio.sleep(1)
                 # Click nút Schedule
@@ -824,16 +1064,16 @@ class UploadWorker(QThread):
 
             if not post_clicked:
                 await self._try_save_draft(cdp, idx)
-                self.task_completed.emit(idx, False, "Không bấm được nút Đăng")
+                self._emit_task_completed(idx, False, "Không bấm được nút Đăng")
                 return
 
             # ── PHASE 6: Xác nhận ──
             await asyncio.sleep(3)
-            success = await self._verify_post_success(cdp, idx)
+            success = await self._verify_post_success(cdp, idx, is_schedule=is_schedule)
 
             if success:
                 self.status_updated.emit(idx, "✅ Đăng thành công!", "green")
-                self.task_completed.emit(idx, True, "OK")
+                self._emit_task_completed(idx, True, "OK")
 
                 # Xóa file nếu được tick
                 if self.settings.get("delete_on_success", False):
@@ -845,12 +1085,19 @@ class UploadWorker(QThread):
             else:
                 # Fallback: save draft
                 await self._try_save_draft(cdp, idx)
-                self.task_completed.emit(idx, False, "Không xác nhận được thành công")
+                self._emit_task_completed(idx, False, "Không xác nhận được thành công")
 
             await cdp.disconnect()
 
         finally:
             # Đóng browser
+            if process is not None:
+                try:
+                    from browser_manager import BrowserManager
+                    BrowserManager().close_browser(task.get("browser_id"), task.get("profile_dir", ""))
+                except Exception:
+                    pass
+            self._stop_local_proxy_bridge(task.get("browser_id"))
             self._stop_gologin_profile(gl, debug_port)
 
     # ═══════════════════════════════════════════════
@@ -1364,6 +1611,7 @@ class UploadWorker(QThread):
         """Chờ upload + render hoàn tất."""
         start = time.time()
         last_pct = -1
+        ready_streak = 0
 
         while time.time() - start < timeout_sec:
             if self._stop_flag:
@@ -1372,23 +1620,45 @@ class UploadWorker(QThread):
             # Kiểm tra progress
             info = await cdp.evaluate("""
                 (() => {
+                    const normalize = (text) => String(text || '')
+                        .toLowerCase()
+                        .normalize('NFD')
+                        .replace(/[\\u0300-\\u036f]/g, '')
+                        .replace(/đ/g, 'd')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 &&
+                            style.display !== 'none' && style.visibility !== 'hidden';
+                    };
                     const body = document.body ? document.body.innerText : '';
-                    // Tìm phần trăm upload
                     const match = body.match(/(\\d+)\\s*%/);
                     const pct = match ? parseInt(match[1]) : -1;
-                    // Kiểm tra đã ready chưa (nút Post/Schedule enabled)
-                    const btns = document.querySelectorAll('button');
+                    const btns = document.querySelectorAll('button, [role="button"]');
                     let postReady = false;
+                    let readyText = '';
                     for (const b of btns) {
-                        const t = b.innerText.toLowerCase().trim();
-                        if ((t === 'post' || t === 'đăng' || t === 'schedule' || t === 'lên lịch' || t === 'đăng bài') && !b.disabled) {
+                        if (!visible(b)) continue;
+                        const rect = b.getBoundingClientRect();
+                        if (rect.top < window.innerHeight * 0.45) continue;
+                        const t = normalize(
+                            b.innerText || b.textContent || b.getAttribute('aria-label') || ''
+                        );
+                        if (
+                            (t === 'post' || t === 'dang' || t === 'dang bai' || t === 'dang video')
+                            && !b.disabled
+                            && b.getAttribute('aria-disabled') !== 'true'
+                        ) {
                             postReady = true;
+                            readyText = t;
                             break;
                         }
                     }
-                    // Kiểm tra lỗi
                     const hasError = body.includes('Upload failed') || body.includes('Tải lên thất bại');
-                    return {pct, postReady, hasError};
+                    return {pct, postReady, hasError, readyText};
                 })()
             """)
 
@@ -1404,13 +1674,212 @@ class UploadWorker(QThread):
                     last_pct = pct
 
                 if info.get("postReady"):
-                    self.status_updated.emit(idx, "✅ Upload + Render hoàn tất!", "green")
-                    return True
+                    ready_streak += 1
+                    if ready_streak >= 2:
+                        self.status_updated.emit(idx, "✅ Upload + Render hoàn tất!", "green")
+                        return True
+                else:
+                    ready_streak = 0
 
             await asyncio.sleep(3)
 
         self.status_updated.emit(idx, "⏰ Upload timeout", "red")
         return False
+
+    async def _get_publish_button_state(self, cdp, is_schedule=False):
+        target_texts = ["schedule", "len lich"] if is_schedule else ["post", "dang", "dang bai", "dang video"]
+        return await cdp.evaluate(f"""
+            (() => {{
+                const targets = {_json.dumps(target_texts)};
+                const normalize = (text) => String(text || '')
+                    .toLowerCase()
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '')
+                    .replace(/đ/g, 'd')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                const visible = (el) => {{
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.display !== 'none' && style.visibility !== 'hidden';
+                }};
+                const buttons = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"]'))
+                    .filter(visible)
+                    .map(el => {{
+                        const rect = el.getBoundingClientRect();
+                        const text = normalize(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+                        return {{
+                            text,
+                            disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + rect.height / 2,
+                            width: rect.width,
+                            height: rect.height,
+                            top: rect.top,
+                            left: rect.left,
+                            inViewport:
+                                rect.bottom > 0 &&
+                                rect.right > 0 &&
+                                rect.top < window.innerHeight &&
+                                rect.left < window.innerWidth,
+                        }};
+                    }})
+                    .filter(x => x.text && targets.some(t => x.text === t || x.text.includes(t)));
+
+                buttons.sort((a, b) => b.top - a.top || b.width - a.width || a.left - b.left);
+                const best = buttons[0] || null;
+                return {{
+                    found: !!best,
+                    enabled: !!(best && !best.disabled),
+                    text: best ? best.text : '',
+                    x: best ? best.x : 0,
+                    y: best ? best.y : 0,
+                    count: buttons.length,
+                }};
+            }})()
+        """) or {}
+
+    async def _scroll_publish_button_into_view(self, cdp, is_schedule=False):
+        target_texts = ["schedule", "len lich"] if is_schedule else ["post", "dang", "dang bai", "dang video"]
+        return await cdp.evaluate(f"""
+            (() => {{
+                const targets = {_json.dumps(target_texts)};
+                const normalize = (text) => String(text || '')
+                    .toLowerCase()
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '')
+                    .replace(/đ/g, 'd')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                const visible = (el) => {{
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.display !== 'none' && style.visibility !== 'hidden';
+                }};
+                const buttons = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"]'))
+                    .filter(visible)
+                    .map(el => {{
+                        const rect = el.getBoundingClientRect();
+                        const text = normalize(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+                        return {{el, rect, text, disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true'}};
+                    }})
+                    .filter(x => x.text && targets.some(t => x.text === t || x.text.includes(t)));
+                buttons.sort((a, b) => b.rect.top - a.rect.top || b.rect.width - a.rect.width || a.rect.left - b.rect.left);
+                const best = buttons[0];
+                if (!best) return false;
+                try {{
+                    best.el.scrollIntoView({{behavior: 'instant', block: 'center', inline: 'center'}});
+                    return true;
+                }} catch (_err) {{
+                    return false;
+                }}
+            }})()
+        """) or False
+
+    async def _js_click_publish_button(self, cdp, is_schedule=False):
+        target_texts = ["schedule", "len lich"] if is_schedule else ["post", "dang", "dang bai", "dang video"]
+        return await cdp.evaluate(f"""
+            (() => {{
+                const targets = {_json.dumps(target_texts)};
+                const normalize = (text) => String(text || '')
+                    .toLowerCase()
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '')
+                    .replace(/đ/g, 'd')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                const visible = (el) => {{
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.display !== 'none' && style.visibility !== 'hidden';
+                }};
+                const fire = (el) => {{
+                    el.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true}}));
+                    el.dispatchEvent(new MouseEvent('mouseenter', {{bubbles: true}}));
+                    el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
+                    el.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true}}));
+                    el.dispatchEvent(new MouseEvent('click', {{bubbles: true}}));
+                }};
+                const buttons = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"]'))
+                    .filter(visible)
+                    .map(el => {{
+                        const rect = el.getBoundingClientRect();
+                        const text = normalize(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+                        return {{el, rect, text, disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true'}};
+                    }})
+                    .filter(x => x.text && targets.some(t => x.text === t || x.text.includes(t)) && !x.disabled);
+                buttons.sort((a, b) => b.rect.top - a.rect.top || b.rect.width - a.rect.width || a.rect.left - b.rect.left);
+                const best = buttons[0];
+                if (!best) return {{clicked: false, text: ''}};
+                try {{
+                    best.el.scrollIntoView({{behavior: 'instant', block: 'center', inline: 'center'}});
+                }} catch (_err) {{}}
+                try {{ best.el.focus(); }} catch (_err) {{}}
+                try {{ fire(best.el); }} catch (_err) {{}}
+                try {{ best.el.click(); }} catch (_err) {{}}
+                const rect = best.el.getBoundingClientRect();
+                return {{
+                    clicked: true,
+                    text: best.text,
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                    inViewport:
+                        rect.bottom > 0 &&
+                        rect.right > 0 &&
+                        rect.top < window.innerHeight &&
+                        rect.left < window.innerWidth,
+                }};
+            }})()
+        """) or {}
+
+    async def _wait_publish_button_ready(self, cdp, is_schedule=False, idx=None, timeout=30):
+        deadline = time.time() + max(3, int(timeout))
+        ready_streak = 0
+        last_state = {}
+        last_log_bucket = -1
+
+        while not self._stop_flag and time.time() < deadline:
+            await self._dismiss_popups(cdp, idx, press_escape=(ready_streak == 0))
+            state = await self._get_publish_button_state(cdp, is_schedule=is_schedule)
+            last_state = state or {}
+
+            if state and state.get("found") and not state.get("inViewport"):
+                await self._scroll_publish_button_into_view(cdp, is_schedule=is_schedule)
+                await asyncio.sleep(0.6)
+                state = await self._get_publish_button_state(cdp, is_schedule=is_schedule)
+                last_state = state or last_state
+
+            if state and state.get("found") and state.get("enabled"):
+                ready_streak += 1
+                if ready_streak >= 2:
+                    return state
+            else:
+                ready_streak = 0
+
+            if idx is not None:
+                remaining = max(0, int(deadline - time.time()))
+                bucket = remaining // 5
+                if bucket != last_log_bucket:
+                    last_log_bucket = bucket
+                    label = "Lên lịch" if is_schedule else "Đăng"
+                    if state and state.get("found"):
+                        self.status_updated.emit(
+                            idx,
+                            f"⏳ Đang chờ nút {label} sẵn sàng... ({state.get('text') or 'found'})",
+                            "blue",
+                        )
+                    else:
+                        self.status_updated.emit(idx, f"⏳ Đang chờ nút {label} xuất hiện...", "blue")
+
+            await asyncio.sleep(1.2)
+
+        return last_state or {}
 
     async def _fill_caption(self, cdp, title):
         """Điền tiêu đề vào ô caption (DraftJS editor)."""
@@ -2695,54 +3164,78 @@ class UploadWorker(QThread):
 
     async def _click_post_button(self, cdp, is_schedule=False, idx=None):
         """Click nút Post hoặc Schedule."""
-        target_texts = ["schedule", "lên lịch"] if is_schedule else ["post", "đăng", "đăng bài", "đăng video"]
+        state = await self._wait_publish_button_ready(cdp, is_schedule=is_schedule, idx=idx, timeout=35)
+        if not state or not state.get("found") or not state.get("enabled"):
+            return False
 
-        if is_schedule:
-            target_texts.extend(["schedule", "lên lịch"])
-        else:
-            target_texts.extend(["post", "đăng", "đăng bài", "đăng video"])
+        for attempt in range(4):
+            await self._scroll_publish_button_into_view(cdp, is_schedule=is_schedule)
+            await asyncio.sleep(0.4)
+            state = await self._get_publish_button_state(cdp, is_schedule=is_schedule)
+            x = int(state.get("x") or 0)
+            y = int(state.get("y") or 0)
+            if x <= 0 or y <= 0:
+                state = await self._get_publish_button_state(cdp, is_schedule=is_schedule)
+                x = int(state.get("x") or 0)
+                y = int(state.get("y") or 0)
+                if x <= 0 or y <= 0:
+                    await asyncio.sleep(1)
+                    continue
 
-        for attempt in range(5):
-            await self._dismiss_popups(cdp, idx, press_escape=(attempt == 0))
-            clicked = await cdp.evaluate(f"""
-                (() => {{
-                    const visible = (el) => {{
+            await self._show_visible_cursor(cdp, x, y, idx)
+            try:
+                await cdp.mouse_move(x, y)
+            except Exception:
+                pass
+            await asyncio.sleep(0.15)
+            js_result = await self._js_click_publish_button(cdp, is_schedule=is_schedule)
+            await asyncio.sleep(0.25)
+            await cdp.click_at(x, y)
+            await asyncio.sleep(0.6)
+            if not js_result or not js_result.get("clicked"):
+                await cdp.evaluate(f"""
+                    (() => {{
+                        const el = document.elementFromPoint({x}, {y});
                         if (!el) return false;
-                        const style = getComputedStyle(el);
-                        const rect = el.getBoundingClientRect();
-                        return style.display !== 'none' && style.visibility !== 'hidden' &&
-                               rect.width > 0 && rect.height > 0;
-                    }};
-                    const fire = (el) => {{
-                        el.scrollIntoView({{behavior: 'smooth', block: 'center'}});
-                        el.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true}}));
-                        el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
-                        el.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true}}));
-                        el.dispatchEvent(new MouseEvent('click', {{bubbles: true}}));
-                    }};
-                    const targets = {_json.dumps(target_texts)};
-                    const btns = document.querySelectorAll('button');
-                    for (const btn of btns) {{
-                        const t = btn.innerText.toLowerCase().trim();
-                        if (visible(btn) && targets.some(x => t === x || t.includes(x)) && !btn.disabled) {{
-                            fire(btn);
+                        const target = el.closest('button, [role="button"], div[role="button"]') || el;
+                        try {{
+                            target.click();
                             return true;
+                        }} catch (_err) {{
+                            return false;
                         }}
-                    }}
-                    return false;
-                }})()
-            """)
-            if clicked:
-                await asyncio.sleep(1)
-                await self._dismiss_popups(cdp, idx, press_escape=False)
+                    }})()
+                """)
+
+            await asyncio.sleep(1.0)
+            await self._dismiss_popups(cdp, idx, press_escape=False)
+
+            next_state = await self._get_publish_button_state(cdp, is_schedule=is_schedule)
+            url = ""
+            try:
+                url = (await cdp.get_url()) or ""
+            except Exception:
+                url = ""
+
+            if "/content" in url or "/manage" in url:
                 return True
-            await asyncio.sleep(2)
+            if not next_state or not next_state.get("found"):
+                return True
+            if next_state.get("text") != state.get("text") or not next_state.get("enabled"):
+                return True
+
+            state = next_state
+            if idx is not None and attempt < 3:
+                label = "Lên lịch" if is_schedule else "Đăng"
+                self.status_updated.emit(idx, f"🔁 Nút {label} vẫn còn, thử bấm lại lần {attempt + 2}...", "orange")
+            await asyncio.sleep(1.2)
 
         return False
 
-    async def _verify_post_success(self, cdp, idx=None):
+    async def _verify_post_success(self, cdp, idx=None, is_schedule=False):
         """Kiểm tra đăng bài thành công."""
-        for _ in range(10):
+        deadline = time.time() + 45
+        while not self._stop_flag and time.time() < deadline:
             await self._dismiss_popups(cdp, idx, press_escape=False)
             url = await cdp.get_url()
             if "/content" in url or "/manage" in url:
@@ -2750,16 +3243,45 @@ class UploadWorker(QThread):
 
             body_check = await cdp.evaluate("""
                 (() => {
-                    const body = document.body ? document.body.innerText : '';
-                    if (body.includes('đã được đăng') || body.includes('successfully') ||
-                        body.includes('đã được lên lịch') || body.includes('scheduled') ||
-                        body.includes('Quản lý bài đăng') || body.includes('Manage your posts')) return true;
-                    return false;
+                    const normalize = (text) => String(text || '')
+                        .toLowerCase()
+                        .normalize('NFD')
+                        .replace(/[\\u0300-\\u036f]/g, '')
+                        .replace(/đ/g, 'd')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                    const body = normalize(document.body ? document.body.innerText : '');
+                    const success =
+                        body.includes('da duoc dang') ||
+                        body.includes('posted successfully') ||
+                        body.includes('successfully posted') ||
+                        body.includes('da duoc len lich') ||
+                        body.includes('scheduled successfully') ||
+                        body.includes('quan ly bai dang') ||
+                        body.includes('manage your posts');
+                    const busy =
+                        body.includes('posting') ||
+                        body.includes('publishing') ||
+                        body.includes('processing') ||
+                        body.includes('dang xu ly') ||
+                        body.includes('dang dang') ||
+                        body.includes('vui long cho');
+                    return {success, busy};
                 })()
             """)
-            if body_check:
+            if body_check and body_check.get("success"):
                 return True
-            await asyncio.sleep(1.5)
+
+            button_state = await self._get_publish_button_state(cdp, is_schedule=is_schedule)
+            still_ready = bool(button_state and button_state.get("found") and button_state.get("enabled"))
+            busy = bool(body_check and body_check.get("busy"))
+
+            if not still_ready and not busy:
+                # Button disappeared/disabled and page is transitioning; give TikTok more time.
+                await asyncio.sleep(2.5)
+                continue
+
+            await asyncio.sleep(2.0)
         return False
 
     async def _try_save_draft(self, cdp, idx):
@@ -2797,3 +3319,4 @@ class UploadWorker(QThread):
             self.status_updated.emit(idx, "💾 Đã lưu Draft", "orange")
             await asyncio.sleep(1)
         return bool(saved)
+

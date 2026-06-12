@@ -7,21 +7,92 @@ from scheduler_dialog import SchedulerDialog
 from title_editor_dialog import TitleEditorDialog
 from account_selector_dialog import AccountSelectorDialog
 from upload_dashboard import UploadDashboard
-from app_paths import gologin_base_dir, gologin_profile_dir
-
-GOLOGIN_BASE_DIR = str(gologin_base_dir())
-
-
-def get_browser_profile_dir(browser_id):
-    if not browser_id:
-        return ""
-    return str(gologin_profile_dir(browser_id))
+from gologin_profile_utils import first_real_gologin_profile_id
+from browser_backend_utils import (
+    LOCAL_CHROME_BACKEND,
+    GOLOGIN_BACKEND,
+    STEALTH_FIREFOX_BACKEND,
+    ensure_profile_backend_defaults,
+    normalize_browser_backend,
+)
 
 
 class VideoTableManager:
     """Quản lý các thao tác liên quan đến bảng Video (Hẹn giờ/Đăng bài)"""
     def __init__(self, main_gui):
         self.gui = main_gui
+
+    def _table_text(self, table, row, col):
+        item = table.item(row, col)
+        return item.text().strip() if item else ""
+
+    def _account_upload_identity(self, row):
+        name_item = self.gui.acc_table.item(row, 1)
+        try:
+            data = ensure_profile_backend_defaults(dict(name_item.data(Qt.UserRole) or {})) if name_item else {}
+        except Exception:
+            data = {}
+
+        ten_ho_so = (
+            self._table_text(self.gui.acc_table, row, 1)
+            or str(data.get("ten_ho_so") or "").strip()
+            or f"Row {row + 1}"
+        )
+        browser_id = (
+            str(data.get("browser_id") or "").strip()
+            or self._table_text(self.gui.acc_table, row, 4)
+        )
+        backend = normalize_browser_backend(data.get("browser_backend"))
+        gologin_profile_id = ""
+        if backend == LOCAL_CHROME_BACKEND:
+            task_browser_id = browser_id
+            profile_key = f"local_chrome:{browser_id}" if browser_id else f"row:{row}"
+        elif backend == STEALTH_FIREFOX_BACKEND:
+            task_browser_id = browser_id
+            profile_key = f"stealth_firefox:{browser_id}" if browser_id else f"row:{row}"
+        else:
+            gologin_profile_id = first_real_gologin_profile_id(
+                data.get("gologin_profile_id"),
+                browser_id,
+            )
+            task_browser_id = gologin_profile_id or browser_id
+            profile_key = (
+                f"gologin:{gologin_profile_id}"
+                if gologin_profile_id
+                else f"row:{row}"
+            )
+            backend = GOLOGIN_BACKEND
+
+        return {
+            "ten_ho_so": ten_ho_so,
+            "source_row": row,
+            "profile_key": profile_key,
+            "browser_backend": backend,
+            "browser_id": task_browser_id,
+            "gologin_profile_id": gologin_profile_id,
+            "proxy": self._table_text(self.gui.acc_table, row, 3),
+            "proxy_type": str(data.get("proxy_type") or "").strip(),
+            "cookie": str(data.get("cookie") or "").strip(),
+            "id_tiktok": self._table_text(self.gui.acc_table, row, 5),
+            "tong_views": self._table_text(self.gui.acc_table, row, 8),
+            "views_30": self._table_text(self.gui.acc_table, row, 6),
+            "tinh_trang": self._table_text(self.gui.acc_table, row, 12),
+            "stt": self._table_text(self.gui.acc_table, row, 25) or str(row + 1),
+        }
+
+    def _make_upload_to_item(self, account_info):
+        item = QTableWidgetItem(account_info.get("ten_ho_so", ""))
+        item.setData(Qt.UserRole, {
+            "profile_key": account_info.get("profile_key", ""),
+            "source_row": account_info.get("source_row", -1),
+            "browser_backend": account_info.get("browser_backend", ""),
+            "browser_id": account_info.get("browser_id", ""),
+            "gologin_profile_id": account_info.get("gologin_profile_id", ""),
+            "proxy": account_info.get("proxy", ""),
+            "proxy_type": account_info.get("proxy_type", ""),
+            "cookie": account_info.get("cookie", ""),
+        })
+        return item
 
     def handle_choose_video_folder(self):
         """Action 1: Chọn thư mục Video và lưu vào profile"""
@@ -98,7 +169,11 @@ class VideoTableManager:
             t_item = self.gui.video_table.item(i, 0)
             p_item = self.gui.video_table.item(i, 3)
             if t_item and p_item:
-                existing_keys.add(f"{t_item.text()}_{p_item.text()}")
+                try:
+                    p_meta = dict(p_item.data(Qt.UserRole) or {})
+                except Exception:
+                    p_meta = {}
+                existing_keys.add(f"{t_item.text()}_{p_meta.get('profile_key') or p_item.text()}")
         
         for index in selected_rows:
             row = index.row()
@@ -109,7 +184,8 @@ class VideoTableManager:
                 continue
                 
             folder_path = folder_item.text().strip()
-            profile_name = name_item.text() if name_item else "Unknown"
+            account_info = self._account_upload_identity(row)
+            profile_name = account_info.get("ten_ho_so") or (name_item.text() if name_item else "Unknown")
             
             if not os.path.exists(folder_path):
                 QMessageBox.warning(self.gui, "Lỗi", f"Thư mục không tồn tại:\n{folder_path}")
@@ -123,7 +199,7 @@ class VideoTableManager:
                 if limit > 0 and loaded_for_profile >= limit:
                     break
                     
-                key = f"{v['title']}_{v['upload_to']}"
+                key = f"{v['title']}_{account_info.get('profile_key') or v['upload_to']}"
                 if key in existing_keys:
                     continue 
                     
@@ -133,7 +209,7 @@ class VideoTableManager:
                 self.gui.video_table.setItem(v_row, 0, QTableWidgetItem(v['title']))
                 self.gui.video_table.setItem(v_row, 1, QTableWidgetItem(v['duration']))
                 self.gui.video_table.setItem(v_row, 2, QTableWidgetItem("Đang chờ"))
-                self.gui.video_table.setItem(v_row, 3, QTableWidgetItem(v['upload_to']))
+                self.gui.video_table.setItem(v_row, 3, self._make_upload_to_item(account_info))
                 self.gui.video_table.setItem(v_row, 4, QTableWidgetItem("Ready"))
                 self.gui.video_table.setItem(v_row, 6, QTableWidgetItem(v['full_path']))
                 
@@ -247,23 +323,7 @@ class VideoTableManager:
         # Build account data
         account_data = []
         for r in range(self.gui.acc_table.rowCount()):
-            ten_ho_so = self.gui.acc_table.item(r, 1).text() if self.gui.acc_table.item(r, 1) else ""
-            proxy = self.gui.acc_table.item(r, 3).text() if self.gui.acc_table.item(r, 3) else ""
-            id_tiktok = self.gui.acc_table.item(r, 5).text() if self.gui.acc_table.item(r, 5) else ""
-            tong_views = self.gui.acc_table.item(r, 8).text() if self.gui.acc_table.item(r, 8) else ""
-            views_30 = self.gui.acc_table.item(r, 6).text() if self.gui.acc_table.item(r, 6) else ""
-            tinh_trang = self.gui.acc_table.item(r, 12).text() if self.gui.acc_table.item(r, 12) else ""
-            stt = self.gui.acc_table.item(r, 25).text() if self.gui.acc_table.item(r, 25) else str(r+1)
-            
-            account_data.append({
-                "ten_ho_so": ten_ho_so,
-                "proxy": proxy,
-                "id_tiktok": id_tiktok,
-                "tong_views": tong_views,
-                "views_30": views_30,
-                "tinh_trang": tinh_trang,
-                "stt": stt
-            })
+            account_data.append(self._account_upload_identity(r))
             
         dialog = AccountSelectorDialog(self.gui, account_data=account_data, selected_video_indices=video_indices)
         if dialog.exec_():
@@ -274,7 +334,7 @@ class VideoTableManager:
             num_accs = len(accounts)
             
             for i, row_index in enumerate(video_indices):
-                assigned_acc = ""
+                assigned_acc = {}
                 if mode == "single":
                     # Chia mảng tuần tự (ví dụ 5 video, 2 acc -> acc1 có 3, acc2 có 2)
                     chunk_size = math.ceil(num_vids / num_accs)
@@ -286,7 +346,9 @@ class VideoTableManager:
                 elif mode == "random":
                     assigned_acc = random.choice(accounts)
                     
-                self.gui.video_table.setItem(row_index, 3, QTableWidgetItem(assigned_acc))
+                if not isinstance(assigned_acc, dict):
+                    assigned_acc = {"ten_ho_so": str(assigned_acc or "")}
+                self.gui.video_table.setItem(row_index, 3, self._make_upload_to_item(assigned_acc))
                 
             self.gui.log(f"Đã gán tài khoản upload cho {num_vids} video theo kiểu '{mode}'.", "green")
 
@@ -296,32 +358,20 @@ class VideoTableManager:
             QMessageBox.warning(self.gui, "Cảnh báo", "Vui lòng chọn ít nhất 1 video để đưa vào hàng chờ upload!")
             return
 
-        # Build lookup: ten profile -> GoLogin profile/session data.
         profile_lookup = {}
+        name_lookup = {}
         for r in range(self.gui.acc_table.rowCount()):
-            name_item = self.gui.acc_table.item(r, 1)
-            if name_item:
-                name = name_item.text()
-                data = name_item.data(Qt.UserRole) or {}
-                browser_id = data.get("browser_id", "")
-                gologin_profile_id = data.get("gologin_profile_id", "") or browser_id
-                profile_dir = get_browser_profile_dir(browser_id)
-                proxy = self.gui.acc_table.item(r, 3).text() if self.gui.acc_table.item(r, 3) else ""
-                profile_lookup[name] = {
-                    "profile_dir": profile_dir,
-                    "browser_id": browser_id,
-                    "gologin_profile_id": gologin_profile_id,
-                    "proxy": proxy,
-                    "proxy_type": data.get("proxy_type", ""),
-                    "cookie": data.get("cookie", "")
-                }
+            info = self._account_upload_identity(r)
+            profile_lookup[info["profile_key"]] = info
+            name_lookup.setdefault(info["ten_ho_so"], []).append(info)
 
         video_tasks = []
         for index in selected_rows:
             row = index.row()
             title = self.gui.video_table.item(row, 0).text() if self.gui.video_table.item(row, 0) else ""
             status = self.gui.video_table.item(row, 2).text() if self.gui.video_table.item(row, 2) else ""
-            upload_to = self.gui.video_table.item(row, 3).text() if self.gui.video_table.item(row, 3) else ""
+            upload_item = self.gui.video_table.item(row, 3)
+            upload_to = upload_item.text() if upload_item else ""
             file_path = self.gui.video_table.item(row, 6).text() if self.gui.video_table.item(row, 6) else ""
 
             schedule_time = "Public"
@@ -330,14 +380,37 @@ class VideoTableManager:
                 schedule_time = status_text.split(":", 1)[1].strip()
 
             # Lấy thông tin profile
-            pinfo = profile_lookup.get(upload_to, {})
+            upload_meta = {}
+            if upload_item:
+                try:
+                    upload_meta = dict(upload_item.data(Qt.UserRole) or {})
+                except Exception:
+                    upload_meta = {}
+            profile_key = upload_meta.get("profile_key", "")
+            pinfo = profile_lookup.get(profile_key, {}) if profile_key else {}
+            if not pinfo and upload_meta.get("gologin_profile_id"):
+                pinfo = upload_meta
+            if not pinfo and upload_to:
+                matches = name_lookup.get(upload_to, [])
+                if len(matches) == 1:
+                    pinfo = matches[0]
+                elif len(matches) > 1:
+                    QMessageBox.warning(
+                        self.gui,
+                        "Trung ten profile",
+                        f"Video '{title}' dang gan voi ten profile bi trung: {upload_to}.\n"
+                        "Hay chon lai tai khoan Upload cho video nay de gan dung GoLogin ID.",
+                    )
+                    return
 
             video_tasks.append({
                 "title": title,
                 "schedule_time": schedule_time,
                 "upload_to": upload_to,
                 "file_path": file_path,
-                "profile_dir": pinfo.get("profile_dir", ""),
+                "upload_profile_key": pinfo.get("profile_key", ""),
+                "source_account_row": pinfo.get("source_row", -1),
+                "browser_backend": pinfo.get("browser_backend", "gologin"),
                 "browser_id": pinfo.get("browser_id", ""),
                 "gologin_profile_id": pinfo.get("gologin_profile_id", ""),
                 "proxy": pinfo.get("proxy", ""),

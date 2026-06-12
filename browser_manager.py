@@ -5,7 +5,7 @@ import subprocess
 import threading
 import time
 
-from app_paths import gologin_base_dir, require_orbita_browser_exe
+from app_paths import gologin_base_dir, require_chrome_exe, require_orbita_browser_exe
 
 GOLOGIN_BASE_DIR = str(gologin_base_dir())
 
@@ -63,7 +63,9 @@ class BrowserManager:
             sock.bind(("127.0.0.1", 0))
             return sock.getsockname()[1]
 
-    def _find_browser_exe(self, chrome_path=None):
+    def _find_browser_exe(self, chrome_path=None, browser_backend="gologin"):
+        if str(browser_backend or "").strip().lower() == "local_chrome":
+            return require_chrome_exe(chrome_path)
         return require_orbita_browser_exe(chrome_path)
 
     def _find_external_profile_process(self, profile_dir):
@@ -75,7 +77,7 @@ class BrowserManager:
             for proc in psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
                     name = (proc.info.get("name") or "").lower()
-                    if name not in {"chrome.exe", "orbita-browser.exe", "chromium.exe"}:
+                    if name not in {"chrome.exe", "orbita-browser.exe", "chromium.exe", "firefox.exe"}:
                         continue
                     cmdline = proc.info.get("cmdline") or []
                     for arg in cmdline:
@@ -131,6 +133,7 @@ class BrowserManager:
         proxy_server="",
         extra_args=None,
         chrome_path=None,
+        browser_backend="gologin",
         creationflags=0x08000000,
         cwd=None,
     ):
@@ -161,7 +164,7 @@ class BrowserManager:
 
             os.makedirs(profile_dir, exist_ok=True)
             port = self._find_free_port()
-            exe_path = self._find_browser_exe(chrome_path)
+            exe_path = self._find_browser_exe(chrome_path, browser_backend=browser_backend)
 
             width = int(width or 960)
             height = int(height or 680)

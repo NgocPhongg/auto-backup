@@ -1,10 +1,11 @@
-import sys
+﻿import sys
 import os
 import asyncio
 import random
 import json
 import time
 import re
+import traceback
 
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QCheckBox,
@@ -17,12 +18,61 @@ from PyQt5.QtCore import Qt, QEvent, QThread, pyqtSignal, QUrl, QTimer, QPoint
 from PyQt5.QtGui import QColor, QCursor
 from PyQt5.QtNetwork import QNetworkCookie
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
+from PyQt5 import sip
 from gologin_profile_utils import first_real_gologin_profile_id
-from app_paths import data_file, named_browser_profile_dir
+from app_paths import data_file, named_browser_profile_dir, require_chrome_exe, require_stealth_firefox_exe
+from browser_backend_utils import (
+    LOCAL_CHROME_BACKEND,
+    GOLOGIN_BACKEND,
+    STEALTH_FIREFOX_BACKEND,
+    normalize_browser_backend,
+)
 
 
 def get_profile_dir(profile_name):
     return str(named_browser_profile_dir(profile_name))
+
+
+def _write_dashboard_exception_log(context, exc):
+    try:
+        base = os.getenv("APPDATA")
+        if base:
+            log_dir = os.path.join(base, "AutoBackup", "logs")
+        else:
+            log_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(log_dir, f"dashboard_exception_{stamp}.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{context}\n")
+            f.write("=" * 80 + "\n")
+            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            f.write("\n")
+        return path
+    except Exception:
+        return ""
+
+def _repair_ui_text(text):
+    value = str(text or "")
+    suspicious = "ÃÄâð€™œžŸŠŒ"
+    if not any(ch in value for ch in suspicious):
+        return value
+
+    candidates = [value]
+    for encoding in ("cp1252", "latin1"):
+        try:
+            repaired = value.encode(encoding, "ignore").decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if repaired:
+            candidates.append(repaired)
+
+    def score(item):
+        weird = sum(item.count(ch) for ch in suspicious)
+        replacement = item.count("\ufffd") + item.count("?")
+        return (weird, replacement, len(item))
+
+    return min(candidates, key=score)
 
 
 # ============================================================
@@ -578,19 +628,19 @@ class AutomationDashboard(QDialog):
         top_bar = QHBoxLayout(top_bar_widget)
         top_bar.setContentsMargins(12, 0, 12, 0)
 
-        lbl_title = QLabel("🎯 Bảng theo dõi")
+        lbl_title = QLabel("Bảng theo dõi")
         lbl_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #3b82f6;")
         top_bar.addWidget(lbl_title)
 
-        top_bar.addWidget(QLabel("luồng"))
+        top_bar.addWidget(QLabel("Luồng"))
         self.spin_luong = QSpinBox(); self.spin_luong.setValue(1); self.spin_luong.setFixedWidth(50)
         top_bar.addWidget(self.spin_luong)
-        top_bar.addWidget(QLabel("?? tr?"))
+        top_bar.addWidget(QLabel("Độ trễ"))
         self.spin_delay = QSpinBox(); self.spin_delay.setRange(1, 60); self.spin_delay.setValue(3); self.spin_delay.setFixedWidth(50)
         top_bar.addWidget(self.spin_delay)
 
         preset_label = QLabel(
-            f"preset {self._dashboard_preset['label']} "
+            f"Preset {self._dashboard_preset['label']} "
             f"{self._dashboard_preset['screen_w']}x{self._dashboard_preset['screen_h']}"
         )
         preset_label.setStyleSheet("font-size: 12px; color: #64748b; margin-left: 10px;")
@@ -606,10 +656,6 @@ class AutomationDashboard(QDialog):
         self.chk_browser.setStyleSheet("color: #16a34a;")
         top_bar.addWidget(self.chk_browser)
 
-        self.chk_cache = QCheckBox("Tự động dọn cache")
-        self.chk_cache.setChecked(True)
-        top_bar.addWidget(self.chk_cache)
-
         btn_minimize = QPushButton("-")
         btn_minimize.setToolTip("Thu nhỏ / ẩn bảng theo dõi")
         btn_minimize.setStyleSheet("background: #64748b; color: #ffffff; font-weight: bold; border-radius: 4px;")
@@ -617,7 +663,7 @@ class AutomationDashboard(QDialog):
         btn_minimize.clicked.connect(self.hide_dashboard)
         top_bar.addWidget(btn_minimize)
 
-        btn_close = QPushButton("✕ Đóng")
+        btn_close = QPushButton("Đóng")
         btn_close.setStyleSheet("background: #ef4444; color: #ffffff; font-weight: bold; border-radius: 4px;")
         btn_close.setFixedWidth(70)
         btn_close.clicked.connect(self.close)
@@ -672,11 +718,6 @@ class AutomationDashboard(QDialog):
             ("Đổi avatar", "#8b5cf6"),
             ("Tương tác ở Feed", "#3b82f6"),
             ("Tương tác theo từ khóa", "#3b82f6"),
-            ("KYC(gologin)(pro)", "#f59e0b"),
-            ("Đặt riêng tư (pro)", "#f59e0b"),
-            ("Đổi mật khẩu Firefox (pro)", "#f59e0b"),
-            ("Đăng nhập mail (pro)", "#f59e0b"),
-            ("Xóa tài khoản(pro)", "#ef4444"),
         ]
         self.feature_widgets = {}
         for feat, color in features:
@@ -729,11 +770,7 @@ class AutomationDashboard(QDialog):
 
         btn_browser = QPushButton("🌍 Mở trình duyệt")
         btn_browser.clicked.connect(self.on_open_browser)
-        btn_tach = QPushButton("🔀 Tách điều khiển")
-        btn_done = QPushButton("👁 Ẩn/hiện mục xong")
-        grid_buttons.addWidget(btn_browser, 1, 0)
-        grid_buttons.addWidget(btn_tach, 1, 1)
-        grid_buttons.addWidget(btn_done, 1, 2)
+        grid_buttons.addWidget(btn_browser, 1, 0, 1, 3)
 
         left_layout.addWidget(btn_container)
         splitter.addWidget(left_widget)
@@ -910,8 +947,14 @@ class AutomationDashboard(QDialog):
                                            profile_index=row,
                                            account_row=row,
                                            embed_browser=embed_browser)
-            preview.data_updated.connect(self._on_preview_data_updated)
-            preview.status_updated.connect(self._on_preview_status_updated)
+            preview.data_updated.connect(
+                lambda account_row, new_data:
+                    self._safe_dashboard_callback("data_updated", self._on_preview_data_updated, account_row, new_data)
+            )
+            preview.status_updated.connect(
+                lambda account_row, msg, color:
+                    self._safe_dashboard_callback("status_updated", self._on_preview_status_updated, account_row, msg, color)
+            )
             r, c = idx // max_cols, idx % max_cols
             self.browser_grid_layout.addWidget(preview, r, c)
             # Dùng browser_id làm key unique (không dùng profile_name vì có thể trùng)
@@ -982,8 +1025,14 @@ class AutomationDashboard(QDialog):
                                            profile_index=row,
                                            account_row=row,
                                            embed_browser=embed_browser)
-            preview.data_updated.connect(self._on_preview_data_updated)
-            preview.status_updated.connect(self._on_preview_status_updated)
+            preview.data_updated.connect(
+                lambda account_row, new_data:
+                    self._safe_dashboard_callback("data_updated", self._on_preview_data_updated, account_row, new_data)
+            )
+            preview.status_updated.connect(
+                lambda account_row, msg, color:
+                    self._safe_dashboard_callback("status_updated", self._on_preview_status_updated, account_row, msg, color)
+            )
             r, c = idx // max_cols, idx % max_cols
             self.browser_grid_layout.addWidget(preview, r, c)
             self.browser_widgets[browser_id] = preview
@@ -1094,8 +1143,14 @@ class AutomationDashboard(QDialog):
                                            profile_index=row,
                                            account_row=row,
                                            embed_browser=embed_browser)
-            preview.data_updated.connect(self._on_preview_data_updated)
-            preview.status_updated.connect(self._on_preview_status_updated)
+            preview.data_updated.connect(
+                lambda account_row, new_data:
+                    self._safe_dashboard_callback("data_updated", self._on_preview_data_updated, account_row, new_data)
+            )
+            preview.status_updated.connect(
+                lambda account_row, msg, color:
+                    self._safe_dashboard_callback("status_updated", self._on_preview_status_updated, account_row, msg, color)
+            )
             r, c = idx // max_cols, idx % max_cols
             self.browser_grid_layout.addWidget(preview, r, c)
             # Dùng browser_id làm key unique (không dùng profile_name vì có thể trùng)
@@ -1166,8 +1221,14 @@ class AutomationDashboard(QDialog):
                                            profile_index=row,
                                            account_row=row,
                                            embed_browser=embed_browser)
-            preview.data_updated.connect(self._on_preview_data_updated)
-            preview.status_updated.connect(self._on_preview_status_updated)
+            preview.data_updated.connect(
+                lambda account_row, new_data:
+                    self._safe_dashboard_callback("data_updated", self._on_preview_data_updated, account_row, new_data)
+            )
+            preview.status_updated.connect(
+                lambda account_row, msg, color:
+                    self._safe_dashboard_callback("status_updated", self._on_preview_status_updated, account_row, msg, color)
+            )
             r, c = idx // max_cols, idx % max_cols
             self.browser_grid_layout.addWidget(preview, r, c)
             self.browser_widgets[browser_id] = preview
@@ -1204,14 +1265,29 @@ class AutomationDashboard(QDialog):
         columns = acc_info.setdefault("columns", {})
         profile_data = acc_info.setdefault("profile_data", {})
 
-        browser_id = first_real_gologin_profile_id(
-            profile_data.get("gologin_profile_id"),
-            profile_data.get("browser_id"),
-            columns.get("4"),
-        )
-        profile_data["browser_id"] = browser_id
-        profile_data["gologin_profile_id"] = browser_id
-        columns["4"] = browser_id
+        backend = normalize_browser_backend(profile_data.get("browser_backend"))
+        if backend == LOCAL_CHROME_BACKEND:
+            browser_id = str(profile_data.get("browser_id") or columns.get("4") or "").strip()
+            profile_data["browser_backend"] = LOCAL_CHROME_BACKEND
+            profile_data["browser_id"] = browser_id
+            profile_data["gologin_profile_id"] = ""
+            columns["4"] = browser_id
+        elif backend == STEALTH_FIREFOX_BACKEND:
+            browser_id = str(profile_data.get("browser_id") or columns.get("4") or "").strip()
+            profile_data["browser_backend"] = STEALTH_FIREFOX_BACKEND
+            profile_data["browser_id"] = browser_id
+            profile_data["gologin_profile_id"] = ""
+            columns["4"] = browser_id
+        else:
+            browser_id = first_real_gologin_profile_id(
+                profile_data.get("gologin_profile_id"),
+                profile_data.get("browser_id"),
+                columns.get("4"),
+            )
+            profile_data["browser_backend"] = GOLOGIN_BACKEND
+            profile_data["browser_id"] = browser_id
+            profile_data["gologin_profile_id"] = browser_id
+            columns["4"] = browser_id
 
         source_row = acc_info.get("source_row")
         parent = self.parent()
@@ -1222,6 +1298,9 @@ class AutomationDashboard(QDialog):
                 if name_item:
                     pdata = dict(name_item.data(Qt.UserRole) or {})
                     pdata["browser_id"] = browser_id
+                    pdata["browser_backend"] = profile_data.get("browser_backend", GOLOGIN_BACKEND)
+                    if backend != GOLOGIN_BACKEND:
+                        pdata["gologin_profile_id"] = ""
                     name_item.setData(Qt.UserRole, pdata)
 
         return acc_info, profile_data, columns, browser_id
@@ -1296,10 +1375,32 @@ class AutomationDashboard(QDialog):
         if not profile_key:
             return
         self._stopping_profile_keys[profile_key] = row
+        if self._row_status_is_error(row):
+            return
         self._set_table_status(
             row,
             "Dang don trinh duyet cu, vui long cho Orbita/GoLogin dong xong...",
             "#f59e0b",
+        )
+
+    def _row_status_is_error(self, row):
+        if not (0 <= row < self.table.rowCount()):
+            return False
+        item = self.table.item(row, 5)
+        text = item.text().strip().lower() if item else ""
+        return any(
+            marker in text
+            for marker in (
+                "loi",
+                "lỗi",
+                "error",
+                "proxy khong",
+                "proxy không",
+                "proxy loi",
+                "proxy lỗi",
+                "thieu",
+                "thiếu",
+            )
         )
 
     def _on_preview_browser_closed(self, row, profile_key, reason="closed"):
@@ -1314,7 +1415,8 @@ class AutomationDashboard(QDialog):
         self._stopping_profile_keys.pop(profile_key, None)
         self._running_rows.discard(row)
         self._release_profile(profile_key)
-        self._set_table_status(row, "Da dong trinh duyet, co the chay lai", "#6b7280")
+        if not self._row_status_is_error(row):
+            self._set_table_status(row, "Da dong trinh duyet, co the chay lai", "#6b7280")
 
         if self._pending_restart_request and not self._stopping_profile_keys:
             request = self._pending_restart_request
@@ -1347,6 +1449,114 @@ class AutomationDashboard(QDialog):
         self._pending_start_timers.clear()
 
     def _check_gologin_local_requirements(self, selected_rows):
+        gologin_rows = []
+        local_rows = []
+        stealth_rows = []
+        missing_local_ids = []
+        missing_stealth_ids = []
+        missing_gologin_ids = []
+
+        for row in selected_rows:
+            if row < 0 or row >= len(self.accounts_data):
+                continue
+            acc_info = self.accounts_data[row]
+            profile_data = acc_info.get("profile_data", {})
+            columns = acc_info.get("columns", {})
+            backend = normalize_browser_backend(profile_data.get("browser_backend"))
+            browser_id = str(
+                profile_data.get("browser_id")
+                or columns.get("4")
+                or ""
+            ).strip()
+            if backend != LOCAL_CHROME_BACKEND and browser_id.startswith("local_chrome:"):
+                backend = LOCAL_CHROME_BACKEND
+            if backend != STEALTH_FIREFOX_BACKEND and browser_id.startswith("stealth_firefox:"):
+                backend = STEALTH_FIREFOX_BACKEND
+
+            name = (
+                profile_data.get("ten_ho_so")
+                or columns.get("1")
+                or f"Row {row + 1}"
+            )
+
+            if backend == LOCAL_CHROME_BACKEND:
+                local_rows.append(row)
+                if not browser_id:
+                    missing_local_ids.append(str(name))
+            elif backend == STEALTH_FIREFOX_BACKEND:
+                stealth_rows.append(row)
+                if not browser_id:
+                    missing_stealth_ids.append(str(name))
+            else:
+                gologin_rows.append(row)
+                resolved_id = first_real_gologin_profile_id(
+                    profile_data.get("gologin_profile_id"),
+                    profile_data.get("browser_id"),
+                    columns.get("4"),
+                )
+                if not resolved_id:
+                    missing_gologin_ids.append(str(name))
+
+        if missing_local_ids:
+            sample = "\n".join(missing_local_ids[:8])
+            more = "" if len(missing_local_ids) <= 8 else f"\n... va {len(missing_local_ids) - 8} profile khac"
+            QMessageBox.warning(
+                self,
+                "Local Chrome",
+                "Cac profile Local Chrome nay chua co browser_id nen khong the mo:\n\n"
+                f"{sample}{more}",
+            )
+            return False
+
+        if local_rows:
+            try:
+                require_chrome_exe()
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Local Chrome",
+                    f"Khong tim thay Chrome local cho profile Local Chrome:\n{e}",
+                )
+                return False
+
+        if missing_stealth_ids:
+            sample = "\n".join(missing_stealth_ids[:8])
+            more = "" if len(missing_stealth_ids) <= 8 else f"\n... va {len(missing_stealth_ids) - 8} profile khac"
+            QMessageBox.warning(
+                self,
+                "Stealth Firefox",
+                "Cac profile Stealth Firefox nay chua co browser_id nen khong the mo:\n\n"
+                f"{sample}{more}",
+            )
+            return False
+
+        if stealth_rows:
+            try:
+                require_stealth_firefox_exe()
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Stealth Firefox",
+                    f"Khong tim thay Firefox patched cho profile Stealth Firefox:\n{e}",
+                )
+                return False
+            try:
+                import importlib.util
+                if importlib.util.find_spec("invisible_playwright") is None:
+                    raise ImportError("python -m pip install invisible_playwright")
+            except Exception:
+                QMessageBox.warning(
+                    self,
+                    "Stealth Firefox",
+                    "May nay chua cai invisible_playwright.\n\n"
+                    "Cai truoc bang lenh:\n"
+                    "python -m pip install invisible_playwright",
+                )
+                return False
+
+        if not gologin_rows:
+            return True
+
         try:
             from gologin_config import load_gologin_settings
             settings = load_gologin_settings()
@@ -1362,7 +1572,7 @@ class AutomationDashboard(QDialog):
             QMessageBox.warning(
                 self,
                 "GoLogin Local SDK",
-                "Thiếu GoLogin API Key. Vào menu API | Cookie để nhập token trước khi chạy.",
+                "Thieu GoLogin API Key. Vao menu API | Cookie de nhap token truoc khi chay GoLogin profile.",
             )
             return False
 
@@ -1390,44 +1600,72 @@ class AutomationDashboard(QDialog):
             QMessageBox.warning(
                 self,
                 "GoLogin Local SDK",
-                "Chưa thấy Orbita local của GoLogin SDK.\n\n"
-                "Hãy cài/mở GoLogin hoặc chạy GoLogin SDK lần đầu để tải Orbita trước.\n"
-                f"Thư mục kiểm tra:\n{browser_root}",
+                "Chua thay Orbita local cua GoLogin SDK.\n\n"
+                "Hay cai/mo GoLogin hoac chay GoLogin SDK lan dau de tai Orbita truoc.\n"
+                f"Thu muc kiem tra:\n{browser_root}",
             )
             return False
 
-        missing = []
-        for row in selected_rows:
-            if row < 0 or row >= len(self.accounts_data):
-                continue
-            acc_info = self.accounts_data[row]
-            profile_data = acc_info.get("profile_data", {})
-            columns = acc_info.get("columns", {})
-            resolved_id = first_real_gologin_profile_id(
-                profile_data.get("gologin_profile_id"),
-                profile_data.get("browser_id"),
-                columns.get("4"),
-            )
-            if not resolved_id:
-                name = (
-                    profile_data.get("ten_ho_so")
-                    or columns.get("1")
-                    or f"Row {row + 1}"
-                )
-                missing.append(str(name))
-
-        if missing:
-            sample = "\n".join(missing[:8])
-            more = "" if len(missing) <= 8 else f"\n... va {len(missing) - 8} profile khac"
+        if missing_gologin_ids:
+            sample = "\n".join(missing_gologin_ids[:8])
+            more = "" if len(missing_gologin_ids) <= 8 else f"\n... va {len(missing_gologin_ids) - 8} profile khac"
             QMessageBox.warning(
                 self,
                 "GoLogin Local SDK",
-                "Cac profile nay chua co GoLogin Profile ID that nen khong the chay bang GoLogin:\n\n"
+                "Cac profile GoLogin nay chua co GoLogin Profile ID that nen khong the chay bang GoLogin:\n\n"
                 f"{sample}{more}",
             )
             return False
 
         return True
+
+    def _filter_unsupported_automation_rows(self, selected_rows, manual_only=False):
+        if manual_only:
+            return list(selected_rows or [])
+
+        allowed_rows = []
+        unsupported_names = []
+        for row in list(selected_rows or []):
+            if row < 0 or row >= len(self.accounts_data):
+                continue
+            acc_info = self.accounts_data[row]
+            profile_data = acc_info.get("profile_data", {})
+            columns = acc_info.get("columns", {})
+            browser_id = str(
+                profile_data.get("browser_id")
+                or columns.get("4")
+                or ""
+            ).strip()
+            backend = normalize_browser_backend(profile_data.get("browser_backend"))
+            if backend != STEALTH_FIREFOX_BACKEND and browser_id.startswith("stealth_firefox:"):
+                backend = STEALTH_FIREFOX_BACKEND
+            if backend == STEALTH_FIREFOX_BACKEND:
+                name = (
+                    profile_data.get("ten_ho_so")
+                    or columns.get("1")
+                    or f"Row {row + 1}"
+                )
+                unsupported_names.append(str(name))
+                self._set_table_status(
+                    row,
+                    "Bo qua: Stealth Firefox hien chi ho tro mo trinh duyet tay",
+                    "#f59e0b",
+                )
+                continue
+            allowed_rows.append(row)
+
+        if unsupported_names:
+            sample = "\n".join(f"- {name}" for name in unsupported_names[:8])
+            more = "" if len(unsupported_names) <= 8 else f"\n... va {len(unsupported_names) - 8} profile khac"
+            QMessageBox.information(
+                self,
+                "Stealth Firefox",
+                "Cac profile sau dang de backend Stealth Firefox nen tool se bo qua trong lan chay auto:\n\n"
+                f"{sample}{more}\n\n"
+                "Backend nay hien chi ho tro Mo trinh duyet de dang nhap/thao tac tay.",
+            )
+
+        return allowed_rows
 
     def _clear_browser_grid(self):
         for i in reversed(range(self.browser_grid_layout.count())):
@@ -1659,6 +1897,20 @@ class AutomationDashboard(QDialog):
         selected_rows = list(preset_rows) if preset_rows is not None else self._selected_rows()
         if not selected_rows:
             return
+        if not manual_only:
+            selected_features = [
+                f for f, w in self.feature_widgets.items() if w["chk"].isChecked()
+            ]
+            if not selected_features:
+                QMessageBox.warning(
+                    self,
+                    "Automation",
+                    "Ban chua tick chuc nang nao de chay auto.",
+                )
+                return
+        selected_rows = self._filter_unsupported_automation_rows(selected_rows, manual_only=manual_only)
+        if not selected_rows:
+            return
         if not self._check_gologin_local_requirements(selected_rows):
             return
 
@@ -1742,17 +1994,57 @@ class AutomationDashboard(QDialog):
             start_collapsed=start_collapsed,
         )
         run_generation = self._run_generation
-        preview.data_updated.connect(self._on_preview_data_updated)
-        preview.status_updated.connect(self._on_preview_status_updated)
+        preview.data_updated.connect(
+            lambda account_row, new_data:
+                self._safe_dashboard_callback("data_updated", self._on_preview_data_updated, account_row, new_data)
+        )
+        preview.status_updated.connect(
+            lambda account_row, msg, color:
+                self._safe_dashboard_callback("status_updated", self._on_preview_status_updated, account_row, msg, color)
+        )
         preview.automation_finished.connect(
             lambda row, profile_key=profile_key, generation=run_generation:
-                self._on_preview_finished(row, profile_key, generation)
+                self._safe_dashboard_callback(
+                    "automation_finished",
+                    self._on_preview_finished,
+                    row,
+                    profile_key,
+                    generation,
+                )
         )
         preview.browser_closed.connect(
             lambda row, reason, profile_key=profile_key:
-                self._on_preview_browser_closed(row, profile_key, reason)
+                self._safe_dashboard_callback(
+                    "browser_closed",
+                    self._on_preview_browser_closed,
+                    row,
+                    profile_key,
+                    reason,
+                )
         )
         return preview
+
+    def _safe_dashboard_callback(self, context, func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            path = _write_dashboard_exception_log(context, exc)
+            message = f"Loi GUI dashboard ({context}): {str(exc)[:160]}"
+            if path:
+                message += f" | log: {path}"
+            try:
+                row = int(args[0]) if args else -1
+            except Exception:
+                row = -1
+            try:
+                if 0 <= row < self.table.rowCount():
+                    self._set_table_status(row, message, "#ef4444")
+            except Exception:
+                pass
+            try:
+                print(message, file=sys.stderr)
+            except Exception:
+                pass
 
     def _prepare_preview_grid(self, selected_rows):
         embed_browser = self.chk_browser.isChecked()
@@ -1816,7 +2108,7 @@ class AutomationDashboard(QDialog):
                 continue
 
             if delay_ms:
-                self._set_table_status(row, f"Ch? ch?y sau {delay_ms // 1000}s...", "#6b7280")
+                self._set_table_status(row, f"Chờ chạy sau {delay_ms // 1000}s...", "#6b7280")
             timer = QTimer(self)
             timer.setSingleShot(True)
             timer.timeout.connect(lambda row=row, timer=timer: self._start_scheduled_profile(row, timer))
@@ -1887,15 +2179,20 @@ class AutomationDashboard(QDialog):
             self._set_table_status(row, "Dang chay...", "#3b82f6")
             return
 
-        self._running_rows.add(row)
-        self._set_table_status(row, "Dang chay...", "#3b82f6")
         preview.update_status("Dang khoi dong worker...", "blue")
 
         try:
             if self._run_mode == "manual":
-                preview.open_browser_only()
+                started = bool(preview.open_browser_only())
             else:
-                preview.start_automation()
+                started = bool(preview.start_automation())
+            worker = getattr(preview, "worker", None)
+            if not started or not worker or not worker.isRunning():
+                self._set_table_status(row, "Loi khoi chay: worker khong duoc tao", "#ef4444")
+                self._on_preview_browser_closed(row, profile_key, "worker_not_started")
+                return
+            self._running_rows.add(row)
+            self._set_table_status(row, "Dang chay...", "#3b82f6")
         except Exception as e:
             self._set_table_status(row, f"Loi khoi chay: {str(e)[:80]}", "#ef4444")
             self._on_preview_browser_closed(row, profile_key, "start_error")
@@ -1980,11 +2277,14 @@ class AutomationDashboard(QDialog):
             refresh_token = new_data.get("refresh_token", "")
             if refresh_token:
                 acc.setdefault("profile_data", {})["refresh_token"] = refresh_token
-            if "proxy_type" in new_data and new_data.get("proxy_type"):
-                acc.setdefault("profile_data", {})["proxy_type"] = new_data.get("proxy_type")
-            gologin_proxy_synced = new_data.get("gologin_proxy_synced", "")
-            if gologin_proxy_synced:
-                acc.setdefault("profile_data", {})["gologin_proxy_synced"] = gologin_proxy_synced
+            if "proxy" in new_data:
+                proxy_value = new_data.get("proxy", "")
+                acc.setdefault("profile_data", {})["proxy"] = proxy_value
+                acc.setdefault("columns", {})["3"] = proxy_value
+            if "proxy_type" in new_data:
+                acc.setdefault("profile_data", {})["proxy_type"] = new_data.get("proxy_type", "")
+            if "gologin_proxy_synced" in new_data:
+                acc.setdefault("profile_data", {})["gologin_proxy_synced"] = new_data.get("gologin_proxy_synced", "")
             gologin_fp_refreshed = new_data.get("gologin_fingerprint_refreshed_at", "")
             if gologin_fp_refreshed:
                 acc.setdefault("profile_data", {})["gologin_fingerprint_refreshed_at"] = gologin_fp_refreshed
@@ -2048,11 +2348,14 @@ class AutomationDashboard(QDialog):
                     refresh_token = new_data.get("refresh_token", "")
                     if refresh_token:
                         pdata["refresh_token"] = refresh_token
-                    if "proxy_type" in new_data and new_data.get("proxy_type"):
-                        pdata["proxy_type"] = new_data.get("proxy_type")
-                    gologin_proxy_synced = new_data.get("gologin_proxy_synced", "")
-                    if gologin_proxy_synced:
-                        pdata["gologin_proxy_synced"] = gologin_proxy_synced
+                    if "proxy" in new_data:
+                        proxy_value = new_data.get("proxy", "")
+                        pdata["proxy"] = proxy_value
+                        t.setItem(target_row, 3, QTableWidgetItem(proxy_value))
+                    if "proxy_type" in new_data:
+                        pdata["proxy_type"] = new_data.get("proxy_type", "")
+                    if "gologin_proxy_synced" in new_data:
+                        pdata["gologin_proxy_synced"] = new_data.get("gologin_proxy_synced", "")
                     gologin_fp_refreshed = new_data.get("gologin_fingerprint_refreshed_at", "")
                     if gologin_fp_refreshed:
                         pdata["gologin_fingerprint_refreshed_at"] = gologin_fp_refreshed
@@ -2076,6 +2379,7 @@ class AutomationDashboard(QDialog):
         self._schedule_parent_save()
 
     def _on_preview_status_updated(self, account_row, msg, color):
+        msg = _repair_ui_text(msg)
         if not hasattr(self, "_last_table_status"):
             self._last_table_status = {}
         payload = (msg, color)
@@ -2153,6 +2457,8 @@ class BrowserPreviewWidget(QFrame):
         self._fingerprint_worker = None
         self._browser_surface_visible = True
         self._keyboard_target_hwnd = 0
+        self._widget_disposed = False
+        self.destroyed.connect(self._mark_widget_disposed)
 
         self.setFrameShape(QFrame.NoFrame)
         self.setStyleSheet("""
@@ -2250,6 +2556,28 @@ class BrowserPreviewWidget(QFrame):
         if start_collapsed:
             self._set_browser_surface_visible(False)
 
+    def _mark_widget_disposed(self, *_args):
+        self._widget_disposed = True
+        try:
+            if self._status_emit_timer and self._status_emit_timer.isActive():
+                self._status_emit_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._stop_embed_timers()
+        except Exception:
+            pass
+
+    def _is_widget_alive(self):
+        if self._widget_disposed:
+            return False
+        try:
+            if sip.isdeleted(self):
+                return False
+        except Exception:
+            pass
+        return True
+
     def set_preview_size(self, preview_width, browser_height):
         self._preview_width = max(520, int(preview_width or self._preview_width))
         self._browser_height = max(368, int(browser_height or self._browser_height))
@@ -2285,6 +2613,9 @@ class BrowserPreviewWidget(QFrame):
         self._notify_dashboard_resize()
 
     def update_status(self, text, color="gray"):
+        if not self._is_widget_alive():
+            return
+        text = _repair_ui_text(text)
         payload = (text, color)
         if payload == self._last_status_payload:
             return
@@ -2310,16 +2641,71 @@ class BrowserPreviewWidget(QFrame):
             self.lbl_status.setText(text)
 
     def _connect_worker_signals(self):
-        self.worker.status_update.connect(self._on_status)
-        self.worker.finished_signal.connect(self._on_finished)
-        self.worker.profile_update_signal.connect(self._on_profile_update)
+        self.worker.status_update.connect(
+            lambda msg, color:
+                self._safe_widget_callback("worker_status", self._on_status, msg, color)
+        )
+        self.worker.finished_signal.connect(
+            lambda result:
+                self._safe_widget_callback("worker_finished", self._on_finished, result)
+        )
+        self.worker.profile_update_signal.connect(
+            lambda data:
+                self._safe_widget_callback("worker_profile_update", self._on_profile_update, data)
+        )
         if hasattr(self.worker, "browser_ready_signal"):
-            self.worker.browser_ready_signal.connect(self._on_browser_ready)
+            self.worker.browser_ready_signal.connect(
+                lambda info:
+                    self._safe_widget_callback("browser_ready", self._on_browser_ready, info)
+            )
         if hasattr(self.worker, "browser_closed_signal"):
-            self.worker.browser_closed_signal.connect(self._on_browser_closed)
+            self.worker.browser_closed_signal.connect(
+                lambda reason:
+                    self._safe_widget_callback("browser_closed", self._on_browser_closed, reason)
+            )
+
+    def _safe_widget_callback(self, context, func, *args, **kwargs):
+        if not self._is_widget_alive():
+            return
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            if not self._is_widget_alive():
+                return
+            path = _write_dashboard_exception_log(f"preview_{context}", exc)
+            message = f"Loi preview ({context}): {str(exc)[:160]}"
+            if path:
+                message += f" | log: {path}"
+            try:
+                self.update_status(message, "red")
+            except Exception:
+                pass
+            try:
+                self.status_updated.emit(self.account_row, message, "#ef4444")
+            except Exception:
+                pass
+            try:
+                print(message, file=sys.stderr)
+            except Exception:
+                pass
 
     def _on_browser_closed(self, reason="closed"):
-        self.update_status("Da dong trinh duyet.", "gray")
+        if not self._is_widget_alive():
+            return
+        try:
+            last_text = self.lbl_status.text().strip().lower() if hasattr(self, "lbl_status") else ""
+        except RuntimeError:
+            last_text = ""
+        last_color = str(getattr(self, "_last_status_color", "") or "").lower()
+        is_error_status = (
+            last_color in ("red", "#ef4444")
+            or any(marker in last_text for marker in ("loi", "lỗi", "error", "proxy khong", "proxy loi"))
+        )
+        if not is_error_status:
+            try:
+                self.update_status("Da dong trinh duyet.", "gray")
+            except RuntimeError:
+                pass
         self._stop_embed_timers()
         self.browser_closed.emit(self.account_row, str(reason or "closed"))
 
@@ -2427,7 +2813,7 @@ class BrowserPreviewWidget(QFrame):
                 detail += f", err={state.get('last_error')}"
             self._finish_browser_embed(
                 False,
-                message=f"Khong tim thay cua so Orbita/Chrome dung GoLogin profile ({detail})",
+                message=f"Khong tim thay cua so browser de nhung vao khung ({detail})",
                 color="orange",
             )
             return
@@ -2490,7 +2876,7 @@ class BrowserPreviewWidget(QFrame):
         embed_token = str(info.get("embed_token") or "").strip().lower()
         launch_started_at = float(info.get("launch_started_at") or 0.0)
         known_pid = int(info.get("process_pid") or 0)
-        browser_names = {"chrome.exe", "orbita-browser.exe", "chromium.exe"}
+        browser_names = {"chrome.exe", "orbita-browser.exe", "chromium.exe", "firefox.exe"}
 
         def norm_path(path):
             if worker and hasattr(worker, "_norm_proc_path"):
@@ -2571,20 +2957,53 @@ class BrowserPreviewWidget(QFrame):
             except Exception:
                 return 0
 
+        def title_rank(title):
+            text = str(title or "").strip().lower()
+            if not text:
+                return 0
+            generic_titles = {
+                "nightly",
+                "firefox",
+                "mozilla firefox",
+                "new tab",
+                "about:blank",
+                "chrome",
+                "google chrome",
+                "orbita",
+            }
+            if text in generic_titles:
+                return 0
+            if len(text) >= 12:
+                return 2
+            return 1
+
         def enum_cb(hwnd, _):
             try:
                 if not win32gui.IsWindow(hwnd):
                     return True
                 if not win32gui.IsWindowVisible(hwnd):
                     return True
-                if win32gui.GetClassName(hwnd) != "Chrome_WidgetWin_1":
+                class_name = win32gui.GetClassName(hwnd)
+                if class_name != "Chrome_WidgetWin_1" and not class_name.startswith("MozillaWindowClass"):
                     return True
                 area = hwnd_area(hwnd)
                 if area < 20000:
                     return True
                 process_id = ctypes.c_ulong()
                 ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
-                hwnds.append((hwnd, int(process_id.value), area, win32gui.GetParent(hwnd)))
+                title = ""
+                try:
+                    title = win32gui.GetWindowText(hwnd)
+                except Exception:
+                    pass
+                hwnds.append((
+                    int(hwnd),
+                    int(process_id.value),
+                    area,
+                    win32gui.GetParent(hwnd),
+                    class_name,
+                    title,
+                ))
             except Exception:
                 pass
             return True
@@ -2614,9 +3033,10 @@ class BrowserPreviewWidget(QFrame):
         exact = []
         hinted = []
         fresh = []
-        for hwnd, wpid, area, parent_hwnd in hwnds:
+        for hwnd, wpid, area, parent_hwnd, _class_name, title in hwnds:
+            rank = title_rank(title)
             if wpid in all_pids:
-                exact.append((area, hwnd, wpid))
+                exact.append((rank, area, hwnd, wpid))
                 continue
 
             data = proc_info(wpid)
@@ -2625,9 +3045,9 @@ class BrowserPreviewWidget(QFrame):
             if launch_started_at and data["created_at"] < launch_started_at - 10:
                 continue
             if has_hint(data):
-                hinted.append((data["created_at"], area, hwnd, wpid))
+                hinted.append((rank, data["created_at"], area, hwnd, wpid))
             elif attempt >= 120 and not parent_hwnd:
-                fresh.append((data["created_at"], area, hwnd, wpid))
+                fresh.append((rank, data["created_at"], area, hwnd, wpid))
 
         match_count = len(exact) + len(hinted) + len(fresh)
         stats = {
@@ -2638,13 +3058,17 @@ class BrowserPreviewWidget(QFrame):
         }
 
         if exact:
-            _area, hwnd, pid = max(exact, key=lambda item: item[0])
+            _rank, _area, hwnd, pid = max(exact, key=lambda item: (item[0], item[1]))
             return (hwnd, pid), stats
         if hinted:
-            _created, _area, hwnd, pid = max(hinted, key=lambda item: (item[0], item[1]))
+            _rank, _created, _area, hwnd, pid = max(hinted, key=lambda item: (item[0], item[1], item[2]))
             return (hwnd, pid), stats
         if len(fresh) == 1:
-            _created, _area, hwnd, pid = fresh[0]
+            _rank, _created, _area, hwnd, pid = fresh[0]
+            self._on_status(f"Embed fallback: fresh hwnd pid={pid}, port={debug_port}", "orange")
+            return (hwnd, pid), stats
+        if fresh:
+            _rank, _created, _area, hwnd, pid = max(fresh, key=lambda item: (item[0], item[1], item[2]))
             self._on_status(f"Embed fallback: fresh hwnd pid={pid}, port={debug_port}", "orange")
             return (hwnd, pid), stats
         return None, stats
@@ -2666,6 +3090,15 @@ class BrowserPreviewWidget(QFrame):
         try:
             import win32gui
 
+            try:
+                class_name = str(win32gui.GetClassName(hwnd) or "")
+            except Exception:
+                class_name = ""
+            if class_name.startswith("MozillaWindowClass"):
+                firefox_insets = self._measure_firefox_embed_insets(hwnd)
+                if firefox_insets:
+                    return firefox_insets
+
             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
             client_left, client_top = win32gui.ClientToScreen(hwnd, (0, 0))
             client_width, client_height = win32gui.GetClientRect(hwnd)[2:4]
@@ -2680,17 +3113,96 @@ class BrowserPreviewWidget(QFrame):
         except Exception:
             return None
 
+    def _first_firefox_compositor_child(self, root_hwnd):
+        try:
+            import win32con
+            import win32gui
+        except Exception:
+            return 0
+
+        matches = []
+
+        def hwnd_area(hwnd):
+            try:
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                return max(0, right - left) * max(0, bottom - top)
+            except Exception:
+                return 0
+
+        def walk(hwnd, depth=0):
+            try:
+                if not win32gui.IsWindow(hwnd):
+                    return
+                class_name = str(win32gui.GetClassName(hwnd) or "")
+                if class_name == "MozillaCompositorWindowClass":
+                    area = hwnd_area(hwnd)
+                    if area >= 20000 and win32gui.IsWindowVisible(hwnd):
+                        matches.append((area, depth, int(hwnd)))
+                child = win32gui.GetWindow(hwnd, win32con.GW_CHILD)
+                while child:
+                    walk(child, depth + 1)
+                    child = win32gui.GetWindow(child, win32con.GW_HWNDNEXT)
+            except Exception:
+                return
+
+        walk(int(root_hwnd), 0)
+        if not matches:
+            return 0
+        _area, _depth, hwnd = max(matches, key=lambda item: (item[0], -item[1]))
+        return int(hwnd)
+
+    def _measure_firefox_embed_insets(self, root_hwnd):
+        try:
+            import win32gui
+
+            compositor_hwnd = self._first_firefox_compositor_child(root_hwnd)
+            if not compositor_hwnd:
+                return None
+            left, top, right, bottom = win32gui.GetWindowRect(root_hwnd)
+            comp_left, comp_top, comp_right, comp_bottom = win32gui.GetWindowRect(compositor_hwnd)
+            insets = (
+                max(0, int(comp_left) - int(left)),
+                max(0, int(comp_top) - int(top)),
+                max(0, int(right) - int(comp_right)),
+                max(0, int(bottom) - int(comp_bottom)),
+            )
+            return insets if any(insets) else (0, 0, 0, 0)
+        except Exception:
+            return None
+
+    def _embedded_hwnd_class(self, hwnd):
+        try:
+            import win32gui
+
+            if hwnd and win32gui.IsWindow(hwnd):
+                return str(win32gui.GetClassName(hwnd) or "")
+        except Exception:
+            pass
+        return ""
+
     def _embedded_window_rect(self, widget_id, hwnd=None):
         width, height = self._container_client_size(widget_id)
         insets = tuple(max(0, int(v)) for v in (self._embed_insets or (0, 0, 0, 0)))
+        target_class = self._embedded_hwnd_class(hwnd) if hwnd else ""
+        if target_class.startswith("MozillaWindowClass"):
+            return (
+                0,
+                0,
+                max(1, width),
+                max(1, height),
+            )
         if hwnd:
             measured = self._measure_embedded_window_insets(hwnd)
             if measured and any(measured):
                 insets = measured
                 self._embed_insets = measured
         if not any(insets):
-            overscan_x = max(0, int(self._EMBED_OVERSCAN_X))
-            overscan_y = max(0, int(self._EMBED_OVERSCAN_Y))
+            if target_class == "MozillaCompositorWindowClass":
+                overscan_x = 0
+                overscan_y = 0
+            else:
+                overscan_x = max(0, int(self._EMBED_OVERSCAN_X))
+                overscan_y = max(0, int(self._EMBED_OVERSCAN_Y))
             insets = (overscan_x, overscan_y, overscan_x, overscan_y)
         left_inset, top_inset, right_inset, bottom_inset = insets
         return (
@@ -2867,21 +3379,13 @@ class BrowserPreviewWidget(QFrame):
         # Lấy HWND của container để nhúng browser vào nếu chk_browser checked
         widget_id = int(self.browser_container.winId()) if self.embed_browser else 0
 
-        from cdp_worker import CDPWorker
-        self.update_status("Dang tao CDP worker...", "blue")
-        self.worker = CDPWorker(
-            profile_index=self.profile_index,
-            profile_data=self.profile_data,
-            selected_features=self.selected_features,
-            feed_settings=self.feed_settings,
-            container_width=container_w,
-            container_height=container_h,
-            widget_id=widget_id,
-            planned_profile_count=self.planned_profile_count,
-        )
+        self.worker = self._build_worker(False, container_w, container_h, widget_id)
+        if not self.worker:
+            return False
         self._connect_worker_signals()
         self.worker.start()
-        self.update_status("Worker da start, dang mo GoLogin/Orbita...", "blue")
+        self.update_status("Worker da start, dang mo trinh duyet...", "blue")
+        return True
 
     def _on_profile_update(self, data):
         tiktok_id = data.get("tiktok_id", "")
@@ -2900,6 +3404,9 @@ class BrowserPreviewWidget(QFrame):
         self.data_updated.emit(self.account_row, data)
 
     def _queue_status_emit(self, msg, color):
+        if not self._is_widget_alive():
+            return
+        msg = _repair_ui_text(msg)
         payload = (msg, color)
         if payload == self._last_status_emit:
             return
@@ -2908,6 +3415,8 @@ class BrowserPreviewWidget(QFrame):
             self._status_emit_timer.start(300)
 
     def _flush_status_emit(self):
+        if not self._is_widget_alive():
+            return
         if not self._pending_status_emit:
             return
         msg, color = self._pending_status_emit
@@ -2919,6 +3428,9 @@ class BrowserPreviewWidget(QFrame):
         self.status_updated.emit(self.account_row, msg, color)
 
     def _on_status(self, msg, color):
+        if not self._is_widget_alive():
+            return
+        msg = _repair_ui_text(msg)
         self.update_status(msg, color)
         self._queue_status_emit(msg, color)
         if "Browser nhúng OK" in msg or "Browser đã nhúng" in msg:
@@ -2937,9 +3449,6 @@ class BrowserPreviewWidget(QFrame):
             self.update_status(f"Loi: {detail}", "red")
             self.status_updated.emit(self.account_row, f"Loi: {detail}", "#ef4444")
         self.automation_finished.emit(self.account_row)
-        return
-        if result == "success":
-            self.update_status("\u2705 Hoàn thành tất cả!", "green")
 
     def stop_automation(self):
         if self.worker:
@@ -2961,26 +3470,70 @@ class BrowserPreviewWidget(QFrame):
 
         widget_id = int(self.browser_container.winId()) if self.embed_browser else 0
 
+        self.worker = self._build_worker(True, container_w, container_h, widget_id)
+        if not self.worker:
+            return False
+        self._connect_worker_signals()
+        self.worker.start()
+        self.update_status("Worker da start, dang mo trinh duyet...", "blue")
+        return True
+
+    def _build_worker(self, manual_only, container_w, container_h, widget_id):
+        backend = normalize_browser_backend(self.profile_data.get("browser_backend"))
+        if backend == STEALTH_FIREFOX_BACKEND:
+            from stealth_firefox_worker import StealthFirefoxWorker
+
+            if not manual_only:
+                self.update_status(
+                    "Stealth Firefox hien chi ho tro mo browser + giu session. Dung Mo trinh duyet de login tay.",
+                    "orange",
+                )
+                self.status_updated.emit(
+                    self.account_row,
+                    "Stealth Firefox chua ho tro full automation trong ban dau.",
+                    "#f59e0b",
+                )
+                return None
+            self.update_status("Dang tao Stealth Firefox worker...", "blue")
+            return StealthFirefoxWorker(
+                profile_index=self.profile_index,
+                profile_data=self.profile_data,
+                selected_features=self.selected_features if not manual_only else [],
+                feed_settings=self.feed_settings if not manual_only else {},
+                container_width=container_w,
+                container_height=container_h,
+                widget_id=widget_id,
+                manual_only=manual_only,
+                planned_profile_count=self.planned_profile_count,
+            )
+
         from cdp_worker import CDPWorker
         self.update_status("Dang tao CDP worker...", "blue")
-        self.worker = CDPWorker(
+        return CDPWorker(
             profile_index=self.profile_index,
             profile_data=self.profile_data,
-            selected_features=[],  # KHÔNG chạy automation
-            feed_settings={},
+            selected_features=self.selected_features if not manual_only else [],
+            feed_settings=self.feed_settings if not manual_only else {},
             container_width=container_w,
             container_height=container_h,
             widget_id=widget_id,
-            manual_only=True,
+            manual_only=manual_only,
             planned_profile_count=self.planned_profile_count,
         )
-        self._connect_worker_signals()
-        self.worker.start()
-        self.update_status("Worker da start, dang mo GoLogin/Orbita...", "blue")
 
     def _change_fingerprint(self):
         if self._fingerprint_worker and self._fingerprint_worker.isRunning():
             self.update_status("Đang làm mới vân tay GoLogin...", "blue")
+            return
+
+        backend = normalize_browser_backend(self.profile_data.get("browser_backend"))
+        if backend != GOLOGIN_BACKEND:
+            QMessageBox.warning(
+                self,
+                "Fingerprint",
+                "Tinh nang lam moi fingerprint chi ap dung cho GoLogin profile.",
+            )
+            self.update_status("Backend nay khong ho tro lam moi fingerprint GoLogin.", "red")
             return
 
         profile_id = (self.profile_data.get("gologin_profile_id") or "").strip()

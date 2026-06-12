@@ -1,13 +1,16 @@
-from PyQt5.QtWidgets import (
+﻿from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QCheckBox,
     QPushButton, QSplitter, QScrollArea, QWidget, QGridLayout, 
-    QFrame, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QMessageBox
+    QFrame, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor
+import re
+import unicodedata
 
 from upload_worker import UploadWorker
-from automation_dashboard import BrowserPreviewWidget
+from automation_dashboard import BrowserPreviewWidget, _repair_ui_text
+from browser_backend_utils import ensure_profile_backend_defaults
 
 PREVIEW_WIDTH = 960
 PREVIEW_HEIGHT = 680
@@ -21,7 +24,8 @@ class UploadDashboard(QDialog):
         self._worker = None
         self._preview_containers = {}
         self._preview_widgets = {}
-        self._task_widgets = []  # Lưu reference để update trạng thái
+        self._task_widgets = []  # Luu reference de update trang thai
+        self._completed_tasks = set()
         self._closing_after_worker_stop = False
         
         self.init_ui()
@@ -50,32 +54,21 @@ class UploadDashboard(QDialog):
         lbl_title = QLabel("<h2>Dự án: Tổng tài khoản</h2>")
         top_layout.addWidget(lbl_title)
         
-        btn_render = QPushButton("Kết xuất")
-        btn_aff = QPushButton("Chế độ AFF (Gắn aff)")
-        top_layout.addWidget(btn_render)
-        top_layout.addWidget(btn_aff)
-        
         top_layout.addStretch()
         
         lbl_monitor = QLabel("<h2>Màn hình theo dõi</h2>")
         top_layout.addWidget(lbl_monitor)
         
-        search_box = QLineEdit()
-        search_box.setPlaceholderText("tìm màn hình theo tên hồ sơ | id tiktok")
-        search_box.setFixedWidth(300)
-        top_layout.addWidget(search_box)
-        
-        lbl_pro = QLabel("(pro đang mở)")
-        top_layout.addWidget(lbl_pro)
         
         top_layout.addStretch()
         
         chk_browser = QCheckBox("Đưa vào màn hình")
         chk_browser.setChecked(True)
+        self.chk_browser = chk_browser
         btn_close = QPushButton("Đóng")
         btn_close.clicked.connect(self.close)
-        
-        top_layout.addWidget(QLabel("Upload bang GoLogin/Orbita:"))
+
+        top_layout.addWidget(QLabel("Upload bằng trình duyệt:"))
         top_layout.addWidget(chk_browser)
         top_layout.addWidget(btn_close)
         
@@ -104,21 +97,17 @@ class UploadDashboard(QDialog):
         bottom_left_layout = QVBoxLayout(bottom_left)
         bottom_left_layout.setContentsMargins(0, 10, 0, 0)
         
-        chk_time = QCheckBox("Đến giờ đã set thì trình duyệt mở và tự đăng CÔNG KHAI")
-        chk_time.setChecked(True)
-        
         self.chk_delete_video = QCheckBox("Đăng video thành công thì XÓA VIDEO trong hàng chờ và FILE VIDEO")
         self.chk_delete_video.setChecked(True)
         self.chk_delete_video.setStyleSheet("color: #16a34a; font-weight: bold;")
         
-        bottom_left_layout.addWidget(chk_time)
         bottom_left_layout.addWidget(self.chk_delete_video)
         
         ctrl_row = QHBoxLayout()
         self.btn_run = QPushButton("▶ Chạy")
         self.btn_run.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
         self.btn_run.clicked.connect(self.on_run)
-        
+
         self.btn_stop = QPushButton("⏹ Dừng")
         self.btn_stop.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold;")
         self.btn_stop.clicked.connect(self.on_stop)
@@ -128,11 +117,7 @@ class UploadDashboard(QDialog):
         ctrl_row.addWidget(self.btn_stop)
         
         ctrl_row.addStretch()
-        ctrl_row.addWidget(QLabel("Luồng"))
-        self.spin_thread = QSpinBox()
-        self.spin_thread.setValue(1)
-        ctrl_row.addWidget(self.spin_thread)
-        ctrl_row.addWidget(QLabel("Do tre"))
+        ctrl_row.addWidget(QLabel("Độ trễ"))
         self.spin_delay = QSpinBox()
         self.spin_delay.setRange(1, 60)
         self.spin_delay.setValue(5)
@@ -146,8 +131,8 @@ class UploadDashboard(QDialog):
             ("#3498db", "Uploading"),
             ("#2ecc71", "Uploaded"),
             ("#e74c3c", "Upload lỗi"),
-            ("#f1c40f", "?ang k?t xu?t"),
-            ("#e67e22", "?? k?t xu?t"),
+            ("#f1c40f", "Đang kết xuất"),
+            ("#e67e22", "Đã kết xuất"),
             ("#9b59b6", "Render lỗi")
         ]
         for color, text in colors:
@@ -242,15 +227,27 @@ class UploadDashboard(QDialog):
         self._preview_widgets = {}
 
         if not self.video_tasks:
-            self.task_layout.addWidget(QLabel("Khong co video nao trong hang cho."))
+            self.task_layout.addWidget(QLabel("Không có video nào trong hàng chờ."))
             return
 
         account_groups = {}
         for idx, task in enumerate(self.video_tasks):
             account_name = task.get('upload_to') or 'Unknown'
-            account_groups.setdefault(account_name, []).append((idx, task))
+            group_key = (
+                task.get("upload_profile_key")
+                or task.get("gologin_profile_id")
+                or task.get("browser_id")
+                or account_name
+            )
+            group = account_groups.setdefault(
+                group_key,
+                {"name": account_name, "items": []},
+            )
+            group["items"].append((idx, task))
 
-        for account_name, items in account_groups.items():
+        for _group_key, group in account_groups.items():
+            account_name = group["name"]
+            items = group["items"]
             account_widget = QFrame()
             account_widget.setFrameShape(QFrame.StyledPanel)
             account_widget.setStyleSheet("background-color: white; border-radius: 5px; margin-bottom: 3px; border: 1px solid #dcdde1;")
@@ -282,32 +279,33 @@ class UploadDashboard(QDialog):
                 row_layout.addWidget(lbl_title)
                 row_layout.addStretch()
 
-                lbl_status = QLabel("Cho")
+                lbl_status = QLabel("Chờ")
                 lbl_status.setObjectName("status_label")
                 row_layout.addWidget(lbl_status)
 
                 row_widget = QWidget()
                 row_widget.setLayout(row_layout)
-                row_widget.setStyleSheet("background: transparent; border: none;")
+                row_widget.setStyleSheet(self._task_widget_style())
                 account_layout.addWidget(row_widget)
                 self._task_widgets[idx] = row_widget
 
             task_indices = [idx for idx, _task in items]
             first_idx, first_task = items[0]
-            profile_data = {
+            profile_data = ensure_profile_backend_defaults({
                 "ten_ho_so": account_name,
-                "gologin_profile_id": first_task.get("gologin_profile_id") or first_task.get("browser_id") or "",
+                "browser_backend": first_task.get("browser_backend") or "gologin",
+                "gologin_profile_id": first_task.get("gologin_profile_id") or "",
                 "browser_id": first_task.get("browser_id") or first_task.get("gologin_profile_id") or "",
-            }
+            })
             preview = BrowserPreviewWidget(
                 profile_name=account_name,
-                tiktok_id=str(first_task.get("tiktok_id") or ""),
+                tiktok_id=str(first_task.get("tiktok_id") or first_task.get("id_tiktok") or ""),
                 profile_data=profile_data,
                 selected_features=[],
                 feed_settings={},
                 profile_index=first_idx,
                 account_row=first_idx,
-                embed_browser=True,
+                embed_browser=bool(self.chk_browser.isChecked()),
                 preview_width=PREVIEW_WIDTH,
                 browser_height=PREVIEW_HEIGHT,
                 parent=self,
@@ -332,26 +330,102 @@ class UploadDashboard(QDialog):
 
 
     def _add_log(self, msg, color="black"):
-        lbl = QLabel(msg)
+        lbl = QLabel(_repair_ui_text(msg))
         lbl.setStyleSheet(f"color: {color}; font-size: 11px; padding: 1px;")
         lbl.setWordWrap(True)
         self.log_layout.addWidget(lbl)
-        # Auto scroll xuống
+        # Auto scroll xuong
         self.log_scroll.verticalScrollBar().setValue(self.log_scroll.verticalScrollBar().maximum())
 
-    # ═══ Signals ═══
+    def _status_token(self, text):
+        value = unicodedata.normalize("NFD", str(text or "").lower())
+        value = "".join(ch for ch in value if not unicodedata.combining(ch))
+        value = value.replace("đ", "d")
+        return " ".join(value.split())
+
+    def _task_widget_style(self, border_color="#dcdde1", background="#ffffff"):
+        return (
+            f"background-color: {background};"
+            f" border-radius: 4px;"
+            f" margin-bottom: 3px;"
+            f" border: 1px solid {border_color};"
+        )
+
+    def _task_status_display(self, msg, success=None):
+        text = _repair_ui_text(msg).strip()
+        if success is True:
+            return "Thành công", "#15803d", "#22c55e"
+        if success is False:
+            return "Thất bại", "#b91c1c", "#ef4444"
+
+        token = self._status_token(text)
+        if "da dung" in token or "gui lenh dung" in token:
+            return "Đã dừng", "#c2410c", "#fb923c"
+        if "bo qua" in token:
+            return "Bỏ qua", "#b45309", "#f59e0b"
+        if "that bai" in token or token.startswith("loi") or "timeout" in token:
+            return "Lỗi", "#b91c1c", "#ef4444"
+        if "dang upload" in token or "uploading" in token:
+            match = re.search(r"(\d+)\s*%", text)
+            if match:
+                return f"Uploading {match.group(1)}%", "#2563eb", "#60a5fa"
+            return "Đang upload", "#2563eb", "#60a5fa"
+        if "ket xuat" in token or "render" in token:
+            if "hoan tat" in token:
+                return "Đã kết xuất", "#15803d", "#4ade80"
+            return "Đang kết xuất", "#a16207", "#facc15"
+        if "dang public" in token or "nut dang" in token or "dang thanh cong" in token:
+            return "Đang đăng", "#7c3aed", "#c084fc"
+        if "len lich" in token or "dat lich" in token:
+            return "Lên lịch", "#7c3aed", "#c084fc"
+        if "dien tieu de" in token:
+            return "Điền tiêu đề", "#2563eb", "#60a5fa"
+        if "cho " in token:
+            trimmed = text.replace("⏳", "").strip()
+            return trimmed[:28], "#1d4ed8", "#93c5fd"
+        if (
+            "mo " in token
+            or "ket noi cdp" in token
+            or "browser session" in token
+            or "vao tiktok studio" in token
+            or "tiktok studio" in token
+            or "proxy" in token
+        ):
+            return "Khởi động", "#2563eb", "#60a5fa"
+        return text[:28], "#334155", "#cbd5e1"
+
+    def _set_task_state(self, idx, label, text_color, border_color):
+        if not (0 <= idx < len(self._task_widgets)):
+            return
+        widget = self._task_widgets[idx]
+        if not widget:
+            return
+        lbl = widget.findChild(QLabel, "status_label")
+        if lbl:
+            lbl.setText(_repair_ui_text(label))
+            lbl.setStyleSheet(f"color: {text_color}; font-weight: bold;")
+        widget.setStyleSheet(self._task_widget_style(border_color=border_color))
+
+    def _reset_task_ui(self):
+        self._completed_tasks.clear()
+        for idx, widget in enumerate(self._task_widgets):
+            if not widget:
+                continue
+            self._set_task_state(idx, "Chờ", "#64748b", "#dcdde1")
+
+    # Signals
     def on_run(self):
         if not self.video_tasks:
             QMessageBox.warning(self, "Cảnh báo", "Không có video nào!")
             return
             
+        self._reset_task_ui()
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self._add_log("▶ Bắt đầu upload...", "green")
         
         settings = {
             "delete_on_success": self.chk_delete_video.isChecked(),
-            "max_threads": self.spin_thread.value(),
             "delay_min": self.spin_delay.value(),
             "delay_max": self.spin_delay.value() + 5,
         }
@@ -359,12 +433,17 @@ class UploadDashboard(QDialog):
         from PyQt5.QtWidgets import QApplication
         QApplication.processEvents()
         preview_targets = {}
-        for idx, container in self._preview_containers.items():
-            preview_targets[idx] = {
-                "widget_id": int(container.winId()),
-                "width": container.width(),
-                "height": container.height(),
-            }
+        embed_browser = bool(self.chk_browser.isChecked()) if hasattr(self, "chk_browser") else True
+        for preview in self._preview_widgets.values():
+            if preview:
+                preview.embed_browser = embed_browser
+        if embed_browser:
+            for idx, container in self._preview_containers.items():
+                preview_targets[idx] = {
+                    "widget_id": int(container.winId()),
+                    "width": container.width(),
+                    "height": container.height(),
+                }
         
         self._worker = UploadWorker(self.video_tasks, settings, preview_targets=preview_targets)
         self._worker.status_updated.connect(self._on_status)
@@ -393,28 +472,25 @@ class UploadDashboard(QDialog):
             self._add_log("⏹ Đã gửi lệnh dừng...", "orange")
 
     def _on_status(self, idx, msg, color):
+        msg = _repair_ui_text(msg)
         self._add_log(f"[Video {idx+1}] {msg}", color)
-        # Update trạng thái trên task card
-        if 0 <= idx < len(self._task_widgets):
-            widget = self._task_widgets[idx]
-            lbl = widget.findChild(QLabel, "status_label")
-            if lbl:
-                lbl.setText(msg[:40])
-                lbl.setStyleSheet(f"color: {color};")
+        if idx in self._completed_tasks:
+            return
+        # Update trang thai tren task card
+        label, text_color, border_color = self._task_status_display(msg)
+        self._set_task_state(idx, label, text_color, border_color)
 
     def _on_task_done(self, idx, success, detail):
+        self._completed_tasks.add(idx)
+        detail = _repair_ui_text(detail)
         color = "#2ecc71" if success else "#e74c3c"
-        status = "✅ Thành công" if success else f"❌ {detail[:30]}"
+        status = "✅ Thành công" if success else f"❌ {detail[:60]}"
         self._add_log(f"[Video {idx+1}] {status}", color)
-        
-        if 0 <= idx < len(self._task_widgets):
-            border_color = "#2ecc71" if success else "#e74c3c"
-            self._task_widgets[idx].setStyleSheet(
-                f"background-color: white; border-radius: 5px; margin-bottom: 3px; border: 2px solid {border_color};"
-            )
+        label, text_color, border_color = self._task_status_display(detail, success=success)
+        self._set_task_state(idx, label, text_color, border_color)
 
     def _on_all_done(self):
-        self._add_log("Hoan tat tat ca video!", "green")
+        self._add_log("Hoàn tất tất cả video!", "green")
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self._worker = None
@@ -469,7 +545,7 @@ class UploadDashboard(QDialog):
                 self._closing_after_worker_stop = True
                 self.btn_stop.setEnabled(False)
                 self.btn_run.setEnabled(False)
-                self._add_log("Dang dung upload, vui long cho trinh duyet dong xong...", "orange")
+                self._add_log("Đang dừng upload, vui lòng chờ trình duyệt đóng xong...", "orange")
                 self._worker.stop()
             return
         super().closeEvent(event)

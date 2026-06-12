@@ -1,7 +1,40 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+import zipfile
+
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('gologin_zeroprofile.zip', '.'), ('proxy_auth_ext', 'proxy_auth_ext'), ('proxy_ext_0', 'proxy_ext_0'), ('assets', 'assets')]
+
+ROOT = Path.cwd()
+
+
+def ensure_zero_profile_zip() -> str:
+    existing_zip = ROOT / "gologin_zeroprofile.zip"
+    if existing_zip.is_file():
+        return str(existing_zip)
+
+    source_dir = ROOT / "gologin_zeroprofile"
+    if not source_dir.is_dir():
+        raise FileNotFoundError(
+            "Missing GoLogin zero profile asset. Expected gologin_zeroprofile.zip "
+            "or gologin_zeroprofile/ in the workspace root."
+        )
+
+    cache_dir = ROOT / ".tmp_builds"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    generated_zip = cache_dir / "gologin_zeroprofile.zip"
+
+    with zipfile.ZipFile(generated_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for item in source_dir.rglob("*"):
+            if item.is_dir():
+                continue
+            arcname = Path("gologin_zeroprofile") / item.relative_to(source_dir)
+            zf.write(item, arcname.as_posix())
+
+    return str(generated_zip)
+
+
+datas = [(ensure_zero_profile_zip(), '.'), ('proxy_auth_ext', 'proxy_auth_ext'), ('proxy_ext_0', 'proxy_ext_0'), ('assets', 'assets')]
 binaries = []
 hiddenimports = ['curl_cffi', 'msal', 'pandas', 'yt_dlp']
 tmp_ret = collect_all('playwright')

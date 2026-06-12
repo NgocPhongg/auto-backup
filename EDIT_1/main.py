@@ -23,20 +23,24 @@ class AppController:
         self.window.btn_browse_logo.clicked.connect(self.browse_logo)
         self.window.btn_browse_subtitle.clicked.connect(self.browse_subtitle)
         self.window.btn_browse_bg_music.clicked.connect(self.browse_bg_music)
+        self.window.btn_browse_bg_image.clicked.connect(self.browse_bg_image)
         self.window.btn_start_render.clicked.connect(self.start_render)
         self.window.btn_save_preset.clicked.connect(self.save_preset)
         self.window.btn_load_preset.clicked.connect(self.load_preset)
         self.window.btn_watermark_color.clicked.connect(self.choose_watermark_color)
+        self.window.btn_text2_color.clicked.connect(self.choose_text2_color)
         self.window.btn_sub_color.clicked.connect(self.choose_sub_color)
         self.window.btn_sub_bg_color.clicked.connect(self.choose_sub_bg_color)
         
         self.render_worker = None
         self.preview_worker = PreviewWorker()
+        self._last_preview_qimg = None
         
         # Connect Preview Signals
         self.preview_worker.new_frame.connect(self.update_preview_frame)
         self.preview_worker.duration_changed.connect(self.update_preview_duration)
         self.preview_worker.position_changed.connect(self.update_preview_position)
+        self.window.lbl_preview.resized.connect(self._rescale_cached_preview_frame)
         
         self.window.btn_play_pause.clicked.connect(self.toggle_preview_playback)
         self.window.slider_seek.sliderReleased.connect(self.seek_preview)
@@ -52,20 +56,38 @@ class AppController:
         self._logo_y_norm = 0.85
         self._text_x_norm = 0.5
         self._text_y_norm = 0.9
+        self._text2_x_norm = 0.5
+        self._text2_y_norm = 0.2
         self._sub_x_norm = 0.5
         self._sub_y_norm = 0.9
+        self._active_preview_drag_target = None
         
         # Wire drag signals
         self.window.lbl_preview.logo_dragged.connect(self._on_logo_dragged)
         self.window.lbl_preview.text_dragged.connect(self._on_text_dragged)
+        self.window.lbl_preview.text2_dragged.connect(self._on_text2_dragged)
         self.window.lbl_preview.subtitle_dragged.connect(self._on_subtitle_dragged)
         
         # Toggle drag hints  
         self.window.chk_use_logo.stateChanged.connect(self._update_drag_ui)
         self.window.chk_use_watermark.stateChanged.connect(self._update_drag_ui)
+        self.window.chk_use_text2.stateChanged.connect(self._update_drag_ui)
         self.window.chk_use_subtitles.stateChanged.connect(self._update_drag_ui)
+        self.window.txt_watermark.textChanged.connect(self._on_watermark_text_changed)
+        self.window.txt_text2.textChanged.connect(self._on_text2_text_changed)
+        self.window.slider_watermark_size.valueChanged.connect(lambda _value: self._set_active_preview_drag_target('text'))
+        self.window.slider_text2_size.valueChanged.connect(lambda _value: self._set_active_preview_drag_target('text2'))
+        self.window.txt_logo_path.textChanged.connect(lambda _text: self._set_active_preview_drag_target('logo'))
+        self.window.cmb_logo_pos.currentTextChanged.connect(self._on_logo_pos_changed)
+        self.window.slider_logo_scale.valueChanged.connect(lambda _value: self._set_active_preview_drag_target('logo'))
         self.window.slider_watermark_pos_y.valueChanged.connect(self._on_text_y_slider_changed)
+        self.window.slider_text2_pos_y.valueChanged.connect(self._on_text2_y_slider_changed)
         self.window.slider_sub_pos_y.valueChanged.connect(self._on_subtitle_y_slider_changed)
+        self._refresh_logo_drag_pos_label()
+        self._refresh_text_drag_pos_label()
+        self._refresh_text2_drag_pos_label()
+        self._refresh_sub_drag_pos_label()
+        self._update_drag_ui()
         self.check_dependencies()
 
 
@@ -73,9 +95,123 @@ class AppController:
     def _update_drag_ui(self):
         logo_on = self.window.chk_use_logo.isChecked()
         text_on = self.window.chk_use_watermark.isChecked()
+        text2_on = self.window.chk_use_text2.isChecked()
         sub_on = self.window.chk_use_subtitles.isChecked()
-        self.window.lbl_preview.set_enabled_overlays(logo_on, text_on, sub_on)
-        self.window.lbl_drag_hint.setVisible(False)
+        self.window.lbl_preview.set_enabled_overlays(logo_on, text_on, sub_on, text2_on)
+        if self._active_preview_drag_target and not self._is_drag_target_enabled(self._active_preview_drag_target):
+            self._active_preview_drag_target = None
+        if self._active_preview_drag_target is None:
+            if text_on and not logo_on and not text2_on and not sub_on:
+                self._active_preview_drag_target = 'text'
+            elif text2_on and not logo_on and not text_on and not sub_on:
+                self._active_preview_drag_target = 'text2'
+            elif logo_on and not text_on and not text2_on and not sub_on:
+                self._active_preview_drag_target = 'logo'
+            elif sub_on and not logo_on and not text_on and not text2_on:
+                self._active_preview_drag_target = 'subtitle'
+        self.window.lbl_preview.set_active_drag_target(self._active_preview_drag_target)
+        self._refresh_drag_hint()
+
+    def _is_drag_target_enabled(self, target):
+        if target == 'logo':
+            return self.window.chk_use_logo.isChecked()
+        if target == 'text':
+            return self.window.chk_use_watermark.isChecked()
+        if target == 'text2':
+            return self.window.chk_use_text2.isChecked()
+        if target == 'subtitle':
+            return self.window.chk_use_subtitles.isChecked()
+        return False
+
+    def _set_active_preview_drag_target(self, target):
+        if not self._is_drag_target_enabled(target):
+            return
+        self._active_preview_drag_target = target
+        self.window.lbl_preview.set_active_drag_target(target)
+        self._refresh_drag_hint()
+
+    def _refresh_drag_hint(self):
+        labels = {
+            'logo': "Active drag: Image Logo Overlay",
+            'text': "Active drag: Watermark / Text Overlay",
+            'text2': "Active drag: Text Overlay 2",
+            'subtitle': "Active drag: Subtitle Overlay",
+        }
+        if self._active_preview_drag_target and self._is_drag_target_enabled(self._active_preview_drag_target):
+            self.window.lbl_drag_hint.setText(labels[self._active_preview_drag_target])
+            self.window.lbl_drag_hint.setVisible(True)
+            return
+        if self.window.chk_use_logo.isChecked() or self.window.chk_use_watermark.isChecked() or self.window.chk_use_text2.isChecked() or self.window.chk_use_subtitles.isChecked():
+            self.window.lbl_drag_hint.setText("Click directly on the visible overlay in preview to drag it")
+            self.window.lbl_drag_hint.setVisible(True)
+        else:
+            self.window.lbl_drag_hint.setVisible(False)
+
+    def _refresh_logo_drag_pos_label(self):
+        if self.window.cmb_logo_pos.currentText() == "Manual (Drag)":
+            self.window.lbl_logo_drag_pos.setText(
+                f"Position: x={self._logo_x_norm:.2f} y={self._logo_y_norm:.2f} (drag on preview to move)"
+            )
+        else:
+            self.window.lbl_logo_drag_pos.setText(
+                f"Position: preset {self.window.cmb_logo_pos.currentText()}"
+            )
+
+    def _refresh_text_drag_pos_label(self):
+        self.window.lbl_text_drag_pos.setText(
+            f"Position: x={self._text_x_norm:.2f} y={self._text_y_norm:.2f} (drag on preview to move)"
+        )
+
+    def _refresh_text2_drag_pos_label(self):
+        self.window.lbl_text2_drag_pos.setText(
+            f"Position: x={self._text2_x_norm:.2f} y={self._text2_y_norm:.2f} (drag on preview to move)"
+        )
+
+    def _refresh_sub_drag_pos_label(self):
+        self.window.lbl_sub_drag_pos.setText(
+            f"Position: y={self._sub_y_norm:.2f} (drag on preview to move)"
+        )
+
+    def _on_logo_pos_changed(self, _text):
+        self._set_active_preview_drag_target('logo')
+        self._refresh_logo_drag_pos_label()
+
+    def _normalize_watermark_text(self, text):
+        text = str(text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\\n", "\n")
+        lines = text.split("\n")
+        if len(lines) > 2:
+            text = "\n".join(lines[:2])
+        return text
+
+    def _on_watermark_text_changed(self):
+        editor = self.window.txt_watermark
+        text = editor.toPlainText()
+        normalized = self._normalize_watermark_text(text)
+        if normalized != text:
+            cursor_pos = min(editor.textCursor().position(), len(normalized))
+            editor.blockSignals(True)
+            editor.setPlainText(normalized)
+            cursor = editor.textCursor()
+            cursor.setPosition(cursor_pos)
+            editor.setTextCursor(cursor)
+            editor.blockSignals(False)
+        self._set_active_preview_drag_target('text')
+        self.update_preview_settings_sync()
+
+    def _on_text2_text_changed(self):
+        editor = self.window.txt_text2
+        text = editor.toPlainText()
+        normalized = self._normalize_watermark_text(text)
+        if normalized != text:
+            cursor_pos = min(editor.textCursor().position(), len(normalized))
+            editor.blockSignals(True)
+            editor.setPlainText(normalized)
+            cursor = editor.textCursor()
+            cursor.setPosition(cursor_pos)
+            editor.setTextCursor(cursor)
+            editor.blockSignals(False)
+        self._set_active_preview_drag_target('text2')
+        self.update_preview_settings_sync()
 
     def check_dependencies(self):
         required_modules = {
@@ -121,33 +257,44 @@ class AppController:
     def _on_logo_dragged(self, nx: float, ny: float):
         self._logo_x_norm = self._clamp_norm(nx)
         self._logo_y_norm = self._clamp_norm(ny)
+        self._set_active_preview_drag_target('logo')
         # Auto-switch dropdown to Manual
         idx = self.window.cmb_logo_pos.findText("Manual (Drag)")
         if idx >= 0:
             self.window.cmb_logo_pos.blockSignals(True)
             self.window.cmb_logo_pos.setCurrentIndex(idx)
             self.window.cmb_logo_pos.blockSignals(False)
+        self._refresh_logo_drag_pos_label()
         self.update_preview_settings_sync()
 
     def _on_text_dragged(self, nx: float, ny: float):
         self._text_x_norm = self._clamp_norm(nx)
         self._text_y_norm = self._clamp_norm(ny)
-        pos_str = f"Position: x={self._text_x_norm:.2f} y={self._text_y_norm:.2f} (drag on preview to move)"
-        self.window.lbl_text_drag_pos.setText(pos_str)
+        self._set_active_preview_drag_target('text')
+        self._refresh_text_drag_pos_label()
         
         # Sync slider
         self._sync_text_slider_from_norm()
         
         self.update_preview_settings_sync()
 
+    def _on_text2_dragged(self, nx: float, ny: float):
+        self._text2_x_norm = self._clamp_norm(nx)
+        self._text2_y_norm = self._clamp_norm(ny)
+        self._set_active_preview_drag_target('text2')
+        self._refresh_text2_drag_pos_label()
+
+        self._sync_text2_slider_from_norm()
+
+        self.update_preview_settings_sync()
+
     def _on_subtitle_dragged(self, nx: float, ny: float):
         self._sub_x_norm = self._clamp_norm(nx)
         self._sub_y_norm = self._clamp_norm(ny)
+        self._set_active_preview_drag_target('subtitle')
         # Sync slider (1.0 ny means 100%, but we use 1-99 range)
         self._sync_subtitle_slider_from_norm()
-        
-        pos_str = f"Position: y={self._sub_y_norm:.2f} (drag on preview to move)"
-        self.window.lbl_sub_drag_pos.setText(pos_str)
+        self._refresh_sub_drag_pos_label()
         self.update_preview_settings_sync()
 
     def _clamp_norm(self, value):
@@ -161,6 +308,14 @@ class AppController:
         self.window.slider_watermark_pos_y.blockSignals(False)
         self.window.val_watermark_pos_y.setText(f"{val}%")
 
+    def _sync_text2_slider_from_norm(self):
+        val = int(round(self._text2_y_norm * 100))
+        val = max(self.window.slider_text2_pos_y.minimum(), min(val, self.window.slider_text2_pos_y.maximum()))
+        self.window.slider_text2_pos_y.blockSignals(True)
+        self.window.slider_text2_pos_y.setValue(val)
+        self.window.slider_text2_pos_y.blockSignals(False)
+        self.window.val_text2_pos_y.setText(f"{val}%")
+
     def _sync_subtitle_slider_from_norm(self):
         val = int(round(self._sub_y_norm * 100))
         val = max(self.window.slider_sub_pos_y.minimum(), min(val, self.window.slider_sub_pos_y.maximum()))
@@ -171,18 +326,23 @@ class AppController:
 
     def _on_text_y_slider_changed(self, value):
         self._text_y_norm = self._clamp_norm(value / 100.0)
+        self._set_active_preview_drag_target('text')
         self.window.val_watermark_pos_y.setText(f"{value}%")
-        self.window.lbl_text_drag_pos.setText(
-            f"Position: x={self._text_x_norm:.2f} y={self._text_y_norm:.2f} (drag on preview to move)"
-        )
+        self._refresh_text_drag_pos_label()
+        self.update_preview_settings_sync()
+
+    def _on_text2_y_slider_changed(self, value):
+        self._text2_y_norm = self._clamp_norm(value / 100.0)
+        self._set_active_preview_drag_target('text2')
+        self.window.val_text2_pos_y.setText(f"{value}%")
+        self._refresh_text2_drag_pos_label()
         self.update_preview_settings_sync()
 
     def _on_subtitle_y_slider_changed(self, value):
         self._sub_y_norm = self._clamp_norm(value / 100.0)
+        self._set_active_preview_drag_target('subtitle')
         self.window.val_sub_pos_y.setText(f"{value}%")
-        self.window.lbl_sub_drag_pos.setText(
-            f"Position: y={self._sub_y_norm:.2f} (drag on preview to move)"
-        )
+        self._refresh_sub_drag_pos_label()
         self.update_preview_settings_sync()
 
     def hook_ui_for_preview(self):
@@ -198,8 +358,10 @@ class AppController:
             (self.window.chk_use_video_speed, 'stateChanged'), (self.window.slider_speed, 'valueChanged'),
             (self.window.chk_use_pitch, 'stateChanged'), (self.window.slider_pitch, 'valueChanged'),
             (self.window.chk_use_volume, 'stateChanged'), (self.window.slider_volume, 'valueChanged'),
-            (self.window.chk_use_watermark, 'stateChanged'), (self.window.txt_watermark, 'textChanged'),
+            (self.window.chk_use_watermark, 'stateChanged'),
             (self.window.slider_watermark_size, 'valueChanged'),
+            (self.window.chk_use_text2, 'stateChanged'),
+            (self.window.slider_text2_size, 'valueChanged'),
             (self.window.chk_use_logo, 'stateChanged'), (self.window.txt_logo_path, 'textChanged'),
             (self.window.cmb_logo_pos, 'currentTextChanged'), (self.window.slider_logo_scale, 'valueChanged'),
             (self.window.slider_logo_opacity, 'valueChanged'),
@@ -211,6 +373,8 @@ class AppController:
             (self.window.slider_sub_line_spacing, 'valueChanged'), (self.window.slider_sub_padding, 'valueChanged'),
             (self.window.chk_use_bg_music, 'stateChanged'), (self.window.txt_bg_music_path, 'textChanged'),
             (self.window.slider_bgm_volume, 'valueChanged'), (self.window.slider_bgm_speed, 'valueChanged'),
+            (self.window.chk_use_bg_image, 'stateChanged'), (self.window.txt_bg_image_path, 'textChanged'),
+            (self.window.cmb_bg_image_fit, 'currentTextChanged'),
             (self.window.cmb_ratio, 'currentTextChanged'), (self.window.cmb_fit_mode, 'currentTextChanged'),
             (self.window.slider_blur, 'valueChanged')
         ]
@@ -257,12 +421,76 @@ class AppController:
         self.preview_worker.seek(t)
         
     def update_preview_frame(self, qimg):
-        pixmap = QPixmap.fromImage(qimg)
+        self._last_preview_qimg = qimg.copy()
+        self._rescale_cached_preview_frame()
+
+    def _rescale_cached_preview_frame(self):
+        if self._last_preview_qimg is None or self._last_preview_qimg.isNull():
+            return
+        pixmap = QPixmap.fromImage(self._last_preview_qimg)
         # Scaled to fit label while keeping aspect ratio
         w = max(1, self.window.lbl_preview.width())
         h = max(1, self.window.lbl_preview.height())
         scaled = pixmap.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         self.window.lbl_preview.setPixmap(scaled)
+        self._update_preview_overlay_bounds()
+
+    def _update_preview_overlay_bounds(self):
+        processor = getattr(self.preview_worker, 'processor', None)
+        if processor is None:
+            self.window.lbl_preview.clear_overlay_bounds()
+            return
+
+        frame_w = int(getattr(processor, 'w', 0) or 0)
+        frame_h = int(getattr(processor, 'h', 0) or 0)
+        if frame_w <= 0 or frame_h <= 0:
+            self.window.lbl_preview.clear_overlay_bounds()
+            return
+
+        logo_rect = None
+        if self.window.chk_use_logo.isChecked() and getattr(processor, 'logo_alpha', None) is not None:
+            logo_rect = (
+                int(getattr(processor, 'logo_x', 0)),
+                int(getattr(processor, 'logo_y', 0)),
+                int(getattr(processor, 'logo_w', 0)),
+                int(getattr(processor, 'logo_h', 0)),
+            )
+
+        text_rect = None
+        if self.window.chk_use_watermark.isChecked() and getattr(processor, 'overlay_alpha', None) is not None:
+            text_rect = (
+                int(getattr(processor, 'overlay_x', 0)),
+                int(getattr(processor, 'overlay_y', 0)),
+                int(getattr(processor, 'box_w', 0)),
+                int(getattr(processor, 'box_h', 0)),
+            )
+
+        text2_rect = None
+        if self.window.chk_use_text2.isChecked() and getattr(processor, 'overlay2_alpha', None) is not None:
+            text2_rect = (
+                int(getattr(processor, 'overlay2_x', 0)),
+                int(getattr(processor, 'overlay2_y', 0)),
+                int(getattr(processor, 'box2_w', 0)),
+                int(getattr(processor, 'box2_h', 0)),
+            )
+
+        subtitle_rect = None
+        if self.window.chk_use_subtitles.isChecked() and getattr(processor, 'sub_alpha', None) is not None:
+            subtitle_rect = (
+                int(getattr(processor, 'sub_x', 0)),
+                int(getattr(processor, 'sub_y', 0)),
+                int(getattr(processor, 'sub_w', 0)),
+                int(getattr(processor, 'sub_h', 0)),
+            )
+
+        self.window.lbl_preview.set_overlay_bounds(
+            frame_w,
+            frame_h,
+            logo_rect=logo_rect,
+            text_rect=text_rect,
+            text2_rect=text2_rect,
+            subtitle_rect=subtitle_rect,
+        )
         
     def update_preview_duration(self, duration):
         pass # Handle in position update to format strings
@@ -308,6 +536,12 @@ class AppController:
         filename, _ = QFileDialog.getOpenFileName(self.window, "Select Background Music", "", "Audio Files (*.mp3 *.wav *.m4a *.aac *.ogg)")
         if filename:
             self.window.txt_bg_music_path.setText(filename)
+
+    def browse_bg_image(self):
+        filename, _ = QFileDialog.getOpenFileName(self.window, "Select Background Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if filename:
+            self.window.txt_bg_image_path.setText(filename)
+            self.update_preview_settings_sync()
             
     def choose_watermark_color(self):
         from PyQt6.QtWidgets import QColorDialog
@@ -318,6 +552,17 @@ class AppController:
             text_col = "#000000" if color.lightness() > 128 else "#ffffff"
             self.window.btn_watermark_color.setStyleSheet(f"background-color: {self.window.watermark_color}; color: {text_col}; font-weight: bold;")
             self.window.btn_watermark_color.setText(self.window.watermark_color)
+            self.update_preview_settings_sync()
+
+    def choose_text2_color(self):
+        from PyQt6.QtWidgets import QColorDialog
+        from PyQt6.QtGui import QColor
+        color = QColorDialog.getColor(QColor(self.window.text2_color), self.window, "Select Text 2 Color")
+        if color.isValid():
+            self.window.text2_color = color.name()
+            text_col = "#000000" if color.lightness() > 128 else "#ffffff"
+            self.window.btn_text2_color.setStyleSheet(f"background-color: {self.window.text2_color}; color: {text_col}; font-weight: bold;")
+            self.window.btn_text2_color.setText(self.window.text2_color)
             self.update_preview_settings_sync()
 
     def choose_sub_color(self):
@@ -375,10 +620,15 @@ class AppController:
             'use_volume': self.window.chk_use_volume.isChecked(),
             'volume': self.window.slider_volume.value(),
             'use_watermark': self.window.chk_use_watermark.isChecked(),
-            'watermark_text': self.window.txt_watermark.text(),
+            'watermark_text': self._normalize_watermark_text(self.window.txt_watermark.toPlainText()),
             'watermark_size': self.window.slider_watermark_size.value(),
             'watermark_color': self.window.watermark_color,
             'watermark_pos_y': self.window.slider_watermark_pos_y.value(),
+            'use_text2': self.window.chk_use_text2.isChecked(),
+            'text2_text': self._normalize_watermark_text(self.window.txt_text2.toPlainText()),
+            'text2_size': self.window.slider_text2_size.value(),
+            'text2_color': self.window.text2_color,
+            'text2_pos_y': self.window.slider_text2_pos_y.value(),
             'use_logo': self.window.chk_use_logo.isChecked(),
             'logo_path': self.window.txt_logo_path.text(),
             'logo_pos': self.window.cmb_logo_pos.currentText(),
@@ -388,6 +638,8 @@ class AppController:
             'logo_y_norm': self._logo_y_norm,
             'text_x_norm': self._text_x_norm,
             'text_y_norm': self._text_y_norm,
+            'text2_x_norm': self._text2_x_norm,
+            'text2_y_norm': self._text2_y_norm,
             'use_subtitles': self.window.chk_use_subtitles.isChecked(),
             'subtitle_path': self.window.txt_subtitle_path.text(),
             'subtitle_font': self.window.cmb_sub_font.currentText(),
@@ -409,7 +661,10 @@ class AppController:
             'bgm_speed': self.window.slider_bgm_speed.value(),
             'target_ratio': self.window.cmb_ratio.currentText(),
             'fit_mode': self.window.cmb_fit_mode.currentText(),
-            'blur_intensity': self.window.slider_blur.value()
+            'blur_intensity': self.window.slider_blur.value(),
+            'use_bg_image': self.window.chk_use_bg_image.isChecked(),
+            'bg_image_path': self.window.txt_bg_image_path.text(),
+            'bg_image_fit': self.window.cmb_bg_image_fit.currentText()
         }
 
     def get_render_settings(self):
@@ -444,9 +699,13 @@ class AppController:
             'use_volume': self.window.chk_use_volume.isChecked(),
             'volume': self.window.slider_volume.value() / 100.0,  # 0.0=mute, 1.0=normal, 3.0=3x
             'use_watermark': self.window.chk_use_watermark.isChecked(),
-            'watermark_text': self.window.txt_watermark.text(),
+            'watermark_text': self._normalize_watermark_text(self.window.txt_watermark.toPlainText()),
             'watermark_size': self.window.slider_watermark_size.value() / 100.0,
             'watermark_color': self.window.watermark_color,
+            'use_text2': self.window.chk_use_text2.isChecked(),
+            'text2_text': self._normalize_watermark_text(self.window.txt_text2.toPlainText()),
+            'text2_size': self.window.slider_text2_size.value() / 100.0,
+            'text2_color': self.window.text2_color,
             'use_logo': self.window.chk_use_logo.isChecked(),
             'logo_path': self.window.txt_logo_path.text(),
             'logo_pos': self.window.cmb_logo_pos.currentText(),
@@ -456,6 +715,8 @@ class AppController:
             'logo_y_norm': self._logo_y_norm,
             'text_x_norm': self._text_x_norm,
             'text_y_norm': self._text_y_norm,
+            'text2_x_norm': self._text2_x_norm,
+            'text2_y_norm': self._text2_y_norm,
             'use_subtitles': self.window.chk_use_subtitles.isChecked(),
             'subtitle_path': self.window.txt_subtitle_path.text(),
             'subtitle_font': self.window.cmb_sub_font.currentText(),
@@ -475,7 +736,10 @@ class AppController:
             'bgm_speed': self.window.slider_bgm_speed.value() / 10.0,
             'target_ratio': self.window.cmb_ratio.currentText(),
             'fit_mode': self.window.cmb_fit_mode.currentText(),
-            'blur_intensity': self.window.slider_blur.value() | 1  # ensure odd for Gaussian
+            'blur_intensity': self.window.slider_blur.value() | 1,  # ensure odd for Gaussian
+            'use_bg_image': self.window.chk_use_bg_image.isChecked(),
+            'bg_image_path': self.window.txt_bg_image_path.text(),
+            'bg_image_fit': self.window.cmb_bg_image_fit.currentText()
         }
 
     def save_preset(self):
@@ -523,7 +787,7 @@ class AppController:
             self.window.chk_use_volume.setChecked(settings.get('use_volume', False))
             self.window.slider_volume.setValue(settings.get('volume', 100))
             self.window.chk_use_watermark.setChecked(settings.get('use_watermark', False))
-            self.window.txt_watermark.setText(settings.get('watermark_text', ''))
+            self.window.txt_watermark.setPlainText(self._normalize_watermark_text(settings.get('watermark_text', '')))
             self.window.slider_watermark_size.setValue(settings.get('watermark_size', 8))
             self.window.slider_watermark_pos_y.setValue(settings.get('watermark_pos_y', 90))
             
@@ -535,6 +799,16 @@ class AppController:
             text_col = "#000000" if color_obj.lightness() > 128 else "#ffffff"
             self.window.btn_watermark_color.setStyleSheet(f"background-color: {wm_color}; color: {text_col}; font-weight: bold;")
             self.window.btn_watermark_color.setText(wm_color)
+            self.window.chk_use_text2.setChecked(settings.get('use_text2', False))
+            self.window.txt_text2.setPlainText(self._normalize_watermark_text(settings.get('text2_text', '')))
+            self.window.slider_text2_size.setValue(settings.get('text2_size', 8))
+            self.window.slider_text2_pos_y.setValue(settings.get('text2_pos_y', 20))
+            text2_color = settings.get('text2_color', '#ffffff')
+            self.window.text2_color = text2_color
+            text2_color_obj = QColor(text2_color)
+            text2_text_col = "#000000" if text2_color_obj.lightness() > 128 else "#ffffff"
+            self.window.btn_text2_color.setStyleSheet(f"background-color: {text2_color}; color: {text2_text_col}; font-weight: bold;")
+            self.window.btn_text2_color.setText(text2_color)
             self.window.chk_use_logo.setChecked(settings.get('use_logo', False))
             self.window.txt_logo_path.setText(settings.get('logo_path', ''))
             idx_logo = self.window.cmb_logo_pos.findText(settings.get('logo_pos', 'Bottom-Right'))
@@ -576,6 +850,11 @@ class AppController:
             if idx_fit >= 0:
                 self.window.cmb_fit_mode.setCurrentIndex(idx_fit)
             self.window.slider_blur.setValue(settings.get('blur_intensity', 31))
+            self.window.chk_use_bg_image.setChecked(settings.get('use_bg_image', False))
+            self.window.txt_bg_image_path.setText(settings.get('bg_image_path', ''))
+            idx_bg_fit = self.window.cmb_bg_image_fit.findText(settings.get('bg_image_fit', 'Cover'))
+            if idx_bg_fit >= 0:
+                self.window.cmb_bg_image_fit.setCurrentIndex(idx_bg_fit)
 
 
             
@@ -589,16 +868,18 @@ class AppController:
             self._logo_y_norm = self._clamp_norm(settings.get('logo_y_norm', 0.85))
             self._text_x_norm = self._clamp_norm(settings.get('text_x_norm', 0.5))
             self._text_y_norm = self._clamp_norm(settings.get('text_y_norm', settings.get('watermark_pos_y', 90) / 100.0))
+            self._text2_x_norm = self._clamp_norm(settings.get('text2_x_norm', 0.5))
+            self._text2_y_norm = self._clamp_norm(settings.get('text2_y_norm', settings.get('text2_pos_y', 20) / 100.0))
             self._sub_x_norm = self._clamp_norm(settings.get('sub_x_norm', 0.5))
             self._sub_y_norm = self._clamp_norm(settings.get('sub_y_norm', settings.get('subtitle_pos_y', 90) / 100.0))
             self._sync_text_slider_from_norm()
+            self._sync_text2_slider_from_norm()
             self._sync_subtitle_slider_from_norm()
-            self.window.lbl_text_drag_pos.setText(
-                f"Position: x={self._text_x_norm:.2f} y={self._text_y_norm:.2f} (drag on preview to move)"
-            )
-            self.window.lbl_sub_drag_pos.setText(
-                f"Position: x={self._sub_x_norm:.2f} y={self._sub_y_norm:.2f} (drag on preview to move)"
-            )
+            self._refresh_logo_drag_pos_label()
+            self._refresh_text_drag_pos_label()
+            self._refresh_text2_drag_pos_label()
+            self._refresh_sub_drag_pos_label()
+            self._update_drag_ui()
             self.window.log_msg(f"Preset loaded: {filename}")
         except Exception as e:
             self.window.log_msg(f"Error loading preset: {e}")

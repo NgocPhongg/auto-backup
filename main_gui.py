@@ -7,14 +7,18 @@ import os
 import inspect
 import webbrowser
 import re
+import threading
+import traceback
+import shutil
+from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QSplitter, QTableWidget, QTableWidgetItem, QPushButton, 
     QLineEdit, QComboBox, QLabel, QMenuBar, QMenu, QStatusBar,
     QHeaderView, QAbstractItemView, QAction, QTextEdit, QFrame, QMessageBox, QDialog, QStackedWidget,
-    QCheckBox, QFileDialog, QTextBrowser
+    QCheckBox, QFileDialog, QTextBrowser, QStyledItemDelegate, QInputDialog
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess, QTimer, QRectF, QEvent
 from PyQt5.QtGui import QIcon, QColor, QFont, QBrush, QPixmap, QPainter, QPen
 
 # Nhúng các module backend
@@ -23,24 +27,183 @@ from multi_downloader import MultiDownloader
 from monetization_manager import scrape_account_financial_info
 from automation_dashboard import AutomationDashboard
 from gologin_config import load_gologin_settings, save_gologin_settings, mask_secret
+from gologin_profile_utils import first_real_gologin_profile_id
+from gologin_proxy_check import clear_profile_proxy, set_profile_proxy
 from video_table_manager import VideoTableManager
 from add_profile_dialog import AddProfileDialog
 from add_multiple_dialog import AddMultipleDialog
 from app_paths import (
+    app_data_dir,
     data_file,
     gologin_profiles_root,
     init_app_data,
+    is_local_chrome_disposable_test_dir_name,
+    local_chrome_check_profiles_root,
+    local_chrome_profile_dir,
+    local_chrome_profiles_root,
     named_browser_profile_dir,
     require_orbita_browser_exe,
     resource_path,
+    stealth_firefox_profile_dir,
+    stealth_firefox_profiles_root,
     tool_dir_path,
 )
 from app_version import APP_VERSION
+from browser_backend_utils import (
+    GOLOGIN_BACKEND,
+    LOCAL_CHROME_BACKEND,
+    STEALTH_FIREFOX_BACKEND,
+    ensure_profile_backend_defaults,
+    is_local_chrome_backend,
+    local_chrome_storage_key,
+    make_local_chrome_browser_id,
+    make_stealth_firefox_browser_id,
+    normalize_browser_backend,
+)
 from proxy_utils import normalize_proxy_type, validate_proxy_connection
 from update_checker import check_for_update
 
+
+_fault_log_file = None
+
+
+def _write_crash_log(title, details):
+    try:
+        log_dir = app_data_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = log_dir / f"crash_{stamp}.log"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"{title}\n")
+            f.write("=" * 80 + "\n")
+            f.write(str(details or ""))
+            f.write("\n")
+        return path
+    except Exception:
+        return None
+
+
+def _install_crash_handlers():
+    global _fault_log_file
+
+    try:
+        import faulthandler
+
+        log_dir = app_data_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        _fault_log_file = (log_dir / f"fatal_{stamp}.log").open("a", encoding="utf-8")
+        faulthandler.enable(file=_fault_log_file, all_threads=True)
+    except Exception:
+        _fault_log_file = None
+
+    old_excepthook = sys.excepthook
+
+    def handle_exception(exc_type, exc_value, exc_tb):
+        details = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        path = _write_crash_log("Unhandled exception", details)
+        if path:
+            print(f"Crash log saved: {path}", file=sys.stderr)
+        try:
+            old_excepthook(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    sys.excepthook = handle_exception
+
+    if hasattr(threading, "excepthook"):
+        old_threading_excepthook = threading.excepthook
+
+        def handle_thread_exception(args):
+            details = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+            path = _write_crash_log(f"Unhandled thread exception: {getattr(args.thread, 'name', '')}", details)
+            if path:
+                print(f"Thread crash log saved: {path}", file=sys.stderr)
+            try:
+                old_threading_excepthook(args)
+            except Exception:
+                pass
+
+        threading.excepthook = handle_thread_exception
+
+
 # Disable gologin import for now
 # from kyc_manager import auto_upload_kyc
+
+REGION_OPTIONS = ["", "UK", "US", "DE", "VN", "JP", "KR", "FR"]
+REGION_COLUMN_NAME = "Geo"
+REGION_PROFILE_KEY = "region"
+REGION_EMPTY_LABEL = "+ Select"
+
+REGION_COLORS = {
+    "UK": ("#dbeafe", "#1d4ed8"),
+    "US": ("#fee2e2", "#b91c1c"),
+    "DE": ("#fef3c7", "#92400e"),
+    "VN": ("#dcfce7", "#15803d"),
+    "JP": ("#fce7f3", "#be185d"),
+    "KR": ("#ede9fe", "#6d28d9"),
+    "FR": ("#e0f2fe", "#0369a1"),
+}
+
+
+def region_colors(value):
+    return REGION_COLORS.get(normalize_region(value), ("#f1f5f9", "#64748b"))
+
+
+def normalize_region(value):
+    value = str(value or "").strip().upper()
+    return value if value in REGION_OPTIONS else ""
+
+
+class RegionComboDelegate(QStyledItemDelegate):
+    def __init__(self, options=None, parent=None):
+        super().__init__(parent)
+        self.options = list(options or REGION_OPTIONS)
+
+    def createEditor(self, parent, option, index):
+        combo = QComboBox(parent)
+        combo.addItem(REGION_EMPTY_LABEL, "")
+        for item in self.options:
+            if item:
+                combo.addItem(item, item)
+        combo.setEditable(False)
+        combo.setFrame(False)
+        return combo
+
+    def setEditorData(self, editor, index):
+        value = normalize_region(index.data(Qt.EditRole) or index.data(Qt.DisplayRole) or "")
+        idx = editor.findData(value)
+        editor.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def setModelData(self, editor, model, index):
+        value = normalize_region(editor.currentData() or editor.currentText())
+        model.setData(index, value, Qt.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
+
+    def paint(self, painter, option, index):
+        value = normalize_region(index.data(Qt.EditRole) or index.data(Qt.DisplayRole) or "")
+        if value:
+            text = value
+            bg, fg = region_colors(value)
+        else:
+            text = "+"
+            bg, fg = "#f8fafc", "#64748b"
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(option.rect.adjusted(2, 2, -2, -2))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(bg))
+        painter.drawRoundedRect(rect, 4.0, 4.0)
+        painter.setPen(QColor(fg))
+        font = option.font
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(option.rect, Qt.AlignCenter, text)
+        painter.restore()
+
 
 # --- GENERIC WORKER THREAD ---
 class GenericWorker(QThread):
@@ -121,14 +284,32 @@ class InboxDialog(QDialog):
 
 
 class GoLoginSettingsDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_setup=False):
         super().__init__(parent)
-        self.setWindowTitle("Cài đặt GoLogin API")
-        self.resize(520, 230)
+        self.initial_setup = bool(initial_setup)
+        self.setWindowTitle("Thiết lập lần đầu - GoLogin" if self.initial_setup else "Cài đặt GoLogin API")
+        self.resize(620, 380 if self.initial_setup else 340)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.settings = load_gologin_settings()
+        self.environment_snapshot = {}
 
         layout = QVBoxLayout(self)
+
+        if self.initial_setup:
+            intro = QLabel(
+                "Máy mới cần cấu hình GoLogin trước khi dùng profile thật.\n"
+                "Thiết lập này sẽ được lưu vào thư mục APPDATA của máy hiện tại."
+            )
+            intro.setWordWrap(True)
+            intro.setStyleSheet("color: #334155; font-size: 13px;")
+            layout.addWidget(intro)
+
+        config_path = str(app_data_dir() / "gologin_settings.json")
+        config_path_label = QLabel(f"File cấu hình: {config_path}")
+        config_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        config_path_label.setStyleSheet("color: #64748b; font-size: 12px;")
+        config_path_label.setWordWrap(True)
+        layout.addWidget(config_path_label)
 
         layout.addWidget(QLabel("GoLogin API Key:"))
         self.api_key_input = QLineEdit()
@@ -147,20 +328,58 @@ class GoLoginSettingsDialog(QDialog):
         self.folder_input.setText(self.settings.get("gologin_folder_name", ""))
         layout.addWidget(self.folder_input)
 
+        env_group = QFrame()
+        env_group.setStyleSheet(
+            "QFrame { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; }"
+            "QLabel { border: none; background: transparent; }"
+        )
+        env_layout = QVBoxLayout(env_group)
+        env_layout.setContentsMargins(10, 10, 10, 10)
+        env_layout.setSpacing(6)
+        env_title = QLabel("Trạng thái máy hiện tại")
+        env_title.setStyleSheet("font-weight: bold; color: #0f172a;")
+        env_layout.addWidget(env_title)
+        self.env_summary_label = QLabel("")
+        self.env_summary_label.setWordWrap(True)
+        self.env_summary_label.setStyleSheet("color: #334155;")
+        env_layout.addWidget(self.env_summary_label)
+        self.env_api_label = QLabel("")
+        self.env_use_cloud_label = QLabel("")
+        self.env_sdk_label = QLabel("")
+        self.env_orbita_label = QLabel("")
+        for label in (
+            self.env_api_label,
+            self.env_use_cloud_label,
+            self.env_sdk_label,
+            self.env_orbita_label,
+        ):
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            env_layout.addWidget(label)
+        layout.addWidget(env_group)
+
         self.status_label = QLabel("")
         if self.settings.get("api_key"):
             self.status_label.setText(f"Đang có key: {mask_secret(self.settings.get('api_key'))}")
         layout.addWidget(self.status_label)
 
         btn_layout = QHBoxLayout()
+        btn_check = QPushButton("Kiểm tra môi trường")
+        btn_check.clicked.connect(self.refresh_environment_status)
+        btn_layout.addWidget(btn_check)
         btn_layout.addStretch()
-        btn_cancel = QPushButton("Hủy")
+        btn_cancel = QPushButton("Để sau" if self.initial_setup else "Hủy")
         btn_cancel.clicked.connect(self.reject)
-        btn_save = QPushButton("Lưu")
-        btn_save.clicked.connect(self.accept)
+        btn_save = QPushButton("Lưu và tiếp tục" if self.initial_setup else "Lưu")
+        btn_save.clicked.connect(self.handle_save)
         btn_layout.addWidget(btn_cancel)
         btn_layout.addWidget(btn_save)
         layout.addLayout(btn_layout)
+
+        self.api_key_input.textChanged.connect(self.refresh_environment_status)
+        self.use_cloud_chk.toggled.connect(self.refresh_environment_status)
+        self.folder_input.textChanged.connect(self.refresh_environment_status)
+        self.refresh_environment_status()
 
     def get_settings(self):
         return {
@@ -168,6 +387,125 @@ class GoLoginSettingsDialog(QDialog):
             "use_gologin_cloud": self.use_cloud_chk.isChecked(),
             "gologin_folder_name": self.folder_input.text().strip(),
         }
+
+    def refresh_environment_status(self):
+        snapshot = inspect_gologin_environment(
+            api_key=self.api_key_input.text().strip(),
+            use_gologin_cloud=self.use_cloud_chk.isChecked(),
+            gologin_folder_name=self.folder_input.text().strip(),
+        )
+        self.environment_snapshot = snapshot
+        self.status_label.setText(snapshot["status_text"])
+        self.env_summary_label.setText(snapshot["summary_text"])
+        self.env_api_label.setText(snapshot["api_label"])
+        self.env_use_cloud_label.setText(snapshot["use_cloud_label"])
+        self.env_sdk_label.setText(snapshot["sdk_label"])
+        self.env_orbita_label.setText(snapshot["orbita_label"])
+
+    def handle_save(self):
+        settings = self.get_settings()
+        if not settings["api_key"]:
+            QMessageBox.warning(
+                self,
+                "Thiếu API key",
+                "Máy mới cần GoLogin API key trước khi dùng profile thật.",
+            )
+            return
+        if not settings["use_gologin_cloud"]:
+            answer = QMessageBox.question(
+                self,
+                "Xác nhận cấu hình",
+                "Tắt tùy chọn GoLogin cloud sẽ khiến máy mới không tạo được profile GoLogin thật.\n\n"
+                "Bạn vẫn muốn lưu cấu hình này chứ?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        self.refresh_environment_status()
+        self.accept()
+
+
+def _locate_gologin_orbita():
+    browser_root = Path.home() / ".gologin" / "browser"
+    if browser_root.exists():
+        for candidate in sorted(browser_root.glob("orbita-browser-*/chrome.exe"), reverse=True):
+            if candidate.exists():
+                return str(candidate), str(browser_root)
+    return "", str(browser_root)
+
+
+def _status_html(ok, text, color_ok="#16a34a", color_bad="#dc2626"):
+    color = color_ok if ok else color_bad
+    icon = "OK" if ok else "Loi"
+    return f"<span style='color:{color}; font-weight:600'>{icon}</span> - {html.escape(str(text))}"
+
+
+def inspect_gologin_environment(api_key=None, use_cloud=None, gologin_folder_name=None):
+    settings = load_gologin_settings()
+    api_key = (settings.get("api_key", "") if api_key is None else api_key).strip()
+    use_cloud = bool(settings.get("use_gologin_cloud")) if use_cloud is None else bool(use_cloud)
+    folder_name = (
+        (settings.get("gologin_folder_name", "") if gologin_folder_name is None else gologin_folder_name)
+        or ""
+    ).strip()
+
+    sdk_ok = True
+    sdk_error = ""
+    try:
+        from gologin import GoLogin  # noqa: F401
+    except Exception as exc:
+        sdk_ok = False
+        sdk_error = str(exc)
+
+    orbita_path, browser_root = _locate_gologin_orbita()
+    orbita_ok = bool(orbita_path)
+
+    api_ok = bool(api_key)
+    needs_initial_setup = (not api_ok) or (not use_cloud) or (not sdk_ok)
+
+    if api_ok and use_cloud and sdk_ok:
+        status_text = f"Đang có key: {mask_secret(api_key)}"
+        summary_text = (
+            "Máy này đã có cấu hình GoLogin cơ bản. "
+            "Nếu Orbita chưa có, hãy mở GoLogin một lần để tải trình duyệt trước khi chạy."
+        )
+    else:
+        status_text = "Thiết lập GoLogin chưa hoàn tất trên máy này."
+        summary_text = (
+            "Máy mới cần lưu GoLogin API key và bật GoLogin cloud trước khi thêm/chạy profile thật."
+        )
+
+    return {
+        "api_key_present": api_ok,
+        "use_gologin_cloud": use_cloud,
+        "folder_name": folder_name,
+        "sdk_ok": sdk_ok,
+        "sdk_error": sdk_error,
+        "orbita_ok": orbita_ok,
+        "orbita_path": orbita_path,
+        "browser_root": browser_root,
+        "needs_initial_setup": needs_initial_setup,
+        "status_text": status_text,
+        "summary_text": summary_text,
+        "api_label": _status_html(
+            api_ok,
+            f"API key {'đã có' if api_ok else 'chưa có'}",
+        ),
+        "use_cloud_label": _status_html(
+            use_cloud,
+            "Tạo/sync profile GoLogin thật qua API đang bật" if use_cloud else "Tùy chọn GoLogin cloud đang tắt",
+        ),
+        "sdk_label": _status_html(
+            sdk_ok,
+            "GoLogin SDK đã sẵn sàng" if sdk_ok else f"Chưa cài GoLogin SDK ({sdk_error or 'python -m pip install gologin'})",
+        ),
+        "orbita_label": _status_html(
+            orbita_ok,
+            f"Đã thấy Orbita: {orbita_path}" if orbita_ok else f"Chưa thấy Orbita local trong {browser_root}",
+            color_bad="#d97706",
+        ),
+    }
 
 def check_proxy_live(proxy_string, proxy_type="http"):
     """
@@ -196,9 +534,9 @@ def detect_proxy_type_from_check_message(default_type, message):
     return normalize_proxy_type(default_type)
 
 
-def sync_profile_data_from_table_columns(profile_data, columns):
+def sync_profile_data_from_table_columns(profile_data, columns, region_col=None):
     """Sync editable table columns back into hidden profile_data before launching workers."""
-    profile_data = dict(profile_data or {})
+    profile_data = ensure_profile_backend_defaults(profile_data)
     columns = columns or {}
     old_proxy = (profile_data.get("proxy") or "").strip()
     old_browser_id = (profile_data.get("browser_id") or "").strip()
@@ -217,6 +555,11 @@ def sync_profile_data_from_table_columns(profile_data, columns):
         elif data_key == "proxy":
             profile_data["proxy"] = ""
 
+    if region_col is not None:
+        region_key = str(region_col)
+        if region_key in columns:
+            profile_data[REGION_PROFILE_KEY] = normalize_region(columns.get(region_key, ""))
+
     new_proxy = (profile_data.get("proxy") or "").strip()
     if "3" in columns and new_proxy and new_proxy != old_proxy:
         if "://" in new_proxy:
@@ -224,16 +567,27 @@ def sync_profile_data_from_table_columns(profile_data, columns):
         else:
             profile_data["proxy_type"] = normalize_proxy_type(profile_data.get("proxy_type") or "http")
 
+    backend = normalize_browser_backend(profile_data.get("browser_backend"))
+    profile_data["browser_backend"] = backend
     if "4" in columns:
         browser_id = (profile_data.get("browser_id") or "").strip()
-        if not browser_id:
+        if backend == LOCAL_CHROME_BACKEND:
+            if not browser_id or not browser_id.startswith("local_chrome:"):
+                profile_data["browser_id"] = make_local_chrome_browser_id(profile_data.get("ten_ho_so", ""))
             profile_data["gologin_profile_id"] = ""
-        elif re.fullmatch(r"[0-9a-fA-F]{24}", browser_id):
-            profile_data["gologin_profile_id"] = browser_id
-        elif old_browser_id != browser_id and re.fullmatch(r"[0-9a-fA-F]{24}", old_browser_id):
+        elif backend == STEALTH_FIREFOX_BACKEND:
+            if not browser_id or not browser_id.startswith("stealth_firefox:"):
+                profile_data["browser_id"] = make_stealth_firefox_browser_id(profile_data.get("ten_ho_so", ""))
             profile_data["gologin_profile_id"] = ""
+        else:
+            if not browser_id:
+                profile_data["gologin_profile_id"] = ""
+            elif re.fullmatch(r"[0-9a-fA-F]{24}", browser_id):
+                profile_data["gologin_profile_id"] = browser_id
+            elif old_browser_id != browser_id and re.fullmatch(r"[0-9a-fA-F]{24}", old_browser_id):
+                profile_data["gologin_profile_id"] = ""
 
-    return profile_data
+    return ensure_profile_backend_defaults(profile_data)
 
 
 def make_fingerprint_icon(color="#2563eb"):
@@ -264,7 +618,12 @@ class SSMAToolGUI(QMainWindow):
         init_app_data()
         self.setWindowTitle("DNPTool Reup tiktok")
         self.setWindowIcon(QIcon(str(resource_path("assets/app_icon.ico"))))
-        self.resize(1300, 850)
+        screen = QApplication.primaryScreen()
+        if screen:
+            available = screen.availableGeometry()
+            self.resize(min(1850, available.width() - 80), min(920, available.height() - 80))
+        else:
+            self.resize(1500, 900)
         
         # Khởi tạo các module backend
         self.acc_manager = AccountManager()
@@ -275,6 +634,7 @@ class SSMAToolGUI(QMainWindow):
         self.automation_dashboards = {}
         self.running_profiles = {}
         self._last_update_info = None
+        self._loading_accounts = False
         # Giữ ref worker để không bị garbage collected và tự dọn khi worker xong.
         self.active_workers = []
 
@@ -288,6 +648,8 @@ class SSMAToolGUI(QMainWindow):
         self.load_accounts_from_db()
         
         self.load_projects()
+        self._initial_setup_prompt_shown = False
+        QTimer.singleShot(600, self._maybe_show_initial_gologin_setup)
         QTimer.singleShot(1500, lambda: self.check_app_update(silent=True))
 
     def init_ui(self):
@@ -310,6 +672,8 @@ class SSMAToolGUI(QMainWindow):
         menu_browser_cleanup = menubar.addMenu('Dọn trình duyệt')
         action_cleanup_browsers = menu_browser_cleanup.addAction("Đóng các phiên trình duyệt đang chạy")
         action_cleanup_browsers.triggered.connect(self.handle_cleanup_browser_sessions)
+        action_cleanup_local_test = menu_browser_cleanup.addAction("Xóa Local Chrome test/rác")
+        action_cleanup_local_test.triggered.connect(self.handle_cleanup_local_chrome_test_profiles)
         action_clear_log = menu_browser_cleanup.addAction("Xóa log giao diện")
         action_clear_log.triggered.connect(self.clear_log_output)
         
@@ -380,7 +744,9 @@ class SSMAToolGUI(QMainWindow):
         toolbar.addWidget(QLabel("Dự án:"))
         self.proj_combo = QComboBox()
         self.proj_combo.setMinimumWidth(150)
+        self.proj_combo.setToolTip("Double-click để đổi tên dự án đang chọn")
         self.proj_combo.currentTextChanged.connect(self.filter_by_project)
+        self.proj_combo.installEventFilter(self)
         toolbar.addWidget(self.proj_combo)
         
         btn_refresh_proj = QPushButton("↻")
@@ -431,6 +797,12 @@ class SSMAToolGUI(QMainWindow):
         btn_add_multi.setProperty("variant", "secondary")
         btn_add_multi.clicked.connect(self.open_add_multiple_dialog)
         toolbar.addWidget(btn_add_multi)
+
+        btn_delete_acc = QPushButton("Xóa profile")
+        btn_delete_acc.setProperty("variant", "danger")
+        btn_delete_acc.setToolTip("Xóa profile đã chọn và xóa luôn dữ liệu Local Chrome nếu có")
+        btn_delete_acc.clicked.connect(self.delete_selected_accounts)
+        toolbar.addWidget(btn_delete_acc)
         btn_show_all = QPushButton("Hiện tất cả")
         btn_show_all.setProperty("variant", "ghost")
         btn_show_all.setToolTip("Xóa bộ lọc và hiện tất cả profile")
@@ -481,11 +853,13 @@ class SSMAToolGUI(QMainWindow):
             'Views(30d)', 'Follows', 'Views', 'Videos', 'Email',
             'Upload Folder', 'Status', 'Cookie', '$Earned', '$Balance',
             'C$', 'RPM', 'QG', 'KYC', 'Note', 'Re.Apply', 'Privacy',
-            'VAT', 'TS', 'STT', 'VVP', 'Payout', 'Channel Status'
+            'VAT', 'TS', 'STT', 'VVP', 'Payout', 'Channel Status', REGION_COLUMN_NAME
         ]
         self.channel_status_col = self.headers.index('Channel Status')
+        self.region_col = self.headers.index(REGION_COLUMN_NAME)
         self.acc_table.setColumnCount(len(self.headers))
         self.acc_table.setHorizontalHeaderLabels(self.headers)
+        self.acc_table.setItemDelegateForColumn(self.region_col, RegionComboDelegate(parent=self.acc_table))
         self.acc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.acc_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.acc_table.setAlternatingRowColors(True)
@@ -497,6 +871,7 @@ class SSMAToolGUI(QMainWindow):
         self.acc_table.verticalHeader().setDefaultSectionSize(30)
         self.acc_table.verticalHeader().setMinimumSectionSize(28)
         self.acc_table.selectionModel().selectionChanged.connect(self.update_account_summary)
+        self.acc_table.itemChanged.connect(self._on_account_item_changed)
         
         # Ẩn các cột rác/không dùng tới để làm gọn giao diện
         # (Ẩn từ $Earned đến Payout, nhưng vẫn giữ lại cột Note=20 và STT=25)
@@ -513,10 +888,15 @@ class SSMAToolGUI(QMainWindow):
         status_visual = header.visualIndex(12)
         if channel_visual >= 0 and status_visual >= 0:
             header.moveSection(channel_visual, status_visual + 1)
+        region_visual = header.visualIndex(self.region_col)
+        logged_visual = header.visualIndex(2)
+        if region_visual >= 0 and logged_visual >= 0:
+            header.moveSection(region_visual, logged_visual + 1)
         account_widths = {
-            0: 44, 1: 210, 2: 150, 3: 160, 4: 170, 5: 130,
+            0: 44, 1: 210, 2: 70, 3: 160, 4: 170, 5: 130,
             6: 92, 7: 96, 8: 92, 9: 86, 10: 190, 11: 145,
             12: 150, 13: 220, 20: 180, 25: 55, self.channel_status_col: 180,
+            self.region_col: 70,
         }
         for col, width in account_widths.items():
             if 0 <= col < self.acc_table.columnCount():
@@ -1230,6 +1610,14 @@ class SSMAToolGUI(QMainWindow):
     # ================= QUẢN LÝ DỮ LIỆU (DATABASE) =================
     
     # ================= QUẢN LÝ DỰ ÁN =================
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "proj_combo", None) and event.type() == QEvent.MouseButtonDblClick:
+            project_name = self.proj_combo.currentText().strip()
+            if project_name and not self._is_all_project(project_name):
+                QTimer.singleShot(0, self.handle_rename_project)
+                return True
+        return super().eventFilter(obj, event)
+
     def load_projects(self):
         try:
             with open(self.projects_file, 'r', encoding='utf-8') as f:
@@ -1253,8 +1641,6 @@ class SSMAToolGUI(QMainWindow):
         self.filter_by_project()
 
     def handle_add_project(self):
-        from PyQt5.QtWidgets import QInputDialog
-        import json
         text, ok = QInputDialog.getText(self, "Thêm dự án", "Nhập tên dự án mới:")
         if ok and text.strip():
             proj_name = text.strip()
@@ -1272,6 +1658,97 @@ class SSMAToolGUI(QMainWindow):
                     json.dump(projects, f, ensure_ascii=False)
                 self.load_projects()
                 self.proj_combo.setCurrentText(proj_name)
+
+    def handle_rename_project(self):
+        old_project = self.proj_combo.currentText().strip()
+        if not old_project or self._is_all_project(old_project):
+            QMessageBox.warning(self, "Không thể đổi tên", "Hãy chọn một dự án cụ thể để đổi tên.")
+            return
+
+        text, ok = QInputDialog.getText(
+            self,
+            "Đổi tên dự án",
+            "Nhập tên dự án mới:",
+            text=old_project,
+        )
+        if not ok:
+            return
+
+        new_project = text.strip()
+        if not new_project or new_project == old_project:
+            return
+        if self._is_all_project(new_project):
+            QMessageBox.warning(self, "Tên dự án không hợp lệ", "Không thể đổi tên thành mục Tất cả tài khoản.")
+            return
+
+        try:
+            with open(self.projects_file, "r", encoding="utf-8") as f:
+                projects = json.load(f)
+        except Exception:
+            projects = []
+
+        if new_project in projects:
+            QMessageBox.warning(self, "Trùng tên dự án", f"Dự án '{new_project}' đã tồn tại.")
+            return
+
+        old_dashboard_key = self._dashboard_key_for_project(old_project)
+        existing_dashboard = self._get_dashboard(old_dashboard_key)
+        if existing_dashboard is not None:
+            try:
+                if existing_dashboard.has_active_tasks():
+                    QMessageBox.warning(
+                        self,
+                        "Dự án đang chạy",
+                        (
+                            f"Bảng theo dõi của dự án '{old_project}' đang có tác vụ chạy.\n"
+                            "Hãy dừng hoặc đóng bảng đó trước khi đổi tên dự án."
+                        ),
+                    )
+                    return
+            except Exception:
+                pass
+            try:
+                existing_dashboard.close()
+            except Exception:
+                pass
+
+        updated = False
+        for index, name in enumerate(projects):
+            if name == old_project:
+                projects[index] = new_project
+                updated = True
+                break
+        if not updated:
+            projects.append(new_project)
+
+        with open(self.projects_file, "w", encoding="utf-8") as f:
+            json.dump(projects, f, ensure_ascii=False)
+
+        moved_count = 0
+        for row in range(self.acc_table.rowCount()):
+            name_item = self.acc_table.item(row, 1)
+            if not name_item:
+                continue
+            data = name_item.data(Qt.UserRole) or {}
+            if (data.get("project", "") or "").strip() == old_project:
+                data["project"] = new_project
+                name_item.setData(Qt.UserRole, data)
+                moved_count += 1
+
+        for profile_key, current in list(self.running_profiles.items()):
+            if current.get("project_name") == old_project:
+                current["project_name"] = new_project
+                self.running_profiles[profile_key] = current
+
+        self.save_accounts_to_db()
+        self.load_projects()
+        self.proj_combo.setCurrentText(new_project)
+        self.filter_by_project()
+        self.log(
+            f"Đã đổi tên dự án '{old_project}' thành '{new_project}'. "
+            f"Đã cập nhật {moved_count} tài khoản.",
+            "#00aa00",
+        )
 
     def handle_delete_project(self):
         project_name = self.proj_combo.currentText().strip()
@@ -1354,7 +1831,7 @@ class SSMAToolGUI(QMainWindow):
 
     def _account_row_search_text(self, row):
         values = []
-        for col in (1, 2, 3, 4, 5, 10, 12, 20, self.channel_status_col):
+        for col in (1, 2, 3, 4, 5, 10, 12, 20, self.region_col, self.channel_status_col):
             item = self.acc_table.item(row, col)
             if item:
                 values.append(item.text())
@@ -1364,6 +1841,46 @@ class SSMAToolGUI(QMainWindow):
             if isinstance(data, dict):
                 values.extend(str(v) for v in data.values() if isinstance(v, (str, int, float)))
         return " ".join(values).lower()
+
+    def _set_region_item(self, row, value=""):
+        value = normalize_region(value)
+        item = QTableWidgetItem(value)
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setToolTip("Chọn Geo/Region: UK, US, DE, VN, JP, KR, FR")
+        item.setFlags(item.flags() | Qt.ItemIsEditable)
+        bg, fg = region_colors(value)
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        if value:
+            item.setBackground(QColor(bg))
+            item.setForeground(QColor(fg))
+        else:
+            item.setBackground(QColor("#f8fafc"))
+            item.setForeground(QColor("#64748b"))
+        old_state = self.acc_table.blockSignals(True)
+        try:
+            self.acc_table.setItem(row, self.region_col, item)
+        finally:
+            self.acc_table.blockSignals(old_state)
+
+    def _on_account_item_changed(self, item):
+        if getattr(self, "_loading_accounts", False):
+            return
+        if not item or item.column() != getattr(self, "region_col", -1):
+            return
+
+        row = item.row()
+        region = normalize_region(item.text())
+        self._set_region_item(row, region)
+        item = self.acc_table.item(row, self.region_col)
+
+        name_item = self.acc_table.item(row, 1)
+        if name_item:
+            profile_data = dict(name_item.data(Qt.UserRole) or {})
+            profile_data[REGION_PROFILE_KEY] = region
+            name_item.setData(Qt.UserRole, profile_data)
+        self.save_accounts_to_db()
 
     def update_account_summary(self, *_):
         labels = getattr(self, "account_summary_labels", None)
@@ -1432,6 +1949,7 @@ class SSMAToolGUI(QMainWindow):
         if not os.path.exists(self.db_file):
             self.apply_account_filters()
             return
+        self._loading_accounts = True
         try:
             # Xóa bảng cũ trước khi load lại để không bị trùng
             self.acc_table.setRowCount(0)
@@ -1470,6 +1988,15 @@ class SSMAToolGUI(QMainWindow):
                         }
                     elif self._is_all_project(profile_data.get("project", "")):
                         profile_data["project"] = ""
+                    profile_data["browser_id"] = (
+                        str(profile_data.get("browser_id") or "").strip()
+                        or str(cols.get("4", "") or "").strip()
+                    )
+                    profile_data = ensure_profile_backend_defaults(profile_data)
+
+                    region_value = normalize_region(cols.get(str(self.region_col), "") or profile_data.get(REGION_PROFILE_KEY, ""))
+                    profile_data[REGION_PROFILE_KEY] = region_value
+                    self._set_region_item(row, region_value)
                     
                     name_item.setData(Qt.UserRole, profile_data)
                     if profile_data.get("avatar_path"):
@@ -1479,6 +2006,8 @@ class SSMAToolGUI(QMainWindow):
             self.log(f"Đã tải {len(accounts)} hồ sơ từ cơ sở dữ liệu.")
         except Exception as e:
             self.log(f"Lỗi khi đọc dữ liệu: {e}", "red")
+        finally:
+            self._loading_accounts = False
 
     def open_edit1_folder(self):
         edit_dir = tool_dir_path("EDIT_1")
@@ -1554,17 +2083,27 @@ class SSMAToolGUI(QMainWindow):
             QMessageBox.critical(self, "EDIT video", f"Không chạy được:\n{entry_script}")
 
     def open_creator_now_tool(self):
-        tool_dir = tool_dir_path("Creator Now Cut 14112025")
+        searched_dirs = []
+        for folder_name in ("Creator Now Cut", "Creator Now Cut 14112025"):
+            candidate = tool_dir_path(folder_name)
+            if candidate not in searched_dirs:
+                searched_dirs.append(candidate)
+
+        tool_dir = next(
+            (candidate for candidate in searched_dirs if (candidate / "creator_now_studio.py").is_file()),
+            searched_dirs[0],
+        )
         script = tool_dir / "creator_now_studio.py"
 
         if not tool_dir.is_dir():
-            QMessageBox.warning(self, "Creator Now", f"Khong tim thay thu muc Creator Now:\n{tool_dir}")
+            paths_text = "\n".join(str(candidate) for candidate in searched_dirs)
+            QMessageBox.warning(self, "Creator Now", f"Khong tim thay thu muc Creator Now. Da kiem tra:\n{paths_text}")
             return
         if not script.is_file():
             QMessageBox.warning(
                 self,
                 "Creator Now",
-                "Khong tim thay creator_now_studio.py.",
+                f"Khong tim thay creator_now_studio.py trong:\n{tool_dir}",
             )
             return
 
@@ -1687,7 +2226,7 @@ class SSMAToolGUI(QMainWindow):
 
     def _on_dashboard_hidden(self, dashboard_key=None):
         self._update_dashboard_button()
-        self.status_bar.showMessage("B?ng theo d?i ?? ?n, t?c v? v?n ti?p t?c ch?y.", 5000)
+        self.status_bar.showMessage("Bảng theo dõi đã ẩn, tác vụ vẫn tiếp tục chạy.", 5000)
 
     def _on_dashboard_closed(self, dashboard_key=None, *args):
         if dashboard_key:
@@ -1702,7 +2241,7 @@ class SSMAToolGUI(QMainWindow):
             if getattr(self.automation_dashboard, "dashboard_key", None) == dashboard_key:
                 self.automation_dashboard = None
         self._update_dashboard_button()
-        self.status_bar.showMessage("B?ng theo d?i ?? ??ng.", 5000)
+        self.status_bar.showMessage("Bảng theo dõi đã đóng.", 5000)
 
     def _show_existing_dashboard(self, dashboard_key):
         dashboard = self._get_dashboard(dashboard_key)
@@ -1720,7 +2259,7 @@ class SSMAToolGUI(QMainWindow):
         dashboard_key = dashboard_key or self._dashboard_key_for_project(project_name)
         accounts_data = self._filter_accounts_for_project(accounts_data, project_name)
         if not accounts_data:
-            self.log(f"D? ?n '{project_name}' kh?ng c? profile ?? m? b?ng theo d?i.", "orange")
+            self.log(f"Dự án '{project_name}' không có profile để mở bảng theo dõi.", "orange")
             return None, False
         existing = self._get_dashboard(dashboard_key)
         if existing is not None:
@@ -1729,11 +2268,11 @@ class SSMAToolGUI(QMainWindow):
                 refreshed = existing.replace_accounts_data(accounts_data, project_name=project_name)
             self._show_existing_dashboard(dashboard_key)
             if refreshed:
-                self.log(f"?? c?p nh?t b?ng theo d?i '{project_name}' v?i {len(accounts_data)} profile.", "#2196F3")
+                self.log(f"Đã cập nhật bảng theo dõi '{project_name}' với {len(accounts_data)} profile.", "#2196F3")
                 if after_show:
                     QTimer.singleShot(300, lambda d=existing: after_show(d))
             else:
-                self.log("B?ng theo d?i ?ang ch?y, kh?ng refresh d? li?u ?? tr?nh m?t worker.", "orange")
+                self.log("Bảng theo dõi đang chạy, không refresh dữ liệu để tránh mất worker.", "orange")
             return existing, False
 
         dialog = AutomationDashboard(
@@ -1858,6 +2397,167 @@ class SSMAToolGUI(QMainWindow):
             "blue",
         )
 
+    def handle_cleanup_local_chrome_test_profiles(self):
+        candidates = self._collect_disposable_local_chrome_test_dirs()
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Local Chrome test",
+                "Không có thư mục Local Chrome test/rác nào để xóa.",
+            )
+            return
+
+        names = [path.name for path in candidates]
+        sample = "\n".join(names[:10])
+        more = "" if len(names) <= 10 else f"\n... và {len(names) - 10} thư mục khác"
+        reply = QMessageBox.question(
+            self,
+            "Xóa Local Chrome test/rác",
+            "Sẽ xóa các thư mục Local Chrome test/rác sau:\n\n"
+            f"{sample}{more}\n\n"
+            "Chỉ xóa thư mục test/rác đã biết, không xóa profile Local Chrome thật.\n\n"
+            "Bạn muốn tiếp tục?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        worker = GenericWorker(
+            self._cleanup_local_chrome_test_profiles,
+            extra_data={"count": len(candidates)},
+            pass_progress=False,
+            targets=[str(path) for path in candidates],
+        )
+        worker.finished.connect(self.on_cleanup_local_chrome_test_profiles_done)
+        self._track_worker(worker)
+        worker.start()
+        self.log(
+            f"Đang xóa {len(candidates)} thư mục Local Chrome test/rác...",
+            "blue",
+        )
+
+    def _collect_disposable_local_chrome_test_dirs(self):
+        roots = [local_chrome_profiles_root()]
+        try:
+            check_root = local_chrome_check_profiles_root()
+        except Exception:
+            check_root = None
+        if check_root:
+            roots.append(check_root)
+
+        candidates = []
+        seen = set()
+        for root in roots:
+            try:
+                if not root.exists():
+                    continue
+                for child in root.iterdir():
+                    if not child.is_dir():
+                        continue
+                    if root == check_root or is_local_chrome_disposable_test_dir_name(child.name):
+                        resolved = str(child.resolve()).lower()
+                        if resolved not in seen:
+                            seen.add(resolved)
+                            candidates.append(child)
+            except Exception:
+                continue
+        return candidates
+
+    def _collect_active_browser_user_data_dirs(self):
+        active_dirs = set()
+        try:
+            import psutil
+        except Exception:
+            return active_dirs
+
+        browser_names = {"chrome.exe", "orbita-browser.exe", "chromium.exe", "firefox.exe"}
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                if name not in browser_names:
+                    continue
+                args = [str(arg) for arg in (proc.info.get("cmdline") or [])]
+                for index, arg in enumerate(args):
+                    lower_arg = arg.lower()
+                    user_dir = ""
+                    if lower_arg.startswith("--user-data-dir="):
+                        user_dir = arg.split("=", 1)[1]
+                    elif lower_arg == "--user-data-dir" and index + 1 < len(args):
+                        user_dir = args[index + 1]
+                    elif lower_arg.startswith("--profile="):
+                        user_dir = arg.split("=", 1)[1]
+                    elif lower_arg in {"--profile", "-profile"} and index + 1 < len(args):
+                        user_dir = args[index + 1]
+                    else:
+                        continue
+                    user_dir = str(user_dir or "").strip().strip('"').strip("'")
+                    if not user_dir:
+                        continue
+                    try:
+                        user_dir = str(Path(user_dir).resolve()).lower()
+                    except Exception:
+                        user_dir = os.path.abspath(user_dir).lower()
+                    active_dirs.add(user_dir)
+            except Exception:
+                continue
+        return active_dirs
+
+    def _cleanup_local_chrome_test_profiles(self, targets):
+        result = {"deleted": [], "skipped_active": [], "errors": []}
+        active_dirs = self._collect_active_browser_user_data_dirs()
+        allowed_roots = []
+        for root in (local_chrome_profiles_root(), local_chrome_check_profiles_root()):
+            try:
+                allowed_roots.append(str(root.resolve()).lower())
+            except Exception:
+                allowed_roots.append(str(root).lower())
+
+        for raw_path in (targets or []):
+            try:
+                path = Path(raw_path).resolve()
+            except Exception:
+                path = Path(raw_path)
+            path_text = str(path).lower()
+            if not any(path_text == root or path_text.startswith(root + "\\") or path_text.startswith(root + "/") for root in allowed_roots):
+                result["errors"].append(f"Bo qua duong dan ngoai root cho phep: {path}")
+                continue
+            if path_text in active_dirs:
+                result["skipped_active"].append(str(path))
+                continue
+            if not path.exists() or not path.is_dir():
+                continue
+            try:
+                shutil.rmtree(path)
+                result["deleted"].append(str(path))
+            except Exception as e:
+                result["errors"].append(f"{path.name}: {e}")
+        return result
+
+    def on_cleanup_local_chrome_test_profiles_done(self, success, result, extra_data):
+        info = extra_data if isinstance(extra_data, dict) else {}
+        total = int(info.get("count", 0) or 0)
+        if success and isinstance(result, dict):
+            deleted = result.get("deleted", []) or []
+            skipped = result.get("skipped_active", []) or []
+            errors = result.get("errors", []) or []
+            self.log(
+                f"Đã dọn Local Chrome test/rác: xóa {len(deleted)}/{total}, bỏ qua đang mở {len(skipped)}.",
+                "#16a34a",
+            )
+            for item in skipped[:3]:
+                self.log(f"Bỏ qua đang mở: {item}", "orange")
+            for err in errors[:3]:
+                self.log(f"Dọn Local Chrome test cảnh báo: {err}", "orange")
+            self.status_bar.showMessage(
+                f"Đã dọn {len(deleted)} thư mục Local Chrome test/rác.",
+                6000,
+            )
+            return
+
+        self.log(f"Lỗi dọn Local Chrome test/rác: {result}", "red")
+        self.status_bar.showMessage("Dọn Local Chrome test/rác thất bại.", 6000)
+
     def _collect_browser_cleanup_targets(self):
         targets = []
         gologin_root = gologin_profiles_root()
@@ -1870,9 +2570,20 @@ class SSMAToolGUI(QMainWindow):
                 or (id_item.text().strip() if id_item else "")
                 or ""
             ).strip()
+            backend = normalize_browser_backend(profile_data.get("browser_backend"))
+            if backend != LOCAL_CHROME_BACKEND and browser_id.startswith("local_chrome:"):
+                backend = LOCAL_CHROME_BACKEND
+            if backend != STEALTH_FIREFOX_BACKEND and browser_id.startswith("stealth_firefox:"):
+                backend = STEALTH_FIREFOX_BACKEND
             gologin_id = (profile_data.get("gologin_profile_id") or "").strip()
-            profile_dir = str(gologin_root / f"profile_{browser_id}") if browser_id else ""
+            if backend == LOCAL_CHROME_BACKEND and browser_id:
+                profile_dir = str(local_chrome_profile_dir(browser_id))
+            elif backend == STEALTH_FIREFOX_BACKEND and browser_id:
+                profile_dir = str(stealth_firefox_profile_dir(browser_id))
+            else:
+                profile_dir = str(gologin_root / f"profile_{browser_id}") if browser_id else ""
             targets.append({
+                "browser_backend": backend,
                 "browser_id": browser_id,
                 "gologin_profile_id": gologin_id,
                 "profile_dir": profile_dir,
@@ -1916,7 +2627,7 @@ class SSMAToolGUI(QMainWindow):
             if value and len(str(value).strip()) >= 8
         }
 
-        browser_names = {"chrome.exe", "orbita-browser.exe", "chromium.exe"}
+        browser_names = {"chrome.exe", "orbita-browser.exe", "chromium.exe", "firefox.exe"}
         matched = []
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
             try:
@@ -1929,18 +2640,24 @@ class SSMAToolGUI(QMainWindow):
                 has_match = False
                 for index, arg in enumerate(args):
                     lower_arg = arg.lower()
-                    if "--user-data-dir" not in lower_arg:
-                        continue
-                    if "=" in arg:
+                    user_dir = ""
+                    if lower_arg.startswith("--user-data-dir="):
                         user_dir = arg.split("=", 1)[1]
-                    elif index + 1 < len(args):
+                    elif lower_arg == "--user-data-dir" and index + 1 < len(args):
+                        user_dir = args[index + 1]
+                    elif lower_arg.startswith("--profile="):
+                        user_dir = arg.split("=", 1)[1]
+                    elif lower_arg in {"--profile", "-profile"} and index + 1 < len(args):
                         user_dir = args[index + 1]
                     else:
-                        user_dir = ""
+                        continue
                     user_dir = norm_path(user_dir)
                     if user_dir and any(user_dir == target or user_dir.startswith(target + "/") for target in target_dirs):
                         has_match = True
                         break
+
+                if not has_match and target_dirs:
+                    has_match = any(target and target in cmdline for target in target_dirs)
 
                 if not has_match and target_ids:
                     has_match = any(target_id in cmdline for target_id in target_ids)
@@ -2020,9 +2737,12 @@ class SSMAToolGUI(QMainWindow):
             for col in range(self.acc_table.columnCount()):
                 item = self.acc_table.item(row, col)
                 if item:
-                    columns[str(col)] = item.text()
+                    cell_text = item.text()
+                    if col == self.region_col and cell_text == "+":
+                        cell_text = ""
+                    columns[str(col)] = cell_text
 
-            profile_data = sync_profile_data_from_table_columns(profile_data, columns)
+            profile_data = sync_profile_data_from_table_columns(profile_data, columns, self.region_col)
             name_item.setData(Qt.UserRole, profile_data)
 
             accounts_data.append({
@@ -2059,9 +2779,9 @@ class SSMAToolGUI(QMainWindow):
         project_rows = self._current_project_rows()
         accounts_data = self._collect_accounts_for_rows(project_rows)
         if not accounts_data:
-            self.log("D? ?n hi?n t?i kh?ng c? profile ?? m? b?ng theo d?i.", "orange")
+            self.log("Dự án hiện tại không có profile để mở bảng theo dõi.", "orange")
             return
-        self.log(f"M? b?ng theo d?i '{project_name}' v?i {len(accounts_data)} profile.", "#00ff00")
+        self.log(f"Mở bảng theo dõi '{project_name}' với {len(accounts_data)} profile.", "#00ff00")
         self._show_automation_dashboard(
             accounts_data,
             project_name=project_name,
@@ -2076,13 +2796,17 @@ class SSMAToolGUI(QMainWindow):
             acc_data = {"columns": {}, "profile_data": {}}
             for col in range(self.acc_table.columnCount()):
                 item = self.acc_table.item(row, col)
-                if item and item.text():
-                    acc_data["columns"][str(col)] = item.text()
+                if item:
+                    cell_text = item.text()
+                    if col == self.region_col and cell_text == "+":
+                        cell_text = ""
+                    if cell_text:
+                        acc_data["columns"][str(col)] = cell_text
                     
             name_item = self.acc_table.item(row, 1)
             if name_item:
                 p_data = dict(name_item.data(Qt.UserRole) or {})
-                p_data = sync_profile_data_from_table_columns(p_data, acc_data["columns"])
+                p_data = sync_profile_data_from_table_columns(p_data, acc_data["columns"], self.region_col)
                 if p_data:
                     acc_data["profile_data"] = p_data
                     name_item.setData(Qt.UserRole, p_data)
@@ -2159,6 +2883,40 @@ class SSMAToolGUI(QMainWindow):
 
         if dialog.clickedButton() == btn_download and download_url:
             webbrowser.open(download_url)
+
+    def _maybe_show_initial_gologin_setup(self):
+        if getattr(self, "_initial_setup_prompt_shown", False):
+            return
+        snapshot = inspect_gologin_environment()
+        if not snapshot.get("needs_initial_setup"):
+            self._initial_setup_prompt_shown = True
+            return
+
+        self._initial_setup_prompt_shown = True
+        dialog = GoLoginSettingsDialog(self, initial_setup=True)
+        if dialog.exec_() == QDialog.Accepted:
+            settings = dialog.get_settings()
+            save_gologin_settings(
+                api_key=settings["api_key"],
+                use_gologin_cloud=settings["use_gologin_cloud"],
+                gologin_folder_name=settings["gologin_folder_name"],
+            )
+            snapshot = inspect_gologin_environment(**settings)
+            detail_lines = ["Đã lưu cấu hình GoLogin cho máy này."]
+            if not snapshot.get("sdk_ok"):
+                detail_lines.append("Máy này vẫn cần cài GoLogin SDK: python -m pip install gologin")
+            if not snapshot.get("orbita_ok"):
+                detail_lines.append("Nếu chưa thấy Orbita, hãy mở GoLogin một lần để tải trình duyệt trước khi chạy.")
+            QMessageBox.information(
+                self,
+                "Thiết lập GoLogin",
+                "\n".join(detail_lines),
+            )
+        else:
+            self.status_bar.showMessage(
+                "Máy này chưa thiết lập xong GoLogin. Vào API / Cookie để hoàn tất sau.",
+                8000,
+            )
 
     def open_gologin_settings(self):
         dialog = GoLoginSettingsDialog(self)
@@ -2374,6 +3132,33 @@ class SSMAToolGUI(QMainWindow):
             return "Kết nối API GoLogin bị timeout."
         return "GoLogin API trả lỗi."
 
+    def _sync_gologin_profile_proxy_setting(self, profile_id, proxy_string="", proxy_type="http"):
+        profile_id = first_real_gologin_profile_id(profile_id)
+        if not profile_id:
+            return False, "Thiếu GoLogin Profile ID thật."
+
+        settings = load_gologin_settings()
+        api_key = (settings.get("api_key") or "").strip()
+        if not api_key:
+            return False, "Thiếu GoLogin API key."
+
+        proxy_string = (proxy_string or "").strip()
+        if proxy_string:
+            return set_profile_proxy(api_key, profile_id, proxy_string, proxy_type)
+        return clear_profile_proxy(api_key, profile_id)
+
+    def _resolve_profile_id_from_data(self, *data_objects):
+        values = []
+        for data in data_objects:
+            if isinstance(data, dict):
+                values.extend([
+                    data.get("gologin_profile_id"),
+                    data.get("browser_id"),
+                ])
+            else:
+                values.append(data)
+        return first_real_gologin_profile_id(*values)
+
     def _delete_gologin_cloud_profile(self, profile_id):
         """Delete a GoLogin cloud profile by ID."""
         profile_id = (profile_id or "").strip()
@@ -2424,6 +3209,8 @@ class SSMAToolGUI(QMainWindow):
                 # Proxy check
                 proxy_str = data.get("proxy", "")
                 proxy_type = data.get("proxy_type", "http")
+                proxy_str = (proxy_str or "").strip()
+                data["proxy"] = proxy_str
                 if proxy_str:
                     is_live, msg = check_proxy_live(proxy_str, proxy_type)
                     if not is_live:
@@ -2438,6 +3225,18 @@ class SSMAToolGUI(QMainWindow):
                     data["browser_id"] = profile_id
                     data["gologin_profile_id"] = profile_id
                     self.log(f"✅ Đã tạo GoLogin cloud profile: {profile_id}", "#00ff00")
+                    if proxy_str:
+                        ok_proxy, proxy_msg = self._sync_gologin_profile_proxy_setting(
+                            profile_id,
+                            proxy_str,
+                            data.get("proxy_type", proxy_type),
+                        )
+                        if not ok_proxy:
+                            self.log(f"❌ Không đồng bộ được proxy GoLogin cho {profile_name}: {proxy_msg}", "red")
+                            self._delete_gologin_cloud_profile(profile_id)
+                            continue
+                        data["gologin_proxy_synced"] = proxy_msg
+                        self.log(f"✅ Đã đồng bộ proxy GoLogin: {proxy_msg}", "#00ff00")
                 else:
                     self.log(f"❌ Không tạo được GoLogin profile thật cho {profile_name}: {cloud_result}", "red")
                     self.log("Dừng quá trình nhập vì tool chỉ cho phép profile GoLogin thật.", "red")
@@ -2456,84 +3255,166 @@ class SSMAToolGUI(QMainWindow):
             QMessageBox.information(self, "Hoàn tất", f"Đã thêm thành công {success_count} / {len(profiles)} hồ sơ.")
 
     def open_add_profile_dialog(self):
-        """Mở popup thêm hồ sơ mới → Tự động tạo profile AdsPower → Lưu vào bảng"""
+        """Open add-profile dialog and create either GoLogin or Local Chrome profile."""
         dialog = AddProfileDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            data = dialog.get_data()
-            
-            profile_name = data.get("ten_ho_so", "Unnamed")
-            if not profile_name.strip():
-                QMessageBox.warning(self, "Cảnh báo", "Bác chưa nhập tên hồ sơ!")
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        data = ensure_profile_backend_defaults(dialog.get_data())
+        backend = normalize_browser_backend(data.get("browser_backend"))
+        profile_name = data.get("ten_ho_so", "Unnamed")
+        if not profile_name.strip():
+            QMessageBox.warning(self, "Canh bao", "Bac chua nhap ten ho so!")
+            return
+
+        existing_names = self._get_existing_profile_names()
+        if profile_name.strip() in existing_names:
+            QMessageBox.warning(
+                self,
+                "Trung ten ho so",
+                f"Ten ho so '{profile_name}' da ton tai!\n"
+                "Vui long dat ten khac de tranh xung dot khi chay automation.",
+            )
+            return
+
+        current_proj = self.proj_combo.currentText()
+        data["project"] = "" if current_proj == "Tong tai khoan" else current_proj
+
+        proxy_str = (data.get("proxy", "") or "").strip()
+        proxy_type = "socks5" if dialog.radio_socks5.isChecked() else "http"
+        data["proxy"] = proxy_str
+
+        if proxy_str:
+            self.log(f"Dang check Proxy: {proxy_str} ...")
+            QApplication.processEvents()
+            is_live, msg = check_proxy_live(proxy_str, proxy_type)
+            if not is_live:
+                QMessageBox.critical(self, "Proxy chet", f"Proxy nay khong dung duoc.\nChi tiet: {msg}")
                 return
-            
-            # Kiểm tra trùng tên hồ sơ
-            existing_names = self._get_existing_profile_names()
-            if profile_name.strip() in existing_names:
-                QMessageBox.warning(
-                    self, "Trùng tên hồ sơ",
-                    f"Tên hồ sơ \"{profile_name}\" đã tồn tại!\n"
-                    f"Vui lòng đặt tên khác để tránh xung đột khi chạy automation."
-                )
+            proxy_type = detect_proxy_type_from_check_message(proxy_type, msg)
+            data["proxy_type"] = proxy_type
+
+        if backend == LOCAL_CHROME_BACKEND:
+            if not (data.get("browser_id") or "").startswith("local_chrome:"):
+                data["browser_id"] = make_local_chrome_browser_id(profile_name)
+            data["gologin_profile_id"] = ""
+            data["browser_backend"] = LOCAL_CHROME_BACKEND
+            try:
+                from app_paths import local_chrome_profile_dir
+                local_chrome_profile_dir(data["browser_id"])
+            except Exception as exc:
+                QMessageBox.critical(self, "Local Chrome", f"Khong tao duoc thu muc profile Local Chrome:\n{exc}")
                 return
-            
-            # Assign to current project
-            current_proj = self.proj_combo.currentText()
-            data["project"] = "" if current_proj == "Tổng tài khoản" else current_proj
-            
-            proxy_str = data.get("proxy", "")
-            proxy_type = "socks5" if dialog.radio_socks5.isChecked() else "http"
-            
-            # 2. KIỂM TRA PROXY TRƯỚC KHI TẠO
-            if proxy_str:
-                self.log(f"Đang check Proxy: {proxy_str} ...")
-                QApplication.processEvents() # Cập nhật UI
-                is_live, msg = check_proxy_live(proxy_str, proxy_type)
-                
-                if not is_live:
-                    QMessageBox.critical(self, "Proxy Chết", f"Proxy này không dùng được bác ơi!\nChi tiết: {msg}")
-                    return # Dừng luôn, không cho tạo
-                proxy_type = detect_proxy_type_from_check_message(proxy_type, msg)
-                data["proxy_type"] = proxy_type
-            
-            success_cloud, cloud_result = self._create_gologin_cloud_profile(profile_name)
-            if success_cloud:
-                profile_id = cloud_result
-                data["browser_id"] = profile_id
-                data["gologin_profile_id"] = profile_id
-                self.log(f"✅ Đã tạo GoLogin cloud profile: {profile_id}", "#00ff00")
-                QMessageBox.information(self, "Thành công", f"Đã tạo GoLogin profile!\nID: {profile_id}")
-            else:
-                self.log(f"❌ Không tạo được GoLogin profile thật: {cloud_result}", "red")
-                short_reason = self._explain_gologin_error(cloud_result)
+            self.log(f"Da tao Local Chrome profile: {data['browser_id']}", "#00ff00")
+            QMessageBox.information(self, "Thanh cong", f"Da tao Local Chrome profile!\nID: {data['browser_id']}")
+            self.add_profile_to_table(data)
+            return
+
+        if backend == STEALTH_FIREFOX_BACKEND:
+            if not (data.get("browser_id") or "").startswith("stealth_firefox:"):
+                data["browser_id"] = make_stealth_firefox_browser_id(profile_name)
+            data["gologin_profile_id"] = ""
+            data["browser_backend"] = STEALTH_FIREFOX_BACKEND
+            try:
+                stealth_firefox_profile_dir(data["browser_id"])
+            except Exception as exc:
+                QMessageBox.critical(self, "Stealth Firefox", f"Khong tao duoc thu muc profile Stealth Firefox:\n{exc}")
+                return
+            self.log(f"Da tao Stealth Firefox profile: {data['browser_id']}", "#00ff00")
+            QMessageBox.information(self, "Thanh cong", f"Da tao Stealth Firefox profile!\nID: {data['browser_id']}")
+            self.add_profile_to_table(data)
+            return
+
+        data["browser_backend"] = GOLOGIN_BACKEND
+        success_cloud, cloud_result = self._create_gologin_cloud_profile(profile_name)
+        if not success_cloud:
+            self.log(f"Khong tao duoc GoLogin profile that: {cloud_result}", "red")
+            short_reason = self._explain_gologin_error(cloud_result)
+            QMessageBox.critical(
+                self,
+                "Loi tao profile",
+                f"Khong tao duoc GoLogin profile that.\n"
+                f"Ly do: {short_reason}\n\n"
+                f"Chi tiet ky thuat:\n{cloud_result}\n\n"
+                "Neu muon khong dung API, hay chon loai trinh duyet Local Chrome.",
+            )
+            return
+
+        profile_id = cloud_result
+        data["browser_id"] = profile_id
+        data["gologin_profile_id"] = profile_id
+        self.log(f"Da tao GoLogin cloud profile: {profile_id}", "#00ff00")
+        if proxy_str:
+            ok_proxy, proxy_msg = self._sync_gologin_profile_proxy_setting(
+                profile_id,
+                proxy_str,
+                data.get("proxy_type", proxy_type),
+            )
+            if not ok_proxy:
+                self._delete_gologin_cloud_profile(profile_id)
                 QMessageBox.critical(
                     self,
-                    "Lỗi tạo profile",
-                    f"Không tạo được GoLogin profile thật.\n"
-                    f"Lý do: {short_reason}\n\n"
-                    f"Chi tiết kỹ thuật:\n{cloud_result}\n\n"
-                    "Tool hiện không còn tạo profile local/offline."
+                    "Loi dong bo proxy",
+                    f"Da tao GoLogin profile nhung khong dong bo duoc proxy.\n\n"
+                    f"Chi tiet:\n{proxy_msg}\n\n"
+                    "Tool da rollback profile vua tao de tranh luu sai proxy.",
                 )
                 return
-
-            self.add_profile_to_table(data)
+            data["gologin_proxy_synced"] = proxy_msg
+            self.log(f"Da dong bo proxy GoLogin: {proxy_msg}", "#00ff00")
+        QMessageBox.information(self, "Thanh cong", f"Da tao GoLogin profile!\nID: {profile_id}")
+        self.add_profile_to_table(data)
 
     def handle_edit_profile(self, index):
         """Mở popup sửa hồ sơ đã có khi double click"""
         row = index.row()
         name_item = self.acc_table.item(row, 1)
         if not name_item: return
+        if index.column() == getattr(self, "region_col", -1):
+            return
         
-        existing_data = name_item.data(Qt.UserRole) or {}
+        existing_data = ensure_profile_backend_defaults(dict(name_item.data(Qt.UserRole) or {}))
+        table_proxy_item = self.acc_table.item(row, 3)
+        table_browser_item = self.acc_table.item(row, 4)
+        table_proxy = (table_proxy_item.text() if table_proxy_item else "").strip()
+        table_browser_id = (table_browser_item.text() if table_browser_item else "").strip()
+        if table_proxy and not (existing_data.get("proxy") or "").strip():
+            existing_data["proxy"] = table_proxy
+        if table_browser_id and not (existing_data.get("browser_id") or "").strip():
+            existing_data["browser_id"] = table_browser_id
+        if table_browser_id and not (existing_data.get("gologin_profile_id") or "").strip():
+            existing_data["gologin_profile_id"] = table_browser_id
         
         # Mở dialog ở chế độ Edit
         dialog = AddProfileDialog(self, existing_data=existing_data)
         if dialog.exec_() == QDialog.Accepted:
-            new_data = dialog.get_data()
+            new_data = ensure_profile_backend_defaults(dialog.get_data())
+            backend = normalize_browser_backend(new_data.get("browser_backend"))
             
             proxy_str = new_data.get("proxy", "")
             proxy_type = "socks5" if dialog.radio_socks5.isChecked() else "http"
             browser_id = new_data.get("browser_id", "")
             profile_name = new_data.get("ten_ho_so", "Unnamed")
+            old_proxy_candidates = [
+                existing_data.get("proxy"),
+                table_proxy,
+            ]
+            old_proxy_str = next(
+                (str(value or "").strip() for value in old_proxy_candidates if str(value or "").strip()),
+                "",
+            )
+            old_proxy_type = existing_data.get("proxy_type") or "http"
+            old_proxy_synced = (existing_data.get("gologin_proxy_synced") or "").strip()
+            proxy_str = (proxy_str or "").strip()
+            new_data["proxy"] = proxy_str
+            proxy_changed = (
+                old_proxy_str != proxy_str
+                or (
+                    bool(proxy_str)
+                    and normalize_proxy_type(old_proxy_type) != normalize_proxy_type(proxy_type)
+                )
+            )
+            proxy_clear_needed = not proxy_str and bool(old_proxy_str or old_proxy_synced)
             
             # Kiểm tra trùng tên hồ sơ (bỏ qua chính hàng đang sửa)
             if not profile_name.strip():
@@ -2548,8 +3429,27 @@ class SSMAToolGUI(QMainWindow):
                 )
                 return
             
-            # Luôn check proxy nếu có nhập proxy (bất kể thay đổi hay không)
-            if proxy_str:
+            profile_id = self._resolve_profile_id_from_data(new_data, existing_data, browser_id)
+            if backend == LOCAL_CHROME_BACKEND:
+                new_data["gologin_profile_id"] = ""
+                if not (new_data.get("browser_id") or "").startswith("local_chrome:"):
+                    new_data["browser_id"] = make_local_chrome_browser_id(profile_name)
+                profile_id = ""
+            elif backend == STEALTH_FIREFOX_BACKEND:
+                new_data["gologin_profile_id"] = ""
+                if not (new_data.get("browser_id") or "").startswith("stealth_firefox:"):
+                    new_data["browser_id"] = make_stealth_firefox_browser_id(profile_name)
+                profile_id = ""
+
+            if backend == GOLOGIN_BACKEND and (proxy_changed or proxy_clear_needed) and not profile_id:
+                QMessageBox.critical(
+                    self,
+                    "Thiếu GoLogin Profile ID",
+                    "Không thể đồng bộ thay đổi proxy vì hồ sơ chưa có GoLogin Profile ID thật.",
+                )
+                return
+
+            if backend == GOLOGIN_BACKEND and proxy_changed and proxy_str:
                 self.log(f"Đang check Proxy: {proxy_str} ...")
                 QApplication.processEvents()
                 is_live, msg = check_proxy_live(proxy_str, proxy_type)
@@ -2560,9 +3460,34 @@ class SSMAToolGUI(QMainWindow):
                     proxy_type = detect_proxy_type_from_check_message(proxy_type, msg)
                     new_data["proxy_type"] = proxy_type
                     self.log(f"✅ Proxy sống! IP thật: {msg}", "#00ff00")
-                    
-            # Không cần đồng bộ AdsPower nữa vì đã dùng Gologin Offline
-            self.log("Đã lưu cấu hình proxy Offline.", "#00ff00")
+                ok_proxy, proxy_msg = self._sync_gologin_profile_proxy_setting(profile_id, proxy_str, proxy_type)
+                if not ok_proxy:
+                    QMessageBox.critical(
+                        self,
+                        "Lỗi đồng bộ proxy GoLogin",
+                        f"Proxy đã sống nhưng không lưu được vào GoLogin.\n\nChi tiết:\n{proxy_msg}",
+                    )
+                    return
+                new_data["gologin_proxy_synced"] = proxy_msg
+                self.log(f"✅ Đã đồng bộ proxy GoLogin: {proxy_msg}", "#00ff00")
+            elif backend == GOLOGIN_BACKEND and (proxy_changed or proxy_clear_needed) and not proxy_str:
+                ok_proxy, proxy_msg = self._sync_gologin_profile_proxy_setting(profile_id, "", proxy_type)
+                if not ok_proxy:
+                    QMessageBox.critical(
+                        self,
+                        "Lỗi xóa proxy GoLogin",
+                        f"Không xóa được proxy trong GoLogin profile.\n\nChi tiết:\n{proxy_msg}",
+                    )
+                    return
+                new_data["proxy"] = ""
+                new_data["proxy_type"] = ""
+                new_data["gologin_proxy_synced"] = ""
+                self.log("✅ Đã xóa proxy trong GoLogin profile.", "#00ff00")
+
+            region_save = normalize_region(
+                new_data.get(REGION_PROFILE_KEY) or existing_data.get(REGION_PROFILE_KEY, "")
+            )
+            new_data[REGION_PROFILE_KEY] = region_save
 
             # Cập nhật lại dữ liệu
             name_item.setData(Qt.UserRole, new_data)
@@ -2575,6 +3500,7 @@ class SSMAToolGUI(QMainWindow):
             self.acc_table.setItem(row, 13, QTableWidgetItem(new_data.get("cookie", "")))
             self.acc_table.setItem(row, 20, QTableWidgetItem(new_data.get("note", "")))
             self.acc_table.setItem(row, 0, QTableWidgetItem("Co" if new_data.get("avatar_path") else ""))
+            self._set_region_item(row, region_save)
             
             self.log(f"Đã cập nhật hồ sơ hàng {row+1}")
             self.save_accounts_to_db()
@@ -2597,6 +3523,7 @@ class SSMAToolGUI(QMainWindow):
         self.acc_table.setItem(row, 12, QTableWidgetItem("Chưa check")) # Tình trạng
         self.acc_table.setItem(row, 13, QTableWidgetItem(data.get("cookie", ""))) # Cookie
         self.acc_table.setItem(row, 20, QTableWidgetItem(data.get("note", ""))) # Note
+        self._set_region_item(row, data.get(REGION_PROFILE_KEY, ""))
         self.acc_table.setItem(row, 25, QTableWidgetItem(str(row + 1))) # STT
         
         self.log(f"Đã thêm hồ sơ: {data.get('ten_ho_so', 'Unnamed')}")
@@ -3303,7 +4230,7 @@ class SSMAToolGUI(QMainWindow):
         self.handle_recycle_profile()
 
     def handle_clear_cache(self):
-        """6. Xóa toàn bộ Cache & Cookie"""
+        """Xóa cookie backup trong tool, không xóa state thật của GoLogin."""
         selected_rows = self.acc_table.selectionModel().selectedRows()
         if not selected_rows: return
         for index in selected_rows:
@@ -3314,7 +4241,7 @@ class SSMAToolGUI(QMainWindow):
                 data = name_item.data(Qt.UserRole) or {}
                 data['cookie'] = ""
                 name_item.setData(Qt.UserRole, data)
-            self.log(f"Đã làm sạch môi trường (Xóa Cache/Cookie) cho hàng {row+1}.", "yellow")
+            self.log(f"Đã xóa cookie backup trong tool cho hàng {row+1}.", "yellow")
         self.save_accounts_to_db()
 
     # --- CÁC HÀM ASYNC CHẠY PLAYWRIGHT ---
@@ -3991,7 +4918,7 @@ class SSMAToolGUI(QMainWindow):
         
         browser_feat.addAction("🍪 5. Gắn cookie TikTok cho các tài khoản này")
         
-        action_clear = browser_feat.addAction("🧹 6. Xóa toàn bộ Cache & Cookies")
+        action_clear = browser_feat.addAction("🧹 6. Xóa cookie backup trong tool")
         action_clear.triggered.connect(self.handle_clear_cache)
 
         menu.addAction("📂 Chuyển sang dự án...").triggered.connect(self.assign_to_project)
@@ -4025,11 +4952,140 @@ class SSMAToolGUI(QMainWindow):
         menu.addAction("📥 Tải vào hàng chờ")
         menu.addAction("🌱 Mang các account đã chọn đi SEEDING...")
         menu.addSeparator()
-        
-        action_delete = menu.addAction("🗑️ Xóa các account đã chọn")
-        action_delete.triggered.connect(self.delete_selected_accounts)
 
         menu.exec_(self.acc_table.viewport().mapToGlobal(pos))
+
+    def _selected_account_rows(self):
+        selected = self.acc_table.selectionModel().selectedRows()
+        return sorted({index.row() for index in selected if index.isValid()}, reverse=True)
+
+    def _collect_local_chrome_delete_dirs(self, browser_id, profile_name=""):
+        dirs = []
+        seen = set()
+
+        def add_candidate(path):
+            try:
+                candidate = Path(path).resolve()
+            except Exception:
+                candidate = Path(path)
+            key = str(candidate).lower()
+            if key in seen:
+                return
+            seen.add(key)
+            dirs.append(candidate)
+
+        browser_id = str(browser_id or "").strip()
+        profile_name = str(profile_name or "").strip()
+        if browser_id:
+            add_candidate(local_chrome_profiles_root() / local_chrome_storage_key(browser_id))
+        if profile_name:
+            legacy_dir = named_browser_profile_dir(profile_name)
+            if legacy_dir.exists():
+                add_candidate(legacy_dir)
+        return dirs
+
+    def _collect_stealth_firefox_delete_dirs(self, browser_id):
+        dirs = []
+        browser_id = str(browser_id or "").strip()
+        if not browser_id:
+            return dirs
+        try:
+            dirs.append(stealth_firefox_profiles_root() / browser_id.split(":", 1)[-1])
+        except Exception:
+            pass
+        try:
+            dirs.append(stealth_firefox_profile_dir(browser_id))
+        except Exception:
+            pass
+        dedup = []
+        seen = set()
+        for path in dirs:
+            try:
+                key = str(Path(path).resolve()).lower()
+            except Exception:
+                key = str(path).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(Path(path))
+        return dedup
+
+    def _snapshot_selected_accounts_for_delete(self):
+        snapshots = []
+        for row in self._selected_account_rows():
+            name_item = self.acc_table.item(row, 1)
+            pdata = dict(name_item.data(Qt.UserRole) or {}) if name_item else {}
+            id_item = self.acc_table.item(row, 4)
+            table_browser_id = id_item.text().strip() if id_item else ""
+            profile_name = (
+                name_item.text().strip()
+                if name_item and name_item.text().strip()
+                else str(pdata.get("ten_ho_so") or f"Row {row + 1}")
+            )
+            browser_id = (
+                str(pdata.get("browser_id") or "").strip()
+                or table_browser_id
+            )
+            backend = normalize_browser_backend(pdata.get("browser_backend"))
+            if backend != LOCAL_CHROME_BACKEND and browser_id.startswith("local_chrome:"):
+                backend = LOCAL_CHROME_BACKEND
+            if backend != STEALTH_FIREFOX_BACKEND and browser_id.startswith("stealth_firefox:"):
+                backend = STEALTH_FIREFOX_BACKEND
+            gologin_profile_id = first_real_gologin_profile_id(
+                pdata.get("gologin_profile_id"),
+                pdata.get("browser_id"),
+                table_browser_id,
+            )
+            snapshots.append({
+                "row": row,
+                "profile_name": profile_name,
+                "browser_backend": backend,
+                "browser_id": browser_id,
+                "gologin_profile_id": gologin_profile_id,
+                "local_dirs": self._collect_local_chrome_delete_dirs(browser_id, profile_name)
+                if backend == LOCAL_CHROME_BACKEND else [],
+                "stealth_dirs": self._collect_stealth_firefox_delete_dirs(browser_id)
+                if backend == STEALTH_FIREFOX_BACKEND else [],
+                "gologin_cache_dir": (gologin_profiles_root() / f"profile_{gologin_profile_id}") if gologin_profile_id else None,
+            })
+        return snapshots
+
+    def _delete_browser_data_dir(self, profile_name, path, seen_targets, counters, label):
+        if not path:
+            counters["missing"] += 1
+            return "missing"
+        try:
+            target = Path(path).resolve()
+        except Exception:
+            target = Path(path)
+        target_key = str(target).lower()
+        if target_key in seen_targets:
+            return "duplicate"
+        seen_targets.add(target_key)
+        if not target.exists() or not target.is_dir():
+            counters["missing"] += 1
+            self.log(f"[{profile_name}] Khong tim thay {label}: {target}", "gray")
+            return "missing"
+
+        try:
+            from browser_manager import BrowserManager
+            BrowserManager().close_browser(target.name, str(target))
+        except Exception:
+            pass
+
+        try:
+            shutil.rmtree(str(target))
+            counters["deleted"] += 1
+            self.log(f"[{profile_name}] Da xoa {label}: {target}", "#ff9800")
+            return "deleted"
+        except PermissionError as e:
+            counters["failed"] += 1
+            self.log(f"[{profile_name}] Khong xoa duoc {label} vi browser con mo: {e}", "yellow")
+            return "failed"
+        except Exception as e:
+            counters["failed"] += 1
+            self.log(f"[{profile_name}] Khong xoa duoc {label} {target}: {e}", "yellow")
+            return "failed"
 
     def handle_choose_avatar_for_selected(self):
         selected_rows = self.acc_table.selectionModel().selectedRows()
@@ -4070,7 +5126,7 @@ class SSMAToolGUI(QMainWindow):
             return
         accounts_data = self._collect_selected_accounts_data(selected_rows)
         project_name = self._current_project_name()
-        self.log(f"M? b?ng theo d?i v?i {selected_count} profile ?? ch?n.", "#00ff00")
+        self.log(f"Mở bảng theo dõi với {selected_count} profile đã chọn.", "#00ff00")
         self._show_automation_dashboard(
             accounts_data,
             project_name=project_name,
@@ -4232,71 +5288,139 @@ class SSMAToolGUI(QMainWindow):
                     self.log(f"[{profile_name}] ⚠️ Lỗi mạng: {str(e)[:40]}", "orange")
 
     def delete_selected_accounts(self):
-        selected = self.acc_table.selectionModel().selectedRows()
-        if not selected:
+        snapshots = self._snapshot_selected_accounts_for_delete()
+        if not snapshots:
+            QMessageBox.information(self, "Xoa profile", "Vui long chon it nhat 1 profile de xoa.")
             return
-        
-        count = len(selected)
-        reply = QMessageBox.question(
-            self, "Xác nhận xóa",
-            f"Bạn có chắc muốn xóa {count} tài khoản?\n\n"
-            f"⚠️ Thư mục trình duyệt (profile) trên ổ đĩa và GoLogin cloud profile cũng sẽ bị xóa!",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+
+        count = len(snapshots)
+        reply = QMessageBox.warning(
+            self,
+            "Xac nhan xoa profile",
+            f"Ban co chac muon xoa {count} profile da chon?\n\n"
+            "Hanh dong nay se xoa dong profile khoi tool va xoa du lieu trinh duyet tuong ung:\n"
+            "- Local Chrome: xoa thu muc profile local da gan voi account\n"
+            "- Stealth Firefox: xoa thu muc profile Firefox persistent cua account\n"
+            "- GoLogin: xoa GoLogin cloud profile va thu muc cache local neu co\n\n"
+            "Ban khong the hoan tac neu du lieu trinh duyet da bi xoa.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
-        
-        import shutil
+
         deleted_folders = 0
         deleted_gologin = 0
-        for index in reversed(selected):
-            row = index.row()
-            # Lấy browser_id từ cột 4 hoặc UserRole
-            name_item = self.acc_table.item(row, 1)
-            pdata = name_item.data(Qt.UserRole) if name_item else {}
-            if not isinstance(pdata, dict):
-                pdata = {}
-            id_item = self.acc_table.item(row, 4)
-            browser_id = id_item.text().strip() if id_item else ""
-            if not browser_id:
-                browser_id = pdata.get("browser_id", "")
+        failed_folders = 0
+        missing_folders = 0
+        removed_rows = 0
+        seen_targets = set()
+        gologin_delete_results = {}
+        rows_to_remove = []
+        kept_profiles = []
 
-            gologin_profile_id = (
-                pdata.get("gologin_profile_id")
-                or pdata.get("browser_id")
-                or browser_id
-                or ""
-            ).strip()
-            if gologin_profile_id:
-                ok, msg = self._delete_gologin_cloud_profile(gologin_profile_id)
-                if ok:
-                    deleted_gologin += 1
-                    self.log(f"🗑️ Đã xóa GoLogin profile: {gologin_profile_id}", "#ff9800")
+        for snap in snapshots:
+            row = int(snap.get("row", -1))
+            profile_name = snap.get("profile_name") or f"Row {row + 1}"
+            backend = snap.get("browser_backend")
+            browser_id = str(snap.get("browser_id") or "").strip()
+            can_remove_row = True
+
+            if backend == LOCAL_CHROME_BACKEND:
+                if browser_id:
+                    local_results = {"deleted": 0, "failed": 0, "missing": 0}
+                    for profile_dir in snap.get("local_dirs") or []:
+                        outcome = self._delete_browser_data_dir(
+                            profile_name,
+                            profile_dir,
+                            seen_targets,
+                            local_results,
+                            "Local Chrome data",
+                        )
+                        if outcome == "failed":
+                            can_remove_row = False
+                    deleted_folders += local_results["deleted"]
+                    failed_folders += local_results["failed"]
+                    missing_folders += local_results["missing"]
                 else:
-                    self.log(f"⚠️ Không xóa được GoLogin profile {gologin_profile_id}: {msg}", "yellow")
-            
-            # Xóa thư mục profile trên ổ đĩa
-            if browser_id:
-                # Tìm folder profile_<browser_id>
-                profile_dir = str(gologin_profiles_root() / f"profile_{browser_id}")
-                if os.path.isdir(profile_dir):
-                    try:
-                        shutil.rmtree(profile_dir, ignore_errors=True)
-                        deleted_folders += 1
-                        self.log(f"🗑️ Đã xóa thư mục: {os.path.basename(profile_dir)}", "#ff9800")
-                    except Exception as e:
-                        self.log(f"⚠️ Không xóa được thư mục {profile_dir}: {e}", "yellow")
+                    self.log(f"[{profile_name}] Local Chrome khong co browser_id nen khong xac dinh duoc thu muc data.", "yellow")
+                    can_remove_row = False
+            elif backend == STEALTH_FIREFOX_BACKEND:
+                if browser_id:
+                    stealth_results = {"deleted": 0, "failed": 0, "missing": 0}
+                    for profile_dir in snap.get("stealth_dirs") or []:
+                        outcome = self._delete_browser_data_dir(
+                            profile_name,
+                            profile_dir,
+                            seen_targets,
+                            stealth_results,
+                            "Stealth Firefox data",
+                        )
+                        if outcome == "failed":
+                            can_remove_row = False
+                    deleted_folders += stealth_results["deleted"]
+                    failed_folders += stealth_results["failed"]
+                    missing_folders += stealth_results["missing"]
                 else:
-                    self.log(f"📂 Không tìm thấy thư mục profile: {profile_dir}", "gray")
-            
-            self.acc_table.removeRow(row)
-        
-        self.log(f"✅ Đã xóa {count} tài khoản, {deleted_gologin} GoLogin profile, {deleted_folders} thư mục trình duyệt.")
+                    self.log(f"[{profile_name}] Stealth Firefox khong co browser_id nen khong xac dinh duoc thu muc data.", "yellow")
+                    can_remove_row = False
+            else:
+                gologin_profile_id = str(snap.get("gologin_profile_id") or "").strip()
+                if gologin_profile_id:
+                    if gologin_profile_id not in gologin_delete_results:
+                        ok, msg = self._delete_gologin_cloud_profile(gologin_profile_id)
+                        gologin_delete_results[gologin_profile_id] = (bool(ok), str(msg or ""))
+                        if ok:
+                            deleted_gologin += 1
+                            self.log(f"[{profile_name}] Da xoa GoLogin profile: {gologin_profile_id}", "#ff9800")
+                        else:
+                            self.log(f"[{profile_name}] Khong xoa duoc GoLogin profile {gologin_profile_id}: {msg}", "yellow")
+                    ok, _msg = gologin_delete_results.get(gologin_profile_id, (False, ""))
+                    if not ok:
+                        can_remove_row = False
+
+                    cache_results = {"deleted": 0, "failed": 0, "missing": 0}
+                    cache_outcome = self._delete_browser_data_dir(
+                        profile_name,
+                        snap.get("gologin_cache_dir"),
+                        seen_targets,
+                        cache_results,
+                        "cache GoLogin local",
+                    )
+                    if cache_outcome == "failed":
+                        can_remove_row = False
+                    deleted_folders += cache_results["deleted"]
+                    failed_folders += cache_results["failed"]
+                    missing_folders += cache_results["missing"]
+                else:
+                    self.log(f"[{profile_name}] GoLogin profile khong co GoLogin Profile ID that.", "yellow")
+                    can_remove_row = False
+
+            if can_remove_row:
+                rows_to_remove.append(row)
+            else:
+                kept_profiles.append((row, profile_name))
+
+        for row in sorted({r for r in rows_to_remove if r >= 0}, reverse=True):
+            if 0 <= row < self.acc_table.rowCount():
+                self.acc_table.removeRow(row)
+                removed_rows += 1
+
+        self.log(
+            f"Da xoa {removed_rows} profile khoi tool, {deleted_gologin} GoLogin cloud profile, "
+            f"{deleted_folders} thu muc trinh duyet, {failed_folders} thu muc loi, {missing_folders} thu muc khong ton tai."
+        )
+        if kept_profiles:
+            sample = "\n".join(f"- {name}" for _row, name in kept_profiles[:10])
+            more = "" if len(kept_profiles) <= 10 else f"\n... va {len(kept_profiles) - 10} profile khac"
+            QMessageBox.warning(
+                self,
+                "Xoa profile chua hoan tat",
+                "Mot so profile duoc giu lai trong tool vi xoa du lieu that chua xong:\n\n"
+                f"{sample}{more}\n\n"
+                "Dong het browser lien quan roi xoa lai de tranh con sot du lieu.",
+            )
         self.save_accounts_to_db()
-
-
-
-
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -4513,6 +5637,8 @@ class SSMAToolGUI(QMainWindow):
         """)
 
 if __name__ == "__main__":
+    _install_crash_handlers()
+
     # ── Fix DPI Scaling: ép Windows nhận diện High DPI ──
     # Tránh Windows tự scale → Chrome nhúng bị lệch viền
     try:

@@ -2,18 +2,20 @@ import os
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QProgressBar,
-    QTextEdit, QGroupBox, QSlider, QCheckBox, QComboBox, QFileDialog,
+    QTextEdit, QPlainTextEdit, QGroupBox, QSlider, QCheckBox, QComboBox, QFileDialog,
     QGridLayout, QScrollArea, QFrame, QSizePolicy, QSpinBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPoint, QRect
 from PyQt6.QtGui import QPixmap, QCursor
 
 
 
 class DraggablePreviewLabel(QLabel):
     """Preview label that emits normalized (0-1) drag coords for logo/text positioning."""
+    resized = pyqtSignal()
     logo_dragged = pyqtSignal(float, float)      # nx, ny in video frame space
     text_dragged = pyqtSignal(float, float)      # nx, ny in video frame space
+    text2_dragged = pyqtSignal(float, float)     # nx, ny in video frame space
     subtitle_dragged = pyqtSignal(float, float)  # nx, ny in video frame space
 
     def __init__(self, parent=None):
@@ -23,30 +25,91 @@ class DraggablePreviewLabel(QLabel):
         self._pixmap_rect = None   # QRect of the actual image inside label
         self._logo_enabled = False
         self._text_enabled = False
+        self._text2_enabled = False
         self._subtitle_enabled = False
+        self._active_drag_target = None
+        self._overlay_frame_size = None
+        self._overlay_rects = {
+            'logo': None,
+            'text': None,
+            'text2': None,
+            'subtitle': None,
+        }
+        self._drag_offset_norm = (0.0, 0.0)
 
-    def set_enabled_overlays(self, logo: bool, text: bool, subtitle: bool = False):
+    def set_enabled_overlays(self, logo: bool, text: bool, subtitle: bool = False, text2: bool = False):
         self._logo_enabled = logo
         self._text_enabled = text
+        self._text2_enabled = text2
         self._subtitle_enabled = subtitle
+        if self._active_drag_target and not self._is_target_enabled(self._active_drag_target):
+            self._active_drag_target = None
+
+    def set_active_drag_target(self, target):
+        if target not in ('logo', 'text', 'text2', 'subtitle', None):
+            target = None
+        if target and not self._is_target_enabled(target):
+            target = None
+        self._active_drag_target = target
+
+    def set_overlay_bounds(self, frame_w, frame_h, logo_rect=None, text_rect=None, subtitle_rect=None, text2_rect=None):
+        if frame_w and frame_h:
+            self._overlay_frame_size = (int(frame_w), int(frame_h))
+        else:
+            self._overlay_frame_size = None
+        self._overlay_rects = {
+            'logo': self._normalize_rect(logo_rect),
+            'text': self._normalize_rect(text_rect),
+            'text2': self._normalize_rect(text2_rect),
+            'subtitle': self._normalize_rect(subtitle_rect),
+        }
+
+    def clear_overlay_bounds(self):
+        self._overlay_frame_size = None
+        self._overlay_rects = {
+            'logo': None,
+            'text': None,
+            'text2': None,
+            'subtitle': None,
+        }
+
+    def _normalize_rect(self, rect):
+        if not rect:
+            return None
+        x, y, w, h = rect
+        if w <= 0 or h <= 0:
+            return None
+        return QRect(int(x), int(y), int(w), int(h))
+
+    def _is_target_enabled(self, target):
+        if target == 'logo':
+            return self._logo_enabled
+        if target == 'text':
+            return self._text_enabled
+        if target == 'text2':
+            return self._text2_enabled
+        if target == 'subtitle':
+            return self._subtitle_enabled
+        return False
+
+    def _update_pixmap_rect(self):
+        pixmap = self.pixmap()
+        if pixmap and not pixmap.isNull():
+            pw, ph = pixmap.width(), pixmap.height()
+            ox = (self.width() - pw) // 2
+            oy = (self.height() - ph) // 2
+            self._pixmap_rect = QRect(ox, oy, pw, ph)
+        else:
+            self._pixmap_rect = None
 
     def setPixmap(self, pixmap):
         super().setPixmap(pixmap)
-        # Compute where inside the label the image actually lives (KeepAspectRatio)
-        if pixmap and not pixmap.isNull():
-            lw, lh = self.width(), self.height()
-            pw, ph = pixmap.width(), pixmap.height()
-            if pw == 0 or ph == 0:
-                self._pixmap_rect = None
-                return
-            scale = min(lw / pw, lh / ph)
-            img_w, img_h = int(pw * scale), int(ph * scale)
-            ox = (lw - img_w) // 2
-            oy = (lh - img_h) // 2
-            from PyQt6.QtCore import QRect
-            self._pixmap_rect = QRect(ox, oy, img_w, img_h)
-        else:
-            self._pixmap_rect = None
+        self._update_pixmap_rect()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._update_pixmap_rect()
+        self.resized.emit()
 
     def _to_norm(self, pos: QPoint):
         """Convert label-local mouse pos → normalized (0..1, 0..1) video coords."""
@@ -57,23 +120,78 @@ class DraggablePreviewLabel(QLabel):
         ny = (pos.y() - r.y()) / max(1, r.height())
         return max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))
 
+    def _frame_rect_to_label_rect(self, frame_rect):
+        if frame_rect is None or self._pixmap_rect is None or not self._overlay_frame_size:
+            return None
+        frame_w, frame_h = self._overlay_frame_size
+        if frame_w <= 0 or frame_h <= 0:
+            return None
+        r = self._pixmap_rect
+        x = r.x() + int(round(frame_rect.x() * r.width() / frame_w))
+        y = r.y() + int(round(frame_rect.y() * r.height() / frame_h))
+        w = max(1, int(round(frame_rect.width() * r.width() / frame_w)))
+        h = max(1, int(round(frame_rect.height() * r.height() / frame_h)))
+        return QRect(x, y, w, h)
+
+    def _get_target_frame_rect(self, target):
+        return self._overlay_rects.get(target)
+
+    def _clamp_drag_coords(self, target, nx, ny):
+        frame_rect = self._get_target_frame_rect(target)
+        if frame_rect is None or not self._overlay_frame_size:
+            return max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))
+
+        frame_w, frame_h = self._overlay_frame_size
+        if frame_w <= 0 or frame_h <= 0:
+            return max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))
+
+        half_w = min(0.5, frame_rect.width() / max(1.0, frame_w) / 2.0)
+        half_h = min(0.5, frame_rect.height() / max(1.0, frame_h) / 2.0)
+
+        min_x = half_w
+        max_x = 1.0 - half_w
+        min_y = half_h
+        max_y = 1.0 - half_h
+
+        if min_x > max_x:
+            nx = 0.5
+        else:
+            nx = max(min_x, min(max_x, nx))
+
+        if min_y > max_y:
+            ny = 0.5
+        else:
+            ny = max(min_y, min(max_y, ny))
+
+        return nx, ny
+
+    def _pick_drag_target(self, pos: QPoint):
+        for target in ('logo', 'subtitle', 'text2', 'text'):
+            if not self._is_target_enabled(target):
+                continue
+            rect = self._frame_rect_to_label_rect(self._overlay_rects.get(target))
+            if rect and rect.adjusted(-8, -8, 8, 8).contains(pos):
+                return target
+        if self._active_drag_target and self._is_target_enabled(self._active_drag_target):
+            return self._active_drag_target
+        enabled = [target for target in ('logo', 'text', 'text2', 'subtitle') if self._is_target_enabled(target)]
+        return enabled[0] if len(enabled) == 1 else None
+
     def mousePressEvent(self, ev):
         if ev.button() == Qt.MouseButton.LeftButton:
             coords = self._to_norm(ev.pos())
             if coords is None:
                 return
-            mods = ev.modifiers()
-            # If multiple are enabled, priority is Logo > Subtitle > Text
-            if self._logo_enabled and (mods & Qt.KeyboardModifier.AltModifier):
-                 self._drag_target = 'logo'
-            elif self._subtitle_enabled:
-                 self._drag_target = 'subtitle'
-            elif self._text_enabled:
-                 self._drag_target = 'text'
-            elif self._logo_enabled: # Fallback if no alt but logo is on
-                 self._drag_target = 'logo'
-                 
+            self._drag_target = self._pick_drag_target(ev.pos())
             if self._drag_target:
+                self._drag_offset_norm = (0.0, 0.0)
+                rect = self._frame_rect_to_label_rect(self._get_target_frame_rect(self._drag_target))
+                if rect and self._pixmap_rect is not None:
+                    center = rect.center()
+                    self._drag_offset_norm = (
+                        (ev.pos().x() - center.x()) / max(1, self._pixmap_rect.width()),
+                        (ev.pos().y() - center.y()) / max(1, self._pixmap_rect.height()),
+                    )
                 self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
         super().mousePressEvent(ev)
 
@@ -82,18 +200,27 @@ class DraggablePreviewLabel(QLabel):
             coords = self._to_norm(ev.pos())
             if coords:
                 nx, ny = coords
+                dx, dy = self._drag_offset_norm
+                nx -= dx
+                ny -= dy
+                nx, ny = self._clamp_drag_coords(self._drag_target, nx, ny)
                 if self._drag_target == 'logo':
                     self.logo_dragged.emit(nx, ny)
                 elif self._drag_target == 'subtitle':
                     self.subtitle_dragged.emit(nx, ny)
+                elif self._drag_target == 'text2':
+                    self.text2_dragged.emit(nx, ny)
                 else:
                     self.text_dragged.emit(nx, ny)
-        elif self._logo_enabled or self._text_enabled or self._subtitle_enabled:
+        elif self._pick_drag_target(ev.pos()):
+            self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        elif self._logo_enabled or self._text_enabled or self._text2_enabled or self._subtitle_enabled:
             self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
         self._drag_target = None
+        self._drag_offset_norm = (0.0, 0.0)
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         super().mouseReleaseEvent(ev)
 
@@ -184,6 +311,7 @@ class MainWindow(QMainWindow):
         self.lbl_preview = DraggablePreviewLabel("Select a video from queue to preview")
         self.lbl_preview.setObjectName("previewLabel")
         self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         # Drag mode hint label
         self.lbl_drag_hint = QLabel("Drag on preview to move overlay positions")
@@ -191,7 +319,7 @@ class MainWindow(QMainWindow):
         self.lbl_drag_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_drag_hint.setVisible(False)
         
-        preview_layout.addWidget(self.lbl_preview)
+        preview_layout.addWidget(self.lbl_preview, stretch=1)
         preview_layout.addWidget(self.lbl_drag_hint)
         
         # Playback Controls
@@ -549,6 +677,27 @@ class MainWindow(QMainWindow):
         grid_lay.addWidget(self.slider_blur, 2, 1)
         grid_lay.addWidget(self.val_blur, 2, 2)
 
+        # Optional image background for the empty fit areas
+        self.chk_use_bg_image = QCheckBox("Use Background Image")
+        self.chk_use_bg_image.setChecked(False)
+        grid_lay.addWidget(self.chk_use_bg_image, 3, 0)
+
+        bg_image_file_widget = QWidget()
+        bg_image_file_layout = QHBoxLayout(bg_image_file_widget)
+        bg_image_file_layout.setContentsMargins(0, 0, 0, 0)
+        self.txt_bg_image_path = QLineEdit()
+        self.txt_bg_image_path.setPlaceholderText("Select image for top/bottom background...")
+        self.btn_browse_bg_image = QPushButton("Browse")
+        self.btn_browse_bg_image.setObjectName("secondaryButton")
+        bg_image_file_layout.addWidget(self.txt_bg_image_path)
+        bg_image_file_layout.addWidget(self.btn_browse_bg_image)
+        grid_lay.addWidget(bg_image_file_widget, 3, 1, 1, 2)
+
+        grid_lay.addWidget(QLabel("BG Fit:"), 4, 0)
+        self.cmb_bg_image_fit = QComboBox()
+        self.cmb_bg_image_fit.addItems(["Cover", "Contain"])
+        grid_lay.addWidget(self.cmb_bg_image_fit, 4, 1)
+
         lay_layout.addLayout(grid_lay)
         scroll_layout.addWidget(group_layout)
 
@@ -560,8 +709,12 @@ class MainWindow(QMainWindow):
         self.chk_use_watermark.setChecked(False)
         wm_layout.addWidget(self.chk_use_watermark)
         
-        self.txt_watermark = QLineEdit()
-        self.txt_watermark.setPlaceholderText("Enter text to display at the bottom (Use \\n to break lines)...")
+        self.txt_watermark = QPlainTextEdit()
+        self.txt_watermark.setPlaceholderText("Line 1\nLine 2")
+        self.txt_watermark.setFixedHeight(58)
+        self.txt_watermark.setTabChangesFocus(True)
+        self.txt_watermark.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.txt_watermark.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         wm_layout.addWidget(QLabel("Text Content:"))
         wm_layout.addWidget(self.txt_watermark)
         
@@ -608,6 +761,61 @@ class MainWindow(QMainWindow):
         
         scroll_layout.addWidget(group_watermark)
 
+        # --- SECTION: TEXT OVERLAY 2 ---
+        group_text2 = QGroupBox("TEXT OVERLAY 2")
+        text2_layout = QVBoxLayout(group_text2)
+
+        self.chk_use_text2 = QCheckBox("Enable Text Overlay 2")
+        self.chk_use_text2.setChecked(False)
+        text2_layout.addWidget(self.chk_use_text2)
+
+        self.txt_text2 = QPlainTextEdit()
+        self.txt_text2.setPlaceholderText("Second text overlay")
+        self.txt_text2.setFixedHeight(58)
+        self.txt_text2.setTabChangesFocus(True)
+        self.txt_text2.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.txt_text2.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        text2_layout.addWidget(QLabel("Text Content:"))
+        text2_layout.addWidget(self.txt_text2)
+
+        text2_size_layout = QHBoxLayout()
+        text2_size_layout.addWidget(QLabel("Font Size:"))
+        self.val_text2_size = QLabel("8%")
+        self.slider_text2_size = QSlider(Qt.Orientation.Horizontal)
+        self.slider_text2_size.setRange(2, 20)
+        self.slider_text2_size.setValue(8)
+        self.slider_text2_size.valueChanged.connect(lambda v: self.val_text2_size.setText(f"{v}%"))
+        text2_size_layout.addWidget(self.slider_text2_size)
+        text2_size_layout.addWidget(self.val_text2_size)
+        text2_layout.addLayout(text2_size_layout)
+
+        text2_color_layout = QHBoxLayout()
+        text2_color_layout.addWidget(QLabel("Text Color:"))
+        self.btn_text2_color = QPushButton("#ffffff")
+        self.btn_text2_color.setObjectName("colorButton")
+        self.btn_text2_color.setStyleSheet("background-color: #ffffff; color: #000000; font-weight: bold;")
+        self.text2_color = "#ffffff"
+        text2_color_layout.addWidget(self.btn_text2_color)
+        text2_layout.addLayout(text2_color_layout)
+
+        self.lbl_text2_drag_pos = QLabel("Position: default (drag on preview to move)")
+        self.lbl_text2_drag_pos.setObjectName("helperText")
+        text2_layout.addWidget(self.lbl_text2_drag_pos)
+
+        text2_pos_y_layout = QHBoxLayout()
+        text2_pos_y_layout.addWidget(QLabel("Position (Y):"))
+        self.val_text2_pos_y = QLabel("20%")
+        self.val_text2_pos_y.setFixedWidth(40)
+        self.slider_text2_pos_y = QSlider(Qt.Orientation.Horizontal)
+        self.slider_text2_pos_y.setRange(0, 100)
+        self.slider_text2_pos_y.setValue(20)
+        self.slider_text2_pos_y.valueChanged.connect(lambda v: self.val_text2_pos_y.setText(f"{v}%"))
+        text2_pos_y_layout.addWidget(self.slider_text2_pos_y)
+        text2_pos_y_layout.addWidget(self.val_text2_pos_y)
+        text2_layout.addLayout(text2_pos_y_layout)
+
+        scroll_layout.addWidget(group_text2)
+
         # --- SECTION: IMAGE LOGO OVERLAY ---
         group_logo = QGroupBox("IMAGE LOGO OVERLAY")
         logo_layout = QVBoxLayout(group_logo)
@@ -633,7 +841,11 @@ class MainWindow(QMainWindow):
         self.cmb_logo_pos.addItems(["Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right", "Center", "Manual (Drag)"])
         logo_pos_layout.addWidget(self.cmb_logo_pos)
         logo_layout.addLayout(logo_pos_layout)
-        
+
+        self.lbl_logo_drag_pos = QLabel("Position: preset position")
+        self.lbl_logo_drag_pos.setObjectName("helperText")
+        logo_layout.addWidget(self.lbl_logo_drag_pos)
+
         # Logo Scale
         logo_scale_layout = QHBoxLayout()
         logo_scale_layout.addWidget(QLabel("Scale:"))
@@ -875,6 +1087,10 @@ class MainWindow(QMainWindow):
         self.chk_use_watermark.toggled.connect(self.slider_watermark_size.setEnabled)
         self.chk_use_watermark.toggled.connect(self.btn_watermark_color.setEnabled)
         self.chk_use_watermark.toggled.connect(self.slider_watermark_pos_y.setEnabled)
+        self.chk_use_text2.toggled.connect(self.txt_text2.setEnabled)
+        self.chk_use_text2.toggled.connect(self.slider_text2_size.setEnabled)
+        self.chk_use_text2.toggled.connect(self.btn_text2_color.setEnabled)
+        self.chk_use_text2.toggled.connect(self.slider_text2_pos_y.setEnabled)
         self.chk_use_subtitles.toggled.connect(self.txt_subtitle_path.setEnabled)
         self.chk_use_subtitles.toggled.connect(self.btn_browse_subtitle.setEnabled)
         self.chk_use_subtitles.toggled.connect(self.cmb_sub_font.setEnabled)
@@ -893,6 +1109,9 @@ class MainWindow(QMainWindow):
         self.chk_use_bg_music.toggled.connect(self.btn_browse_bg_music.setEnabled)
         self.chk_use_bg_music.toggled.connect(self.slider_bgm_volume.setEnabled)
         self.chk_use_bg_music.toggled.connect(self.slider_bgm_speed.setEnabled)
+        self.chk_use_bg_image.toggled.connect(self.txt_bg_image_path.setEnabled)
+        self.chk_use_bg_image.toggled.connect(self.btn_browse_bg_image.setEnabled)
+        self.chk_use_bg_image.toggled.connect(self.cmb_bg_image_fit.setEnabled)
         self.chk_use_pitch.toggled.connect(self.slider_pitch.setEnabled)
         self.chk_use_volume.toggled.connect(self.slider_volume.setEnabled)
         
@@ -910,6 +1129,10 @@ class MainWindow(QMainWindow):
         self.slider_watermark_size.setEnabled(self.chk_use_watermark.isChecked())
         self.btn_watermark_color.setEnabled(self.chk_use_watermark.isChecked())
         self.slider_watermark_pos_y.setEnabled(self.chk_use_watermark.isChecked())
+        self.txt_text2.setEnabled(self.chk_use_text2.isChecked())
+        self.slider_text2_size.setEnabled(self.chk_use_text2.isChecked())
+        self.btn_text2_color.setEnabled(self.chk_use_text2.isChecked())
+        self.slider_text2_pos_y.setEnabled(self.chk_use_text2.isChecked())
         self.txt_subtitle_path.setEnabled(self.chk_use_subtitles.isChecked())
         self.btn_browse_subtitle.setEnabled(self.chk_use_subtitles.isChecked())
         self.cmb_sub_font.setEnabled(self.chk_use_subtitles.isChecked())
@@ -926,31 +1149,30 @@ class MainWindow(QMainWindow):
         self.btn_browse_bg_music.setEnabled(self.chk_use_bg_music.isChecked())
         self.slider_bgm_volume.setEnabled(self.chk_use_bg_music.isChecked())
         self.slider_bgm_speed.setEnabled(self.chk_use_bg_music.isChecked())
+        self.txt_bg_image_path.setEnabled(self.chk_use_bg_image.isChecked())
+        self.btn_browse_bg_image.setEnabled(self.chk_use_bg_image.isChecked())
+        self.cmb_bg_image_fit.setEnabled(self.chk_use_bg_image.isChecked())
         self.slider_pitch.setEnabled(self.chk_use_pitch.isChecked())
         self.slider_volume.setEnabled(self.chk_use_volume.isChecked())
 
         # --- Aspect Ratio smart toggle ---
-        def _ratio_changed(index):
+        def _update_layout_mode_controls(*_args):
             """Enable/disable fitting controls based on selected ratio."""
-            not_orig = (index != 0)
-            self.cmb_fit_mode.setEnabled(not_orig)
-            # index 2 = "Fit with Blur"
-            self.slider_blur.setEnabled(not_orig and self.cmb_fit_mode.currentIndex() == 2)
-            self.val_blur.setEnabled(not_orig and self.cmb_fit_mode.currentIndex() == 2)
-
-        def _fit_changed(index):
             not_orig = (self.cmb_ratio.currentIndex() != 0)
-            # index 2 = "Fit with Blur"
-            self.slider_blur.setEnabled(not_orig and index == 2)
-            self.val_blur.setEnabled(not_orig and index == 2)
+            use_bg_image = self.chk_use_bg_image.isChecked()
+            self.cmb_fit_mode.setEnabled(not_orig)
+            self.slider_blur.setEnabled(not_orig and self.cmb_fit_mode.currentIndex() == 2 and not use_bg_image)
+            self.val_blur.setEnabled(not_orig and self.cmb_fit_mode.currentIndex() == 2 and not use_bg_image)
 
-        self.cmb_ratio.currentIndexChanged.connect(_ratio_changed)
-        self.cmb_fit_mode.currentIndexChanged.connect(_fit_changed)
+        self.cmb_ratio.currentIndexChanged.connect(_update_layout_mode_controls)
+        self.cmb_fit_mode.currentIndexChanged.connect(_update_layout_mode_controls)
+        self.chk_use_bg_image.toggled.connect(_update_layout_mode_controls)
 
         # Initial states for aspect ratio controls
         self.cmb_fit_mode.setEnabled(False)   # starts as "Original"
         self.slider_blur.setEnabled(False)
         self.val_blur.setEnabled(False)
+        _update_layout_mode_controls()
 
     def log_msg(self, msg):
         self.log_panel.append(msg)

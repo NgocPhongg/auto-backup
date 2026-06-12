@@ -3,7 +3,6 @@ from PyQt5.QtWidgets import (
     QHeaderView, QPushButton, QRadioButton, QLabel, QCheckBox, QMessageBox, QAbstractItemView
 )
 from PyQt5.QtCore import Qt
-import random
 
 class AccountSelectorDialog(QDialog):
     def __init__(self, parent=None, account_data=None, selected_video_indices=None):
@@ -62,23 +61,10 @@ class AccountSelectorDialog(QDialog):
         btn_deselect_all = QPushButton("Bỏ chọn tất cả")
         btn_deselect_all.setStyleSheet("background-color: white; color: black;")
         btn_deselect_all.clicked.connect(self.deselect_all)
-        
-        btn_clear_main = QPushButton("Xoá toàn bộ trong bảng chính")
-        btn_clear_main.setStyleSheet("background-color: white; color: black;")
-        # Tính năng này tạm thời clear nếu cần
-        
-        btn_clear_row = QPushButton("Xóa hết nick của dòng này")
-        btn_clear_row.setStyleSheet("background-color: white; color: black;")
-        
-        btn_search = QPushButton("Tìm kiếm")
-        btn_search.setStyleSheet("background-color: white; color: black;")
-        
+
         btn_layout.addWidget(btn_apply)
         btn_layout.addWidget(btn_select_all)
         btn_layout.addWidget(btn_deselect_all)
-        btn_layout.addWidget(btn_clear_main)
-        btn_layout.addWidget(btn_clear_row)
-        btn_layout.addWidget(btn_search)
         
         main_layout.addLayout(btn_layout)
         
@@ -174,7 +160,7 @@ class AccountSelectorDialog(QDialog):
             if chk_widget:
                 chk = chk_widget.findChild(QCheckBox)
                 if chk and chk.isChecked():
-                    selected_accounts.append(self.account_data[i]["ten_ho_so"])
+                    selected_accounts.append(dict(self.account_data[i]))
                     
         if not selected_accounts:
             QMessageBox.warning(self, "Cảnh báo", "Bạn chưa chọn tài khoản nào!")

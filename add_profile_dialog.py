@@ -1,10 +1,18 @@
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, 
     QTextEdit, QPushButton, QWidget, QRadioButton, QFrame,
-    QGridLayout, QSizePolicy, QFileDialog
+    QGridLayout, QSizePolicy, QFileDialog, QComboBox
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
+from browser_backend_utils import (
+    GOLOGIN_BACKEND,
+    LOCAL_CHROME_BACKEND,
+    STEALTH_FIREFOX_BACKEND,
+    make_local_chrome_browser_id,
+    make_stealth_firefox_browser_id,
+    normalize_browser_backend,
+)
 
 class AddProfileDialog(QDialog):
     def __init__(self, parent=None, existing_data=None):
@@ -124,6 +132,14 @@ class AddProfileDialog(QDialog):
             
         right_layout.addWidget(fp_panel)
 
+        right_layout.addWidget(QLabel("Loai trinh duyet:"))
+        self.browser_backend_combo = QComboBox()
+        self.browser_backend_combo.addItem("Local Chrome", LOCAL_CHROME_BACKEND)
+        self.browser_backend_combo.addItem("Stealth Firefox", STEALTH_FIREFOX_BACKEND)
+        self.browser_backend_combo.addItem("GoLogin / Orbita", GOLOGIN_BACKEND)
+        self.browser_backend_combo.currentIndexChanged.connect(self._on_browser_backend_changed)
+        right_layout.addWidget(self.browser_backend_combo)
+
         # Proxy và ID Trình duyệt
         proxy_id_layout = QGridLayout()
         
@@ -226,6 +242,45 @@ class AddProfileDialog(QDialog):
         else:
             self.radio_http.setChecked(True)
 
+        backend = normalize_browser_backend(self.existing_data.get("browser_backend"))
+        if hasattr(self, "browser_backend_combo"):
+            idx = self.browser_backend_combo.findData(backend)
+            if idx >= 0:
+                self.browser_backend_combo.setCurrentIndex(idx)
+        self._on_browser_backend_changed()
+
+    def _selected_browser_backend(self):
+        if hasattr(self, "browser_backend_combo"):
+            current = self.browser_backend_combo.currentData()
+            if current is not None:
+                return normalize_browser_backend(current)
+        return normalize_browser_backend(self.existing_data.get("browser_backend"))
+
+    def _on_browser_backend_changed(self):
+        backend = self._selected_browser_backend()
+        is_local = backend == LOCAL_CHROME_BACKEND
+        is_stealth_firefox = backend == STEALTH_FIREFOX_BACKEND
+        browser_input = self.inputs.get("browser_id")
+        gologin_input = self.inputs.get("gologin_profile_id")
+        if browser_input:
+            if is_local and not browser_input.text().strip():
+                profile_name = self.inputs.get("ten_ho_so").text() if self.inputs.get("ten_ho_so") else ""
+                browser_input.setText(make_local_chrome_browser_id(profile_name))
+            elif is_stealth_firefox and not browser_input.text().strip():
+                profile_name = self.inputs.get("ten_ho_so").text() if self.inputs.get("ten_ho_so") else ""
+                browser_input.setText(make_stealth_firefox_browser_id(profile_name))
+            browser_input.setReadOnly(True)
+        if gologin_input:
+            gologin_input.setEnabled(not (is_local or is_stealth_firefox))
+            if is_local:
+                gologin_input.setText("")
+                gologin_input.setPlaceholderText("Local Chrome khong dung GoLogin Profile ID")
+            elif is_stealth_firefox:
+                gologin_input.setText("")
+                gologin_input.setPlaceholderText("Stealth Firefox khong dung GoLogin Profile ID")
+            else:
+                gologin_input.setPlaceholderText("Profile ID trong bang GoLogin")
+
     def add_left_input(self, layout, label_text, key):
         layout.addWidget(QLabel(label_text))
         self.inputs[key] = QLineEdit()
@@ -241,7 +296,7 @@ class AddProfileDialog(QDialog):
             self,
             "Chon anh avatar TikTok",
             "",
-            "File ?nh (*.png *.jpg *.jpeg *.webp);;T?t c? file (*)"
+            "File anh (*.png *.jpg *.jpeg *.webp);;Tat ca file (*)"
         )
         if path:
             self.inputs["avatar_path"].setText(path)
@@ -300,5 +355,6 @@ class AddProfileDialog(QDialog):
             "client_id": self.inputs["client_id"].text(),
             "browser_id": self.inputs["browser_id"].text(),
             "gologin_profile_id": self.inputs["gologin_profile_id"].text(),
+            "browser_backend": self._selected_browser_backend(),
             "avatar_path": self.inputs["avatar_path"].text()
         }

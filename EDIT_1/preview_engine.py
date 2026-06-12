@@ -4,9 +4,64 @@ import numpy as np
 import random
 import math
 import time
+import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 from PIL import Image, ImageDraw, ImageFont
+from overlay_layout import build_logo_overlay_image, build_text_overlay_image, build_text2_overlay_image
+
+
+def _fit_background_image(rgb_image, target_w, target_h, fit_mode="Cover"):
+    if rgb_image is None or target_w <= 0 or target_h <= 0:
+        return None
+
+    src_h, src_w = rgb_image.shape[:2]
+    if src_w <= 0 or src_h <= 0:
+        return None
+
+    contain = str(fit_mode).lower() == "contain"
+    scale = min(target_w / src_w, target_h / src_h) if contain else max(target_w / src_w, target_h / src_h)
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(rgb_image, (new_w, new_h), interpolation=interp)
+
+    if contain:
+        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        x = max(0, (target_w - new_w) // 2)
+        y = max(0, (target_h - new_h) // 2)
+        paste_w = min(target_w, new_w)
+        paste_h = min(target_h, new_h)
+        canvas[y:y + paste_h, x:x + paste_w] = resized[:paste_h, :paste_w]
+        return canvas
+
+    x1 = max(0, (new_w - target_w) // 2)
+    y1 = max(0, (new_h - target_h) // 2)
+    cropped = resized[y1:y1 + target_h, x1:x1 + target_w]
+    if cropped.shape[0] == target_h and cropped.shape[1] == target_w:
+        return cropped.copy()
+
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    paste_h, paste_w = cropped.shape[:2]
+    canvas[:paste_h, :paste_w] = cropped
+    return canvas
+
+
+def _load_background_image(settings, target_w, target_h):
+    if not settings.get("use_bg_image", False):
+        return None
+
+    path = str(settings.get("bg_image_path", "") or "").strip()
+    if not path or not os.path.exists(path):
+        return None
+
+    try:
+        with Image.open(path) as img:
+            rgb = np.array(img.convert("RGB"))
+        return _fit_background_image(rgb, target_w, target_h, settings.get("bg_image_fit", "Cover"))
+    except Exception:
+        return None
+
 
 class EffectProcessor:
     def __init__(self, settings, orig_w, orig_h, is_preview=True):
@@ -89,6 +144,8 @@ class EffectProcessor:
                 self.bg_x1 = (self.orig_w - self.bg_crop_w) // 2
                 self.bg_y1 = (self.orig_h - self.bg_crop_h) // 2
 
+            self.bg_image = _load_background_image(settings, w, h)
+
         # Scale settings
         use_ai_ratio = settings.get('use_ai_ratio', False)
         ai_ratio = settings.get('ai_ratio', 100)
@@ -107,96 +164,27 @@ class EffectProcessor:
         self.pan_x = settings.get('pan_x', 0.0)
         self.pan_y = settings.get('pan_y', 0.0)
 
-        # Watermark
-        use_watermark = settings.get('use_watermark', False)
-        watermark_text = settings.get('watermark_text', '').replace('\\n', '\n')
-        watermark_size = settings.get('watermark_size', 0.08)
-        wm_color_hex = settings.get('watermark_color', '#ffff00').lstrip('#')
-        try:
-            self.wm_color_rgb = tuple(int(wm_color_hex[i:i+2], 16) for i in (0, 2, 4)) + (255,)
-        except Exception:
-            self.wm_color_rgb = (255, 255, 0, 255)
         self.mirror_video = settings.get('mirror_video', False)
         self.keep_hook = settings.get('keep_hook', True)
         self.hook_duration = settings.get('keep_hook_duration', 3.0)
         
         self.overlay_alpha = None
         self.overlay_rgb = None
-        
-        if use_watermark and watermark_text.strip():
-            font_size = int(h * watermark_size)
-            has_cjk = any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af' or '\uff00' <= c <= '\uffef' for c in watermark_text)
-            fonts_to_try = ["meiryo.ttc", "msgothic.ttc", "msyh.ttc", "malgun.ttf", "arialbd.ttf", "arial.ttf"] if has_cjk else ["arialbd.ttf", "arial.ttf"]
-            font = None
-            for fn in fonts_to_try:
-                try:
-                    font = ImageFont.truetype(fn, font_size)
-                    break
-                except IOError:
-                    continue
-            if font is None:
-                font = ImageFont.load_default()
-            stroke_width = max(1, int(h * watermark_size * 0.05))
-            
-            try:
-                from video_engine import _wrap_subtitle_text
-                max_chars = max(10, int(w / (h * watermark_size * 0.55)))
-                wrapped_lines = []
-                for line in watermark_text.split('\n'):
-                    if not line.strip():
-                        wrapped_lines.append("")
-                        continue
-                    wrapped = _wrap_subtitle_text(line, max_chars)
-                    wrapped_lines.extend(wrapped.split('\n'))
-            except Exception:
-                import textwrap
-                max_chars = max(10, int(w / (h * watermark_size * 0.55)))
-                wrapped_lines = []
-                for line in watermark_text.split('\n'):
-                    wrapped = textwrap.wrap(line, width=max_chars)
-                    if not wrapped: wrapped_lines.append("")
-                    else: wrapped_lines.extend(wrapped)
-            text_w = 0; text_h = 0
-            line_heights = []; line_widths = []
-            temp_img = Image.new('RGB', (1, 1))
-            draw_temp = ImageDraw.Draw(temp_img)
-            for line in wrapped_lines:
-                if not line:
-                    line_widths.append(0); line_heights.append(int(h * watermark_size))
-                    text_h += int(h * watermark_size)
-                    continue
-                if hasattr(draw_temp, 'textbbox'):
-                    bbox = draw_temp.textbbox((0, 0), line, font=font)
-                    lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                else: lw, lh = draw_temp.textsize(line, font=font)
-                line_widths.append(lw); line_heights.append(lh)
-                text_w = max(text_w, lw); text_h += lh
-            line_spacing = int(h * watermark_size * 0.2)
-            text_h += max(0, len(wrapped_lines) - 1) * line_spacing
-            text_h += stroke_width * 2
-            box_w = int(text_w + stroke_width * 4); box_h = int(text_h + stroke_width * 4)
-            img_pil = Image.new('RGBA', (box_w, box_h), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(img_pil)
-            current_y = stroke_width * 2
-            for i, line in enumerate(wrapped_lines):
-                if not line:
-                    current_y += line_heights[i] + line_spacing
-                    continue
-                x_pos = (box_w - line_widths[i]) // 2
-                draw.text((x_pos, current_y), line, font=font, fill=self.wm_color_rgb, stroke_width=stroke_width, stroke_fill=(0, 0, 0, 255))
-                current_y += line_heights[i] + line_spacing
-            overlay_rgba = np.array(img_pil)
+        text_image, text_rect = build_text_overlay_image(settings, w, h)
+        if text_image is not None and text_rect is not None:
+            overlay_rgba = np.array(text_image)
             self.overlay_rgb = overlay_rgba[:, :, :3]
             self.overlay_alpha = (overlay_rgba[:, :, 3] / 255.0)[:, :, np.newaxis]
-            # Position anchored to center of the bounding box at (text_x_norm, text_y_norm)
-            text_x_norm = settings.get('text_x_norm', 0.5)
-            text_y_norm = settings.get('text_y_norm', 0.9)
-            self.overlay_x = int(w * text_x_norm) - box_w // 2
-            self.overlay_y = int(h * text_y_norm) - box_h // 2
-            self.overlay_x = max(0, min(self.overlay_x, w - box_w))
-            self.overlay_y = max(0, min(self.overlay_y, h - box_h))
-            self.box_w = box_w
-            self.box_h = box_h
+            self.overlay_x, self.overlay_y, self.box_w, self.box_h = text_rect
+
+        self.overlay2_alpha = None
+        self.overlay2_rgb = None
+        text2_image, text2_rect = build_text2_overlay_image(settings, w, h)
+        if text2_image is not None and text2_rect is not None:
+            overlay2_rgba = np.array(text2_image)
+            self.overlay2_rgb = overlay2_rgba[:, :, :3]
+            self.overlay2_alpha = (overlay2_rgba[:, :, 3] / 255.0)[:, :, np.newaxis]
+            self.overlay2_x, self.overlay2_y, self.box2_w, self.box2_h = text2_rect
 
         # Subtitle Proxy (for preview positioning)
         use_subtitles = settings.get('use_subtitles', False)
@@ -229,54 +217,14 @@ class EffectProcessor:
             # Initial render of a placeholder if no cues, or just wait for process_frame
             self._render_subtitle_bitmap("[Subtitle Preview]")
 
-        # Image Logo
-        use_logo = settings.get('use_logo', False)
-        logo_path = settings.get('logo_path', "")
         self.logo_rgb = None
         self.logo_alpha = None
-        if use_logo and logo_path and os.path.exists(logo_path):
-            try:
-                logo_img = Image.open(logo_path).convert("RGBA")
-                logo_scale = settings.get('logo_scale', 0.2)
-                
-                # Resize logo relative to video width
-                target_w = max(10, int(w * logo_scale))
-                aspect_ratio = logo_img.height / logo_img.width
-                target_h = int(target_w * aspect_ratio)
-                logo_img = logo_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                
-                logo_rgba = np.array(logo_img)
-                self.logo_rgb = logo_rgba[:, :, :3]
-                
-                logo_opacity = settings.get('logo_opacity', 0.8)
-                base_alpha = (logo_rgba[:, :, 3] / 255.0)
-                self.logo_alpha = (base_alpha * logo_opacity)[:, :, np.newaxis]
-                
-                logo_pos = settings.get('logo_pos', 'Bottom-Right')
-                pad_x = int(w * 0.05)
-                pad_y = int(h * 0.05)
-                
-                if logo_pos == 'Manual (Drag)':
-                    lx_n = settings.get('logo_x_norm', 0.85)
-                    ly_n = settings.get('logo_y_norm', 0.85)
-                    self.logo_x = int(w * lx_n) - target_w // 2
-                    self.logo_y = int(h * ly_n) - target_h // 2
-                elif logo_pos == 'Top-Left':
-                    self.logo_x, self.logo_y = pad_x, pad_y
-                elif logo_pos == 'Top-Right':
-                    self.logo_x, self.logo_y = w - target_w - pad_x, pad_y
-                elif logo_pos == 'Bottom-Left':
-                    self.logo_x, self.logo_y = pad_x, h - target_h - pad_y
-                elif logo_pos == 'Bottom-Right':
-                    self.logo_x, self.logo_y = w - target_w - pad_x, h - target_h - pad_y
-                else:  # Center
-                    self.logo_x, self.logo_y = (w - target_w) // 2, (h - target_h) // 2
-                self.logo_x = max(0, min(self.logo_x, w - target_w))
-                self.logo_y = max(0, min(self.logo_y, h - target_h))
-                self.logo_w = target_w
-                self.logo_h = target_h
-            except Exception as e:
-                print(f"[Preview] Error loading logo: {e}")
+        logo_image, logo_rect = build_logo_overlay_image(settings, w, h)
+        if logo_image is not None and logo_rect is not None:
+            logo_rgba = np.array(logo_image)
+            self.logo_rgb = logo_rgba[:, :, :3]
+            self.logo_alpha = (logo_rgba[:, :, 3] / 255.0)[:, :, np.newaxis]
+            self.logo_x, self.logo_y, self.logo_w, self.logo_h = logo_rect
 
         # Particles
         use_particles = settings.get('use_particles', False)
@@ -341,6 +289,7 @@ class EffectProcessor:
         self._any_effect_active = any([
             self.static_scale_only or self.animated_scale,
             self.overlay_alpha is not None,
+            self.overlay2_alpha is not None,
             self.logo_alpha is not None,
             self.sub_alpha is not None,
             self.part_particles is not None,
@@ -444,7 +393,9 @@ class EffectProcessor:
                 cropped = orig_frame[self.crop_y1:self.crop_y1+self.crop_h, self.crop_x1:self.crop_x1+self.crop_w]
                 img = cv2.resize(cropped, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
             else:
-                if self.fit_mode == 'Fit (Black Bars)':
+                if getattr(self, 'bg_image', None) is not None:
+                    img = self.bg_image.copy()
+                elif self.fit_mode == 'Fit (Black Bars)':
                     img = np.zeros((self.h, self.w, 3), dtype=np.uint8)
                 else: 
                     bg_frame = orig_frame[self.bg_y1:self.bg_y1+self.bg_crop_h, self.bg_x1:self.bg_x1+self.bg_crop_w]
@@ -529,6 +480,19 @@ class EffectProcessor:
                 roi = img[y1:y2, x1:x2]
                 alpha_slice = self.overlay_alpha[0:bh, 0:bw]
                 rgb_slice = self.overlay_rgb[0:bh, 0:bw]
+                img[y1:y2, x1:x2] = (roi * (1.0 - alpha_slice) + rgb_slice * alpha_slice).astype(np.uint8)
+
+        # Text Overlay 2
+        if self.overlay2_alpha is not None:
+            y1, y2 = self.overlay2_y, self.overlay2_y + self.box2_h
+            x1, x2 = self.overlay2_x, self.overlay2_x + self.box2_w
+            y1 = max(0, y1); y2 = min(img.shape[0], y2)
+            x1 = max(0, x1); x2 = min(img.shape[1], x2)
+            bh = y2 - y1; bw = x2 - x1
+            if bh > 0 and bw > 0:
+                roi = img[y1:y2, x1:x2]
+                alpha_slice = self.overlay2_alpha[0:bh, 0:bw]
+                rgb_slice = self.overlay2_rgb[0:bh, 0:bw]
                 img[y1:y2, x1:x2] = (roi * (1.0 - alpha_slice) + rgb_slice * alpha_slice).astype(np.uint8)
 
         # Subtitle Proxy (Real-time)
@@ -631,6 +595,7 @@ class PreviewWorker(QThread):
         self.seek_requested = -1.0
 
         # Thread-safe flags: set from main thread, consumed inside run()
+        self._state_lock = threading.Lock()
         self._pending_video_path = None
         self._pending_settings = None
 
@@ -638,21 +603,26 @@ class PreviewWorker(QThread):
 
     def load_video(self, path):
         """Signal the run() loop to open this video file."""
-        self.is_playing = False
-        self._pending_video_path = path
+        with self._state_lock:
+            self.is_playing = False
+            self._pending_video_path = path
+            self._pending_settings = None
         if not self.isRunning():
             self.is_running = True
             self.start()
 
     def set_settings(self, settings):
-        self.settings = settings
-        self._pending_settings = settings
+        settings = dict(settings or {})
+        with self._state_lock:
+            self.settings = settings
+            self._pending_settings = settings
 
     def toggle_playback(self):
         self.is_playing = not self.is_playing
 
     def seek(self, t):
-        self.seek_requested = min(max(t, 0.0), self.duration)
+        with self._state_lock:
+            self.seek_requested = min(max(t, 0.0), self.duration)
 
     def stop(self):
         self.is_running = False
@@ -660,6 +630,31 @@ class PreviewWorker(QThread):
         self.wait()
 
     # ── Private helpers (called from run() thread only) ───────────────────────
+
+    def _take_pending_video(self):
+        with self._state_lock:
+            path = self._pending_video_path
+            if path is None:
+                return None, None
+            settings = dict(self.settings)
+            self._pending_video_path = None
+            self._pending_settings = None
+            return path, settings
+
+    def _take_pending_settings(self):
+        with self._state_lock:
+            if self._pending_settings is None:
+                return None
+            settings = dict(self._pending_settings)
+            self._pending_settings = None
+            return settings
+
+    def _take_seek_request(self):
+        with self._state_lock:
+            seek_t = self.seek_requested
+            if seek_t >= 0:
+                self.seek_requested = -1.0
+            return seek_t
 
     def _apply_timing_plan(self):
         if not self.video_path:
@@ -703,8 +698,10 @@ class PreviewWorker(QThread):
             return None, source_t - self.trim_start
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), source_t - self.trim_start
 
-    def _open_video(self, path):
+    def _open_video(self, path, settings=None):
         """Open a new VideoCapture and rebuild the processor. Must be called from run()."""
+        if settings is not None:
+            self.settings = dict(settings)
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -767,17 +764,14 @@ class PreviewWorker(QThread):
     def run(self):
         while self.is_running:
             # 1. Handle pending video load (highest priority)
-            pending_path = self._pending_video_path
+            pending_path, pending_video_settings = self._take_pending_video()
             if pending_path is not None:
-                self._pending_video_path = None
-                self._pending_settings = None  # already baked into self.settings
-                self._open_video(pending_path)
+                self._open_video(pending_path, pending_video_settings)
                 continue  # loop immediately to process seek_requested = 0
 
             # 2. Handle pending settings change
-            pending_settings = self._pending_settings
+            pending_settings = self._take_pending_settings()
             if pending_settings is not None:
-                self._pending_settings = None
                 self._rebuild_processor(pending_settings)
 
             # 3. No video → idle
@@ -789,10 +783,10 @@ class PreviewWorker(QThread):
             effect_t = 0.0
 
             # 4. Seek / scrub
-            if self.seek_requested >= 0:
-                frame_rgb, effect_t = self._read_frame_at_output_time(self.seek_requested)
-                self.current_t = self.seek_requested
-                self.seek_requested = -1.0
+            seek_t = self._take_seek_request()
+            if seek_t >= 0:
+                frame_rgb, effect_t = self._read_frame_at_output_time(seek_t)
+                self.current_t = seek_t
                 self.position_changed.emit(self.current_t)
 
             # 5. Normal playback

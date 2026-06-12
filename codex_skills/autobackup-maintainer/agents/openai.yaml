@@ -1,0 +1,4 @@
+interface:
+  display_name: "AutoBackup Maintainer"
+  short_description: "Maintain and debug the AutoBackup project."
+  default_prompt: "Use this skill when working on the AutoBackup Python/GoLogin/upload/EDIT_1 project. Start by reading PROJECT_MAP.md and the relevant reference."

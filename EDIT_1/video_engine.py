@@ -9,6 +9,7 @@ import time
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from overlay_layout import build_logo_overlay_image, build_text_overlay_image, build_text2_overlay_image, wrap_multilingual_text
 
 def _get_ffmpeg_exe():
     """Get the ffmpeg binary path from imageio_ffmpeg."""
@@ -123,177 +124,39 @@ def get_render_plan(input_path, settings):
 def _render_text_overlay(settings, w, h, mirror_video):
     """Pre-render the text watermark to a temporary RGBA PNG file.
     Returns (temp_png_path, x_pos, y_pos) or (None, 0, 0) if no watermark."""
-    
-    use_watermark = settings.get('use_watermark', False)
-    watermark_text = settings.get('watermark_text', '').replace('\\n', '\n')
-    watermark_size = settings.get('watermark_size', 0.08)
-    wm_color_hex = settings.get('watermark_color', '#ffff00').lstrip('#')
-    try:
-        wm_color_rgb = tuple(int(wm_color_hex[i:i+2], 16) for i in (0, 2, 4)) + (255,)
-    except Exception:
-        wm_color_rgb = (255, 255, 0, 255)
-    
-    if not use_watermark or not watermark_text.strip():
+    image, rect = build_text_overlay_image(settings, w, h)
+    if image is None or rect is None:
         return None, 0, 0
-
-    # Measure and render text
-    temp_img = Image.new('RGB', (1, 1))
-    draw = ImageDraw.Draw(temp_img)
-
-    try:
-        font_size = int(h * watermark_size)
-        has_cjk = any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af' or '\uff00' <= c <= '\uffef' for c in watermark_text)
-        fonts_to_try = ["meiryo.ttc", "msgothic.ttc", "msyh.ttc", "malgun.ttf", "arialbd.ttf", "arial.ttf"] if has_cjk else ["arialbd.ttf", "arial.ttf"]
-        
-        font = None
-        for fn in fonts_to_try:
-            try:
-                font = ImageFont.truetype(fn, font_size)
-                break
-            except IOError:
-                continue
-        if font is None:
-            font = ImageFont.load_default()
-    except Exception:
-        font = ImageFont.load_default()
-
-    stroke_width = max(1, int(h * watermark_size * 0.05))
-
-    try:
-        max_chars = max(10, int(w / (h * watermark_size * 0.55)))
-        wrapped_lines = []
-        for line in watermark_text.split('\n'):
-            if not line.strip():
-                wrapped_lines.append("")
-                continue
-            wrapped = _wrap_subtitle_text(line, max_chars)
-            wrapped_lines.extend(wrapped.split('\n'))
-    except Exception:
-        import textwrap
-        max_chars = max(10, int(w / (h * watermark_size * 0.55)))
-        wrapped_lines = []
-        for line in watermark_text.split('\n'):
-            wrapped = textwrap.wrap(line, width=max_chars)
-            if not wrapped:
-                wrapped_lines.append("")
-            else:
-                wrapped_lines.extend(wrapped)
-
-    text_w = 0
-    text_h = 0
-    line_heights = []
-    line_widths = []
-
-    for line in wrapped_lines:
-        if not line:
-            line_widths.append(0)
-            line_heights.append(int(h * watermark_size))
-            text_h += int(h * watermark_size)
-            continue
-        if hasattr(draw, 'textbbox'):
-            bbox = draw.textbbox((0, 0), line, font=font)
-            lw = bbox[2] - bbox[0]
-            lh = bbox[3] - bbox[1]
-        else:
-            lw, lh = draw.textsize(line, font=font)
-        line_widths.append(lw)
-        line_heights.append(lh)
-        text_w = max(text_w, lw)
-        text_h += lh
-
-    line_spacing = int(h * watermark_size * 0.2)
-    text_h += max(0, len(wrapped_lines) - 1) * line_spacing
-    text_h += stroke_width * 2
-
-    box_w = int(text_w + stroke_width * 4)
-    box_h = int(text_h + stroke_width * 4)
-    
-    if box_w <= 0 or box_h <= 0:
-        return None, 0, 0
-
-    img_pil = Image.new('RGBA', (box_w, box_h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img_pil)
-
-    current_y = stroke_width * 2
-    for i, line in enumerate(wrapped_lines):
-        if not line:
-            current_y += line_heights[i] + line_spacing
-            continue
-        x_pos = (box_w - line_widths[i]) // 2
-        draw.text((x_pos, current_y), line, font=font, fill=wm_color_rgb,
-                  stroke_width=stroke_width, stroke_fill=(0, 0, 0, 255))
-        current_y += line_heights[i] + line_spacing
-
-    # Calculate position — no need for mirror compensation here since
-    # FFmpeg overlay is applied AFTER hflip, so coordinates are in output space
-    text_x_norm = settings.get('text_x_norm', 0.5)
-    text_y_norm = settings.get('text_y_norm', 0.9)
-    overlay_x = int(w * text_x_norm) - box_w // 2
-    overlay_y = int(h * text_y_norm) - box_h // 2
-    overlay_x = max(0, min(overlay_x, w - box_w))
-    overlay_y = max(0, min(overlay_y, h - box_h))
-
-    # Save to temp file
+    overlay_x, overlay_y, _, _ = rect
     tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False, prefix='wm_')
-    img_pil.save(tmp.name)
+    image.save(tmp.name)
     tmp.close()
-    
+    return tmp.name, overlay_x, overlay_y
+
+
+def _render_text2_overlay(settings, w, h, mirror_video):
+    """Pre-render the second text overlay to a temporary RGBA PNG file."""
+    image, rect = build_text2_overlay_image(settings, w, h)
+    if image is None or rect is None:
+        return None, 0, 0
+    overlay_x, overlay_y, _, _ = rect
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False, prefix='wm2_')
+    image.save(tmp.name)
+    tmp.close()
     return tmp.name, overlay_x, overlay_y
 
 
 def _render_logo_overlay(settings, w, h, mirror_video):
     """Pre-render the logo to a temporary RGBA PNG at target scale/opacity.
     Returns (temp_png_path, x_pos, y_pos) or (None, 0, 0) if no logo."""
-    
-    use_logo = settings.get('use_logo', False)
-    logo_path = settings.get('logo_path', "")
-    
-    if not use_logo or not logo_path or not os.path.exists(logo_path):
+    image, rect = build_logo_overlay_image(settings, w, h)
+    if image is None or rect is None:
         return None, 0, 0
-
+    logo_x, logo_y, _, _ = rect
     try:
-        logo_img = Image.open(logo_path).convert("RGBA")
-        logo_scale = settings.get('logo_scale', 0.2)
-
-        target_w = max(10, int(w * logo_scale))
-        aspect_ratio = logo_img.height / logo_img.width
-        target_h = int(target_w * aspect_ratio)
-        logo_img = logo_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-
-        # Apply opacity to alpha channel
-        logo_opacity = settings.get('logo_opacity', 0.8)
-        logo_rgba = np.array(logo_img)
-        logo_rgba[:, :, 3] = (logo_rgba[:, :, 3] * logo_opacity).astype(np.uint8)
-        logo_img = Image.fromarray(logo_rgba)
-
-        # Calculate position (in output coordinate space, AFTER mirror)
-        logo_pos = settings.get('logo_pos', 'Bottom-Right')
-        pad_x = int(w * 0.05)
-        pad_y = int(h * 0.05)
-
-        if logo_pos == 'Manual (Drag)':
-            lx_n = settings.get('logo_x_norm', 0.85)
-            ly_n = settings.get('logo_y_norm', 0.85)
-            logo_x = int(w * lx_n) - target_w // 2
-            logo_y = int(h * ly_n) - target_h // 2
-        elif logo_pos == 'Top-Left':
-            logo_x, logo_y = pad_x, pad_y
-        elif logo_pos == 'Top-Right':
-            logo_x, logo_y = w - target_w - pad_x, pad_y
-        elif logo_pos == 'Bottom-Left':
-            logo_x, logo_y = pad_x, h - target_h - pad_y
-        elif logo_pos == 'Bottom-Right':
-            logo_x, logo_y = w - target_w - pad_x, h - target_h - pad_y
-        else:  # Center
-            logo_x, logo_y = (w - target_w) // 2, (h - target_h) // 2
-
-        logo_x = max(0, min(logo_x, w - target_w))
-        logo_y = max(0, min(logo_y, h - target_h))
-
         tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False, prefix='logo_')
-        logo_img.save(tmp.name)
+        image.save(tmp.name)
         tmp.close()
-
         return tmp.name, logo_x, logo_y
     except Exception as e:
         print(f"Error pre-rendering logo: {e}")
@@ -373,14 +236,14 @@ def _build_scale_crop_expr(settings, w, h):
             # ct = mod(t, CYCLE)
             ct = f"mod(t\\,{CYCLE:.6f})"
             
-            # ramp for phase 2 (zoom→base): (ct - P1) / TRANS
+            # ramp for phase 2 (zoomâ†’base): (ct - P1) / TRANS
             ramp2 = f"((({ct})-{P1:.6f})/{TRANS:.6f})"
             # eased2 = ramp*(1-EASE) + sin(PI*ramp/2)*EASE
             eased2 = f"(({ramp2})*(1-{EASE:.6f})+sin(PI*({ramp2})/2)*{EASE:.6f})"
             # scale2 = ZOOM + (BASE-ZOOM) * eased2
             scale2 = f"({ZOOM:.6f}+({BASE:.6f}-{ZOOM:.6f})*{eased2})"
 
-            # ramp for phase 4 (base→zoom): (ct - P3) / TRANS
+            # ramp for phase 4 (baseâ†’zoom): (ct - P3) / TRANS
             ramp4 = f"((({ct})-{P3:.6f})/{TRANS:.6f})"
             eased4 = f"(({ramp4})*(1-{EASE:.6f})+sin(PI*({ramp4})/2)*{EASE:.6f})"
             scale4 = f"({BASE:.6f}+({ZOOM:.6f}-{BASE:.6f})*{eased4})"
@@ -421,7 +284,7 @@ def _build_scale_crop_expr(settings, w, h):
     return None
 
 
-# ─── FONT FILE MAPPING (Windows) ─────────────────────────────────────────────
+# â”€â”€â”€ FONT FILE MAPPING (Windows) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 FONT_FILE_MAP = {
     "Arial": "arial.ttf",
     "Times New Roman": "times.ttf",
@@ -464,7 +327,7 @@ def _srt_time_to_seconds(ts: str) -> float:
 
 
 def parse_srt(srt_path: str) -> list:
-    """Parse SRT file → list of dicts: {start, end, text}."""
+    """Parse SRT file â†’ list of dicts: {start, end, text}."""
     cues = []
     with open(srt_path, "r", encoding="utf-8-sig") as f:
         content = f.read()
@@ -505,54 +368,8 @@ def calculate_ffmpeg_params(font_size, sub_y_norm, vid_w, vid_h):
 
 
 def _wrap_subtitle_text(text, max_chars_per_line):
-    """Wrap subtitle text to fit within max_chars_per_line.
-    
-    Handles both CJK (Chinese/Japanese/Korean) and Latin text.
-    CJK characters are ~1.7x wider than Latin, so they count more.
-    """
-    import unicodedata
-    
-    def char_width(ch):
-        """Return effective width: CJK=1.7, Latin=1.0"""
-        cat = unicodedata.east_asian_width(ch)
-        return 1.7 if cat in ('W', 'F') else 1.0
-    
-    def line_width(s):
-        return sum(char_width(c) for c in s)
-    
-    if line_width(text) <= max_chars_per_line:
-        return text
-    
-    # Try to split at spaces first (for Latin/Vietnamese text)
-    words = text.split(' ')
-    lines = []
-    current_line = ""
-    
-    for word in words:
-        test = f"{current_line} {word}".strip() if current_line else word
-        if line_width(test) <= max_chars_per_line:
-            current_line = test
-        else:
-            if current_line:
-                lines.append(current_line)
-            # If a single word is too long (e.g. CJK without spaces), break it
-            if line_width(word) > max_chars_per_line:
-                chars = list(word)
-                current_line = ""
-                for ch in chars:
-                    if line_width(current_line + ch) > max_chars_per_line:
-                        if current_line:
-                            lines.append(current_line)
-                        current_line = ch
-                    else:
-                        current_line += ch
-            else:
-                current_line = word
-    
-    if current_line:
-        lines.append(current_line)
-    
-    return '\n'.join(lines)
+    """Wrap text with the same multilingual rules used by overlay layout."""
+    return wrap_multilingual_text(text, max_chars_per_line)
 
 
 def build_drawtext_filters(cues, font_path, font_size, font_color_hex,
@@ -641,7 +458,7 @@ def build_drawtext_filters(cues, font_path, font_size, font_color_hex,
     return filters, temp_files
 
 def process_video(input_path, output_path, settings, progress_cb=None, log_cb=None, start_t=None, end_t=None):
-    """Process a video using Pure FFmpeg pipeline (NVDEC decode → filters → NVENC encode).
+    """Process a video using Pure FFmpeg pipeline (NVDEC decode â†’ filters â†’ NVENC encode).
     
     This is the Turbo GPU pipeline: no Python frame processing, everything runs
     inside FFmpeg as a single subprocess with hardware acceleration.
@@ -682,6 +499,15 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
     bgm_volume = settings.get('bgm_volume', 1.0)
     bgm_speed = settings.get('bgm_speed', 1.0)
     has_bg_music = use_bg_music and bg_music_path and os.path.exists(bg_music_path)
+    bg_image_path = str(settings.get('bg_image_path', "") or "").strip()
+    bg_image_fit = settings.get('bg_image_fit', 'Cover')
+    has_bg_image = (
+        settings.get('use_bg_image', False)
+        and bg_image_path
+        and os.path.exists(bg_image_path)
+        and target_ratio_setting != 'Original'
+        and fit_mode != 'Crop to Fill'
+    )
     
     use_subtitles = settings.get('use_subtitles', False)
     subtitle_path = settings.get('subtitle_path', "")
@@ -731,6 +557,7 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
     # --- PRE-RENDER OVERLAYS ---
     logo_png, logo_x, logo_y = _render_logo_overlay(settings, w, h, mirror_video)
     text_png, text_x, text_y = _render_text_overlay(settings, w, h, mirror_video)
+    text2_png, text2_x, text2_y = _render_text2_overlay(settings, w, h, mirror_video)
 
     if log_cb:
         if logo_png:
@@ -754,6 +581,16 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
                     )
             except Exception as exc:
                 log_cb(f"Text overlay debug failed: {exc}")
+        if text2_png:
+            try:
+                with Image.open(text2_png) as text2_img:
+                    log_cb(
+                        "Text 2 overlay: "
+                        f"norm=({settings.get('text2_x_norm', 0.5):.3f},{settings.get('text2_y_norm', 0.2):.3f}), "
+                        f"pixel=({text2_x},{text2_y}), box=({text2_img.width},{text2_img.height}), output=({w},{h})"
+                    )
+            except Exception as exc:
+                log_cb(f"Text 2 overlay debug failed: {exc}")
     
     temp_files = []
     tts_data = []
@@ -761,6 +598,8 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
         temp_files.append(logo_png)
     if text_png:
         temp_files.append(text_png)
+    if text2_png:
+        temp_files.append(text2_png)
     
     try:
         # --- BUILD FFMPEG COMMAND ---
@@ -792,6 +631,8 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
         input_idx = 1
         logo_input_idx = None
         text_input_idx = None
+        text2_input_idx = None
+        bg_image_input_idx = None
         bgm_input_idx = None
         if logo_png:
             cmd += ['-i', logo_png]
@@ -800,6 +641,14 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
         if text_png:
             cmd += ['-i', text_png]
             text_input_idx = input_idx
+            input_idx += 1
+        if text2_png:
+            cmd += ['-i', text2_png]
+            text2_input_idx = input_idx
+            input_idx += 1
+        if has_bg_image:
+            cmd += ['-loop', '1', '-i', bg_image_path]
+            bg_image_input_idx = input_idx
             input_idx += 1
         
         if has_bg_music:
@@ -840,12 +689,18 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
                 # We'll handle this specially below
                 pass
         else:
-            # Original ratio — just ensure even dimensions
+            # Original ratio â€” just ensure even dimensions
             if orig_w != w or orig_h != h:
                 vf_parts.append(f"scale={w}:{h}")
         
-        # Scale animation (crop-zoom)
-        scale_filter = _build_scale_crop_expr(settings, w, h)
+        # Scale animation (crop-zoom). When using an image background, mirror is
+        # applied to the foreground video before composition, so pan_x must stay
+        # in the same direction as the preview.
+        scale_settings = settings
+        if has_bg_image and mirror_video:
+            scale_settings = dict(settings)
+            scale_settings['mirror_video'] = False
+        scale_filter = _build_scale_crop_expr(scale_settings, w, h)
         if scale_filter:
             vf_parts.append(scale_filter)
         
@@ -856,12 +711,18 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
             else:
                 vf_parts.append("hflip")
         
-        # Use filter_complex when we have overlays, blur-fit mode, or bg music
-        use_filter_complex = (logo_png is not None or text_png is not None or
-                              (target_ratio_setting != 'Original' and fit_mode == 'Fit with Blur') or
+        needs_fit_composition = target_ratio_setting != 'Original' and (
+            fit_mode == 'Fit with Blur' or has_bg_image
+        )
+
+        # Use filter_complex when we have overlays, composed fit background, or bg music
+        use_filter_complex = (logo_png is not None or text_png is not None or text2_png is not None or
+                              needs_fit_composition or
                               has_bg_music)
         if log_cb:
-            log_cb(f"use_filter_complex={use_filter_complex} (logo={logo_png is not None}, text={text_png is not None}, blur_fit={target_ratio_setting != 'Original' and fit_mode == 'Fit with Blur'}, bgm={has_bg_music})")
+            if settings.get('use_bg_image', False) and not has_bg_image and bg_image_path:
+                log_cb(f"Background image ignored or missing for current layout: {bg_image_path}")
+            log_cb(f"use_filter_complex={use_filter_complex} (logo={logo_png is not None}, text={text_png is not None}, text2={text2_png is not None}, composed_fit={needs_fit_composition}, bg_image={has_bg_image}, bgm={has_bg_music})")
         
         # --- BUILD AUDIO FILTER CHAIN ---
         af_parts = []
@@ -951,40 +812,65 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
             fc_parts = []
             current_vid = "[0:v]"
             
-            # Blur-fit mode needs special handling
-            if target_ratio_setting != 'Original' and fit_mode == 'Fit with Blur':
+            # Fit modes with a full-canvas background need special handling.
+            if needs_fit_composition:
                 if '9:16' in target_ratio_setting:
                     target_aspect = 9.0 / 16.0
                 else:
                     target_aspect = 16.0 / 9.0
-                
-                # Background: crop to target aspect, blur heavily, darken
-                if orig_aspect > target_aspect:
-                    bg_crop = f"crop=ih*{target_aspect:.6f}:ih"
+
+                if has_bg_image and bg_image_input_idx is not None:
+                    if str(bg_image_fit).lower() == 'contain':
+                        fc_parts.append(
+                            f"[{bg_image_input_idx}:v]"
+                            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                            f"setsar=1[bg]"
+                        )
+                    else:
+                        fc_parts.append(
+                            f"[{bg_image_input_idx}:v]"
+                            f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+                            f"crop={w}:{h},setsar=1[bg]"
+                        )
                 else:
-                    bg_crop = f"crop=iw:iw/{target_aspect:.6f}"
-                
-                ksize = max(3, (blur_intensity // 8) | 1)
-                # Use boxblur for speed; approximate the Gaussian
-                blur_radius = max(1, blur_intensity // 4)
-                
-                # Optimize by scaling down before blurring (matches preview_engine.py logic)
-                small_w = max(2, w // 8)
-                small_h = max(2, h // 8)
-                
-                fc_parts.append(
-                    f"[0:v]{bg_crop},scale={small_w}:{small_h},"
-                    f"boxblur={blur_radius}:{blur_radius},"
-                    f"scale={w}:{h},"
-                    f"colorlevels=rimax=0.6:gimax=0.6:bimax=0.6[bg]"
-                )
+                    # Background: crop to target aspect, blur heavily, darken
+                    if orig_aspect > target_aspect:
+                        bg_crop = f"crop=ih*{target_aspect:.6f}:ih"
+                    else:
+                        bg_crop = f"crop=iw:iw/{target_aspect:.6f}"
+
+                    # Use boxblur for speed; approximate the Gaussian
+                    blur_radius = max(1, blur_intensity // 4)
+
+                    # Optimize by scaling down before blurring (matches preview_engine.py logic)
+                    small_w = max(2, w // 8)
+                    small_h = max(2, h // 8)
+
+                    fc_parts.append(
+                        f"[0:v]{bg_crop},scale={small_w}:{small_h},"
+                        f"boxblur={blur_radius}:{blur_radius},"
+                        f"scale={w}:{h},"
+                        f"colorlevels=rimax=0.6:gimax=0.6:bimax=0.6[bg]"
+                    )
+
+                # Foreground: mirror only the source video when an image
+                # background is used; the chosen background image stays fixed.
+                fg_source = "[0:v]"
+                if has_bg_image and mirror_video:
+                    fg_source = "[fg_src]"
+                    if keep_hook and hook_duration > 0:
+                        fc_parts.append(f"[0:v]hflip=enable='gt(t,{hook_duration:.2f})'{fg_source}")
+                    else:
+                        fc_parts.append(f"[0:v]hflip{fg_source}")
+
                 # Foreground: scale to fit
                 fc_parts.append(
-                    f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease[fg]"
+                    f"{fg_source}scale={w}:{h}:force_original_aspect_ratio=decrease[fg]"
                 )
-                # Overlay foreground on blurred background
+                # Overlay foreground on the selected background
                 fc_parts.append(
-                    f"[bg][fg]overlay=(W-w)/2:(H-h)/2[composed]"
+                    f"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1[composed]"
                 )
                 current_vid = "[composed]"
             else:
@@ -999,7 +885,7 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
             remaining_vf = []
             if scale_filter:
                 remaining_vf.append(scale_filter)
-            if mirror_video:
+            if mirror_video and not has_bg_image:
                 if keep_hook and hook_duration > 0:
                     remaining_vf.append(f"hflip=enable='gt(t,{hook_duration:.2f})'")
                 else:
@@ -1007,7 +893,7 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
             if abs(final_speed - 1.0) > 0.001:
                 remaining_vf.append(f"setpts=PTS/{final_speed:.6f}")
             
-            if target_ratio_setting != 'Original' and fit_mode == 'Fit with Blur':
+            if needs_fit_composition:
                 # Apply remaining video filters to composed stream
                 if remaining_vf:
                     rv_str = ",".join(remaining_vf)
@@ -1029,6 +915,14 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
                     f"{current_vid}[{text_input_idx}:v]overlay={text_x}:{text_y}{next_label}"
                 )
                 current_vid = next_label
+
+            # Text Overlay 2 (rendered AFTER Text 1 and BEFORE subtitles)
+            if text2_input_idx is not None:
+                next_label = "[with_text2]"
+                fc_parts.append(
+                    f"{current_vid}[{text2_input_idx}:v]overlay={text2_x}:{text2_y}{next_label}"
+                )
+                current_vid = next_label
             
             # Apply subtitle drawtext filters at the very end of video chain
             if sub_drawtext_filters:
@@ -1045,6 +939,7 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
                 
             # Audio complex filter for background music mixing
             current_a = None
+            audio_input_map = None
             if has_audio or has_bg_music:
                 if has_audio:
                     # Original audio volume
@@ -1053,8 +948,10 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
                     if orig_af:
                         fc_parts.append(f"[0:a]{','.join(orig_af)}[main_a]")
                         current_a = "[main_a]"
-                    else:
+                    elif has_bg_music:
                         current_a = "[0:a]"
+                    else:
+                        audio_input_map = "0:a?"
                 
                 if has_bg_music:
                     bgm_af = []
@@ -1096,6 +993,8 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
             
             if current_a:
                 cmd += ['-map', current_a]
+            elif audio_input_map:
+                cmd += ['-map', audio_input_map]
             elif has_audio:
                 if af_parts:
                     af_string = ",".join(af_parts)
@@ -1136,8 +1035,8 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
             '-b:a', '192k',
         ]
         
-        # No audio if source has none
-        if not has_audio:
+        # No audio only when neither the source nor background music provides it.
+        if not has_audio and not has_bg_music:
             cmd += ['-an']
         
         # Progress reporting via FFmpeg stderr  
@@ -1215,3 +1114,4 @@ def process_video(input_path, output_path, settings, progress_cb=None, log_cb=No
                     os.remove(f)
             except Exception:
                 pass
+

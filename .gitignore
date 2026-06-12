@@ -43,3 +43,14 @@ dist/
 release/
 *.exe
 *.msi
+
+# Local runtime/dev artifacts.
+chrome-win64/
+local_chrome_profiles/
+stealth_firefox_profiles/
+.codex_tmp/
+.tmp_builds/
+scripts/__pycache__/
+scripts/*.pyc
+Creator Now Cut/
+
